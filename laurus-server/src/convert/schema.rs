@@ -12,12 +12,14 @@ use laurus::vector::core::field::{
 use laurus::vector::core::rerank::RerankStorageKind;
 use laurus::{
     AnalyzerDefinition, AnalyzerSpec, BooleanOption, BuiltinAnalyzerSpec, BytesOption,
-    CharFilterConfig, DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition,
-    FieldChangeKind, FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption,
-    IntegerOption, IvfOption, MultiVectorOption, MultiVectorStorage, QuantizationMethod, Schema,
-    TextOption, TokenFilterConfig, TokenizerConfig,
+    DateTimeOption, DistanceMetric, DynamicFieldPolicy, EmbedderDefinition, FieldChangeKind,
+    FieldOption, FlatOption, FloatOption, Geo3dOption, GeoOption, HnswOption, IntegerOption,
+    IvfOption, MultiVectorOption, MultiVectorStorage, QuantizationMethod, Schema, TextOption,
 };
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
+use crate::convert::proto_struct;
 use crate::proto::laurus::v1;
 
 /// Convert a laurus Schema into a proto Schema.
@@ -53,8 +55,10 @@ pub fn to_proto(schema: &Schema) -> v1::Schema {
 ///
 /// Returns an error if a field option cannot be converted (see
 /// [`field_option_from_proto`]; the message names the field), if an
-/// analyzer or embedder definition is invalid, or if `dynamic_field_policy`
-/// is a value this server does not know (Issue #1473).
+/// analyzer definition is invalid (the message names the analyzer and the
+/// component, such as `Analyzer 'a': token_filters[0]: ...`, Issue #1478),
+/// if an embedder definition is invalid, or if `dynamic_field_policy` is a
+/// value this server does not know (Issue #1473).
 pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
     let mut fields = BTreeMap::new();
     for (name, fo) in &proto.fields {
@@ -63,7 +67,9 @@ pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
     }
     let mut analyzers = BTreeMap::new();
     for (name, ad) in &proto.analyzers {
-        analyzers.insert(name.clone(), analyzer_definition_from_proto(ad)?);
+        let definition =
+            analyzer_definition_from_proto(ad).map_err(|e| format!("Analyzer '{name}': {e}"))?;
+        analyzers.insert(name.clone(), definition);
     }
     let mut embedders = BTreeMap::new();
     for (name, ed) in &proto.embedders {
@@ -612,34 +618,35 @@ fn builtin_analyzer_spec_from_proto(
 
 fn analyzer_definition_to_proto(def: &AnalyzerDefinition) -> v1::AnalyzerDefinition {
     v1::AnalyzerDefinition {
-        char_filters: def.char_filters.iter().map(char_filter_to_proto).collect(),
-        tokenizer: Some(tokenizer_to_proto(&def.tokenizer)),
-        token_filters: def
-            .token_filters
-            .iter()
-            .map(token_filter_to_proto)
-            .collect(),
+        char_filters: def.char_filters.iter().map(component_to_proto).collect(),
+        tokenizer: Some(component_to_proto(&def.tokenizer)),
+        token_filters: def.token_filters.iter().map(component_to_proto).collect(),
     }
 }
 
+/// Convert a proto analyzer definition, naming the component that fails:
+/// `tokenizer: ...`, `char_filters[1]: ...` or `token_filters[0]: ...`.
 fn analyzer_definition_from_proto(
     proto: &v1::AnalyzerDefinition,
 ) -> Result<AnalyzerDefinition, String> {
-    let tokenizer = tokenizer_from_proto(
+    let tokenizer = component_from_proto(
         proto
             .tokenizer
             .as_ref()
             .ok_or("AnalyzerDefinition missing tokenizer")?,
-    )?;
+    )
+    .map_err(|e| format!("tokenizer: {e}"))?;
     let char_filters = proto
         .char_filters
         .iter()
-        .map(char_filter_from_proto)
+        .enumerate()
+        .map(|(i, c)| component_from_proto(c).map_err(|e| format!("char_filters[{i}]: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
     let token_filters = proto
         .token_filters
         .iter()
-        .map(token_filter_from_proto)
+        .enumerate()
+        .map(|(i, c)| component_from_proto(c).map_err(|e| format!("token_filters[{i}]: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(AnalyzerDefinition {
         char_filters,
@@ -648,233 +655,64 @@ fn analyzer_definition_from_proto(
     })
 }
 
-fn tokenizer_to_proto(config: &TokenizerConfig) -> v1::ComponentConfig {
-    let (type_name, params) = match config {
-        TokenizerConfig::Whitespace => ("whitespace", HashMap::new()),
-        TokenizerConfig::UnicodeWord => ("unicode_word", HashMap::new()),
-        TokenizerConfig::Regex { pattern, gaps } => {
-            let mut p = HashMap::new();
-            p.insert("pattern".into(), pattern.clone());
-            if *gaps {
-                p.insert("gaps".into(), "true".into());
-            }
-            ("regex", p)
-        }
-        TokenizerConfig::Ngram { min_gram, max_gram } => {
-            let mut p = HashMap::new();
-            p.insert("min_gram".into(), min_gram.to_string());
-            p.insert("max_gram".into(), max_gram.to_string());
-            ("ngram", p)
-        }
-        TokenizerConfig::Lindera {
-            mode,
-            dict,
-            user_dict,
-        } => {
-            let mut p = HashMap::new();
-            p.insert("mode".into(), mode.clone());
-            p.insert("dict".into(), dict.clone());
-            if let Some(ud) = user_dict {
-                p.insert("user_dict".into(), ud.clone());
-            }
-            ("lindera", p)
-        }
-        TokenizerConfig::Whole => ("whole", HashMap::new()),
+/// The error for a component in the form before Issue #1478, from a server
+/// or a client on the other side of that change.
+const LEGACY_COMPONENT_ERROR: &str = "the component sets `type` or `params`, the form \
+     before Issue #1478, which is no longer read; send it as `config` (a server and a \
+     client from before and after that change do not work together)";
+
+/// Convert a core analyzer component ([`laurus::TokenizerConfig`],
+/// [`laurus::CharFilterConfig`] or [`laurus::TokenFilterConfig`]) to its proto
+/// form, whose `config` holds the component's serde form: the shape
+/// `schema.toml` stores and the HTTP API takes (Issue #1478).
+///
+/// The value goes through JSON text, so that an `f32` such as a boost of 0.1
+/// is written as 0.1; `serde_json::to_value` would widen it to
+/// 0.10000000149011612 first. An unset optional parameter, which serializes as
+/// `null`, is left out, while an empty list or table (`words: []`,
+/// `mapping: {}`) is kept, since it is not the same as an omitted key. The
+/// fields of the form before Issue #1478 stay empty, so that a server from
+/// before then rejects the component as an unknown type instead of building it
+/// with its defaults.
+fn component_to_proto<T: Serialize>(component: &T) -> v1::ComponentConfig {
+    let text = serde_json::to_string(component).expect("an analyzer component serializes to JSON");
+    let serde_json::Value::Object(mut obj) =
+        serde_json::from_str(&text).expect("serialized JSON parses")
+    else {
+        unreachable!("an analyzer component serializes to a JSON object");
     };
+    obj.retain(|_, value| !value.is_null());
     v1::ComponentConfig {
-        r#type: type_name.into(),
-        params,
+        config: Some(proto_struct::json_object_to_proto_struct(&obj)),
+        ..Default::default()
     }
 }
 
-fn tokenizer_from_proto(proto: &v1::ComponentConfig) -> Result<TokenizerConfig, String> {
-    match proto.r#type.as_str() {
-        "whitespace" => Ok(TokenizerConfig::Whitespace),
-        "unicode_word" => Ok(TokenizerConfig::UnicodeWord),
-        "regex" => Ok(TokenizerConfig::Regex {
-            pattern: proto
-                .params
-                .get("pattern")
-                .cloned()
-                .unwrap_or_else(|| r"\w+".into()),
-            gaps: proto.params.get("gaps").is_some_and(|v| v == "true"),
-        }),
-        "ngram" => {
-            let min_gram = proto
-                .params
-                .get("min_gram")
-                .ok_or("ngram: missing min_gram")?
-                .parse::<usize>()
-                .map_err(|e| format!("ngram: invalid min_gram: {e}"))?;
-            let max_gram = proto
-                .params
-                .get("max_gram")
-                .ok_or("ngram: missing max_gram")?
-                .parse::<usize>()
-                .map_err(|e| format!("ngram: invalid max_gram: {e}"))?;
-            Ok(TokenizerConfig::Ngram { min_gram, max_gram })
-        }
-        "lindera" => Ok(TokenizerConfig::Lindera {
-            mode: proto
-                .params
-                .get("mode")
-                .cloned()
-                .unwrap_or_else(|| "normal".into()),
-            dict: proto
-                .params
-                .get("dict")
-                .cloned()
-                .ok_or("lindera: missing dict")?,
-            user_dict: proto.params.get("user_dict").cloned(),
-        }),
-        "whole" => Ok(TokenizerConfig::Whole),
-        other => Err(format!("Unknown tokenizer type: {other}")),
+/// Convert a proto analyzer component to a core one with serde, so that it is
+/// read by the rules `schema.toml` is read by: the same types, required keys
+/// and defaults (Issue #1478). A top-level `null` is the same as omitting the
+/// key, as everywhere in the HTTP API.
+///
+/// # Errors
+///
+/// Returns an error for a component that sets a field of the form before
+/// Issue #1478 (`type`, `params`) or has no `config`; that holds a number that
+/// is not finite or a value with no kind (see
+/// [`proto_struct::proto_struct_to_json`]); or that does not deserialize: an
+/// unknown `type`, a missing required key, or a value of the wrong type.
+fn component_from_proto<T: DeserializeOwned>(proto: &v1::ComponentConfig) -> Result<T, String> {
+    #[allow(deprecated)]
+    let legacy = !proto.r#type.is_empty() || !proto.params.is_empty();
+    if legacy {
+        return Err(LEGACY_COMPONENT_ERROR.to_string());
     }
-}
-
-fn char_filter_to_proto(config: &CharFilterConfig) -> v1::ComponentConfig {
-    let (type_name, params) = match config {
-        CharFilterConfig::UnicodeNormalization { form } => {
-            let mut p = HashMap::new();
-            p.insert("form".into(), form.clone());
-            ("unicode_normalization", p)
-        }
-        CharFilterConfig::PatternReplace {
-            pattern,
-            replacement,
-        } => {
-            let mut p = HashMap::new();
-            p.insert("pattern".into(), pattern.clone());
-            p.insert("replacement".into(), replacement.clone());
-            ("pattern_replace", p)
-        }
-        CharFilterConfig::Mapping { mapping } => {
-            // Encode mapping as key=value pairs in params. `mapping` is a
-            // `BTreeMap` (Issue #1060); `params` is the proto's `HashMap`.
-            let p: HashMap<String, String> = mapping
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            ("mapping", p)
-        }
-        CharFilterConfig::JapaneseIterationMark { kanji, kana } => {
-            let mut p = HashMap::new();
-            p.insert("kanji".into(), kanji.to_string());
-            p.insert("kana".into(), kana.to_string());
-            ("japanese_iteration_mark", p)
-        }
-    };
-    v1::ComponentConfig {
-        r#type: type_name.into(),
-        params,
-    }
-}
-
-fn char_filter_from_proto(proto: &v1::ComponentConfig) -> Result<CharFilterConfig, String> {
-    match proto.r#type.as_str() {
-        "unicode_normalization" => Ok(CharFilterConfig::UnicodeNormalization {
-            form: proto
-                .params
-                .get("form")
-                .cloned()
-                .unwrap_or_else(|| "nfkc".into()),
-        }),
-        "pattern_replace" => Ok(CharFilterConfig::PatternReplace {
-            pattern: proto
-                .params
-                .get("pattern")
-                .cloned()
-                .ok_or("pattern_replace: missing pattern")?,
-            replacement: proto.params.get("replacement").cloned().unwrap_or_default(),
-        }),
-        "mapping" => Ok(CharFilterConfig::Mapping {
-            mapping: proto
-                .params
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        }),
-        "japanese_iteration_mark" => Ok(CharFilterConfig::JapaneseIterationMark {
-            kanji: proto.params.get("kanji").is_none_or(|v| v != "false"),
-            kana: proto.params.get("kana").is_none_or(|v| v != "false"),
-        }),
-        other => Err(format!("Unknown char filter type: {other}")),
-    }
-}
-
-fn token_filter_to_proto(config: &TokenFilterConfig) -> v1::ComponentConfig {
-    let (type_name, params) = match config {
-        TokenFilterConfig::Lowercase => ("lowercase", HashMap::new()),
-        TokenFilterConfig::Stop { words } => {
-            let mut p = HashMap::new();
-            if let Some(word_list) = words {
-                p.insert("words".into(), word_list.join(","));
-            }
-            ("stop", p)
-        }
-        TokenFilterConfig::Stem { stem_type } => {
-            let mut p = HashMap::new();
-            if let Some(st) = stem_type {
-                p.insert("stem_type".into(), st.clone());
-            }
-            ("stem", p)
-        }
-        TokenFilterConfig::Boost { boost } => {
-            let mut p = HashMap::new();
-            p.insert("boost".into(), boost.to_string());
-            ("boost", p)
-        }
-        TokenFilterConfig::Limit { limit } => {
-            let mut p = HashMap::new();
-            p.insert("limit".into(), limit.to_string());
-            ("limit", p)
-        }
-        TokenFilterConfig::Strip => ("strip", HashMap::new()),
-        TokenFilterConfig::RemoveEmpty => ("remove_empty", HashMap::new()),
-        TokenFilterConfig::FlattenGraph => ("flatten_graph", HashMap::new()),
-    };
-    v1::ComponentConfig {
-        r#type: type_name.into(),
-        params,
-    }
-}
-
-fn token_filter_from_proto(proto: &v1::ComponentConfig) -> Result<TokenFilterConfig, String> {
-    match proto.r#type.as_str() {
-        "lowercase" => Ok(TokenFilterConfig::Lowercase),
-        "stop" => Ok(TokenFilterConfig::Stop {
-            words: proto.params.get("words").map(|w| {
-                w.split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect::<Vec<_>>()
-            }),
-        }),
-        "stem" => Ok(TokenFilterConfig::Stem {
-            stem_type: proto.params.get("stem_type").cloned(),
-        }),
-        "boost" => {
-            let boost = proto
-                .params
-                .get("boost")
-                .ok_or("boost: missing boost")?
-                .parse::<f32>()
-                .map_err(|e| format!("boost: invalid value: {e}"))?;
-            Ok(TokenFilterConfig::Boost { boost })
-        }
-        "limit" => {
-            let limit = proto
-                .params
-                .get("limit")
-                .ok_or("limit: missing limit")?
-                .parse::<usize>()
-                .map_err(|e| format!("limit: invalid value: {e}"))?;
-            Ok(TokenFilterConfig::Limit { limit })
-        }
-        "strip" => Ok(TokenFilterConfig::Strip),
-        "remove_empty" => Ok(TokenFilterConfig::RemoveEmpty),
-        "flatten_graph" => Ok(TokenFilterConfig::FlattenGraph),
-        other => Err(format!("Unknown token filter type: {other}")),
-    }
+    let config = proto
+        .config
+        .as_ref()
+        .ok_or("the component has no `config`")?;
+    let mut obj = proto_struct::proto_struct_to_json(config)?;
+    obj.retain(|_, value| !value.is_null());
+    serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| e.to_string())
 }
 
 // ---- Embedder definition conversion ----
@@ -2121,6 +1959,414 @@ mod tests {
                 "unset doc_values must default to true, not the proto3 zero-value"
             ),
             other => panic!("expected FieldOption::Text, got {other:?}"),
+        }
+    }
+
+    /// Issue #1478: analyzer components travel in `ComponentConfig.config`
+    /// as their serde form and are read back with serde.
+    mod analyzer_components {
+        use std::collections::BTreeMap;
+        use std::fmt::Debug;
+
+        use laurus::{CharFilterConfig, TokenFilterConfig, TokenizerConfig};
+        use prost::Message;
+        use prost_types::value::Kind;
+        use serde_json::{Value, json};
+
+        use super::super::*;
+
+        /// A component whose `config` is `json`, which must be an object.
+        fn component(json: Value) -> v1::ComponentConfig {
+            v1::ComponentConfig {
+                config: Some(proto_struct::json_object_to_proto_struct(
+                    json.as_object().expect("a component is an object"),
+                )),
+                ..Default::default()
+            }
+        }
+
+        /// The JSON object a component's `config` holds.
+        fn config_json(proto: &v1::ComponentConfig) -> Value {
+            Value::Object(
+                proto_struct::proto_struct_to_json(proto.config.as_ref().expect("config is set"))
+                    .expect("config converts to JSON"),
+            )
+        }
+
+        /// Every tokenizer type, with parameters other than the defaults.
+        fn every_tokenizer() -> Vec<TokenizerConfig> {
+            let all = vec![
+                TokenizerConfig::Whitespace,
+                TokenizerConfig::UnicodeWord,
+                TokenizerConfig::Regex {
+                    pattern: "[a-z]+".into(),
+                    gaps: true,
+                },
+                TokenizerConfig::Ngram {
+                    min_gram: 2,
+                    max_gram: 3,
+                },
+                TokenizerConfig::Lindera {
+                    mode: "decompose".into(),
+                    dict: "/var/lib/lindera/ipadic".into(),
+                    user_dict: Some("/var/lib/lindera/user.csv".into()),
+                },
+                TokenizerConfig::Whole,
+            ];
+            // No wildcard: a new tokenizer type does not compile here until
+            // it is added above.
+            for tokenizer in &all {
+                match tokenizer {
+                    TokenizerConfig::Whitespace
+                    | TokenizerConfig::UnicodeWord
+                    | TokenizerConfig::Regex { .. }
+                    | TokenizerConfig::Ngram { .. }
+                    | TokenizerConfig::Lindera { .. }
+                    | TokenizerConfig::Whole => {}
+                }
+            }
+            all
+        }
+
+        /// Every char filter type, with a mapping that has a key `type` and
+        /// an empty one.
+        fn every_char_filter() -> Vec<CharFilterConfig> {
+            let all = vec![
+                CharFilterConfig::UnicodeNormalization { form: "nfd".into() },
+                CharFilterConfig::PatternReplace {
+                    pattern: "a+".into(),
+                    replacement: "b".into(),
+                },
+                CharFilterConfig::Mapping {
+                    mapping: BTreeMap::from([
+                        ("type".to_string(), "t".to_string()),
+                        ("ph".to_string(), "f".to_string()),
+                    ]),
+                },
+                CharFilterConfig::Mapping {
+                    mapping: BTreeMap::new(),
+                },
+                CharFilterConfig::JapaneseIterationMark {
+                    kanji: false,
+                    kana: true,
+                },
+            ];
+            for char_filter in &all {
+                match char_filter {
+                    CharFilterConfig::UnicodeNormalization { .. }
+                    | CharFilterConfig::PatternReplace { .. }
+                    | CharFilterConfig::Mapping { .. }
+                    | CharFilterConfig::JapaneseIterationMark { .. } => {}
+                }
+            }
+            all
+        }
+
+        /// Every token filter type, with stop words that have commas and
+        /// spaces, an empty stop list and no stop list, and a boost of 0.1.
+        fn every_token_filter() -> Vec<TokenFilterConfig> {
+            let all = vec![
+                TokenFilterConfig::Lowercase,
+                TokenFilterConfig::Stop {
+                    words: Some(vec!["new,york".into(), " padded ".into(), "a,b".into()]),
+                },
+                TokenFilterConfig::Stop {
+                    words: Some(vec![]),
+                },
+                TokenFilterConfig::Stop { words: None },
+                TokenFilterConfig::Stem {
+                    stem_type: Some("simple".into()),
+                },
+                TokenFilterConfig::Stem { stem_type: None },
+                TokenFilterConfig::Boost { boost: 0.1 },
+                TokenFilterConfig::Limit { limit: 5 },
+                TokenFilterConfig::Strip,
+                TokenFilterConfig::RemoveEmpty,
+                TokenFilterConfig::FlattenGraph,
+            ];
+            for token_filter in &all {
+                match token_filter {
+                    TokenFilterConfig::Lowercase
+                    | TokenFilterConfig::Stop { .. }
+                    | TokenFilterConfig::Stem { .. }
+                    | TokenFilterConfig::Boost { .. }
+                    | TokenFilterConfig::Limit { .. }
+                    | TokenFilterConfig::Strip
+                    | TokenFilterConfig::RemoveEmpty
+                    | TokenFilterConfig::FlattenGraph => {}
+                }
+            }
+            all
+        }
+
+        /// `component` goes to proto, through the protobuf encoding, and
+        /// back unchanged. The core types do not implement `PartialEq`, so
+        /// they are compared as serde JSON.
+        fn assert_round_trips<T: Serialize + DeserializeOwned + Debug>(component: &T) {
+            let proto = component_to_proto(component);
+            let decoded = v1::ComponentConfig::decode(proto.encode_to_vec().as_slice())
+                .expect("the message decodes");
+            let back: T = component_from_proto(&decoded)
+                .unwrap_or_else(|e| panic!("{component:?} does not come back: {e}"));
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(component).unwrap(),
+                "{component:?}"
+            );
+        }
+
+        #[test]
+        fn every_component_type_round_trips() {
+            every_tokenizer().iter().for_each(assert_round_trips);
+            every_char_filter().iter().for_each(assert_round_trips);
+            every_token_filter().iter().for_each(assert_round_trips);
+        }
+
+        #[test]
+        fn to_proto_writes_the_serde_form_in_config() {
+            let cases = [
+                (
+                    component_to_proto(&TokenFilterConfig::Stop {
+                        words: Some(vec!["a,b".into(), " c".into()]),
+                    }),
+                    json!({"type": "stop", "words": ["a,b", " c"]}),
+                ),
+                (
+                    component_to_proto(&TokenFilterConfig::Stop {
+                        words: Some(vec![]),
+                    }),
+                    json!({"type": "stop", "words": []}),
+                ),
+                (
+                    component_to_proto(&TokenFilterConfig::Stop { words: None }),
+                    json!({"type": "stop"}),
+                ),
+                (
+                    component_to_proto(&CharFilterConfig::Mapping {
+                        mapping: BTreeMap::new(),
+                    }),
+                    json!({"type": "mapping", "mapping": {}}),
+                ),
+                (
+                    component_to_proto(&TokenizerConfig::Lindera {
+                        mode: "normal".into(),
+                        dict: "/d".into(),
+                        user_dict: None,
+                    }),
+                    json!({"type": "lindera", "mode": "normal", "dict": "/d"}),
+                ),
+                (
+                    component_to_proto(&TokenizerConfig::Ngram {
+                        min_gram: 2,
+                        max_gram: 3,
+                    }),
+                    json!({"type": "ngram", "min_gram": 2, "max_gram": 3}),
+                ),
+            ];
+            for (proto, expected) in cases {
+                assert_eq!(config_json(&proto), expected);
+                #[allow(deprecated)]
+                let legacy_is_empty = proto.r#type.is_empty() && proto.params.is_empty();
+                assert!(legacy_is_empty, "{expected}");
+            }
+
+            // 0.1 as the double 0.1, not the widened f32 0.10000000149011612.
+            let proto = component_to_proto(&TokenFilterConfig::Boost { boost: 0.1 });
+            let boost = &proto.config.as_ref().unwrap().fields["boost"];
+            assert_eq!(boost.kind, Some(Kind::NumberValue(0.1)));
+        }
+
+        #[test]
+        fn the_form_before_issue_1478_is_rejected() {
+            let whitespace = component(json!({"type": "whitespace"}));
+            #[allow(deprecated)]
+            let cases = [
+                // `type` set as well as `config`.
+                v1::ComponentConfig {
+                    r#type: "whitespace".into(),
+                    ..whitespace.clone()
+                },
+                // `params` that would change nothing if ignored.
+                v1::ComponentConfig {
+                    params: HashMap::from([("form".to_string(), "nfc".to_string())]),
+                    ..component(json!({"type": "unicode_normalization", "form": "nfc"}))
+                },
+                // The old form alone.
+                v1::ComponentConfig {
+                    r#type: "lowercase".into(),
+                    ..Default::default()
+                },
+            ];
+            for proto in &cases {
+                let err = component_from_proto::<TokenizerConfig>(proto).unwrap_err();
+                assert_eq!(err, LEGACY_COMPONENT_ERROR, "{proto:?}");
+            }
+
+            let err = component_from_proto::<TokenizerConfig>(&v1::ComponentConfig::default())
+                .unwrap_err();
+            assert_eq!(err, "the component has no `config`");
+            assert!(component_from_proto::<TokenizerConfig>(&whitespace).is_ok());
+        }
+
+        #[test]
+        fn whole_doubles_fill_integer_parameters_and_others_are_rejected() {
+            let ngram: TokenizerConfig = component_from_proto(&component(
+                json!({"type": "ngram", "min_gram": 2.0, "max_gram": 3.0}),
+            ))
+            .unwrap();
+            assert!(matches!(
+                ngram,
+                TokenizerConfig::Ngram {
+                    min_gram: 2,
+                    max_gram: 3
+                }
+            ));
+            for limit in [2.5, -1.0, 1e20, 18_446_744_073_709_551_616.0] {
+                let result = component_from_proto::<TokenFilterConfig>(&component(
+                    json!({"type": "limit", "limit": limit}),
+                ));
+                assert!(
+                    result.is_err(),
+                    "limit {limit} must be rejected: {result:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_number_that_is_not_finite_or_a_value_with_no_kind_is_rejected() {
+            let with_limit = |kind: Option<Kind>| {
+                let mut proto = component(json!({"type": "limit", "limit": 1}));
+                proto
+                    .config
+                    .as_mut()
+                    .unwrap()
+                    .fields
+                    .insert("limit".to_string(), prost_types::Value { kind });
+                proto
+            };
+            for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let err = component_from_proto::<TokenFilterConfig>(&with_limit(Some(
+                    Kind::NumberValue(n),
+                )))
+                .unwrap_err();
+                assert!(
+                    err.starts_with("limit: ") && err.contains("finite"),
+                    "{err}"
+                );
+            }
+            let err = component_from_proto::<TokenFilterConfig>(&with_limit(None)).unwrap_err();
+            assert_eq!(err, "limit: the value has no kind");
+        }
+
+        #[test]
+        fn required_keys_and_types_are_the_ones_schema_toml_has() {
+            let cases: [(Value, &str); 7] = [
+                (
+                    json!({"type": "unicode_normalization"}),
+                    "missing field `form`",
+                ),
+                (
+                    json!({"type": "pattern_replace", "pattern": "a"}),
+                    "missing field `replacement`",
+                ),
+                (
+                    json!({"type": "lindera", "dict": "/d"}),
+                    "missing field `mode`",
+                ),
+                (
+                    json!({"type": "ngram", "max_gram": 3}),
+                    "missing field `min_gram`",
+                ),
+                (
+                    json!({"type": "japanese_iteration_mark", "kanji": "False"}),
+                    "invalid type: string \"False\", expected a boolean",
+                ),
+                (
+                    json!({"type": "ngram", "min_gram": "2", "max_gram": 3}),
+                    "invalid type: string \"2\", expected usize",
+                ),
+                (json!({"type": "nope"}), "unknown variant `nope`"),
+            ];
+            for (json, expected) in cases {
+                let proto = component(json.clone());
+                let err = match json["type"].as_str() {
+                    Some(
+                        "unicode_normalization" | "pattern_replace" | "japanese_iteration_mark",
+                    ) => component_from_proto::<CharFilterConfig>(&proto).map(|_| ()),
+                    _ => component_from_proto::<TokenizerConfig>(&proto).map(|_| ()),
+                }
+                .unwrap_err();
+                assert!(err.contains(expected), "{json}: {err}");
+                // schema.toml rejects the same component.
+                let toml_value: toml::Value = serde_json::from_value(json.clone()).unwrap();
+                let toml_text = toml::to_string(&toml_value).unwrap();
+                let from_toml = match json["type"].as_str() {
+                    Some(
+                        "unicode_normalization" | "pattern_replace" | "japanese_iteration_mark",
+                    ) => toml::from_str::<CharFilterConfig>(&toml_text).map(|_| ()),
+                    _ => toml::from_str::<TokenizerConfig>(&toml_text).map(|_| ()),
+                };
+                assert!(from_toml.is_err(), "schema.toml takes {json}");
+            }
+        }
+
+        #[test]
+        fn a_top_level_null_is_the_same_as_omitting_the_key() {
+            let regex: TokenizerConfig = component_from_proto(&component(
+                json!({"type": "regex", "pattern": null, "gaps": null}),
+            ))
+            .unwrap();
+            assert!(
+                matches!(&regex, TokenizerConfig::Regex { pattern, gaps: false } if pattern == r"\w+"),
+                "{regex:?}"
+            );
+            let marks: CharFilterConfig = component_from_proto(&component(
+                json!({"type": "japanese_iteration_mark", "kanji": null}),
+            ))
+            .unwrap();
+            assert!(matches!(
+                marks,
+                CharFilterConfig::JapaneseIterationMark {
+                    kanji: true,
+                    kana: true
+                }
+            ));
+            let stop: TokenFilterConfig =
+                component_from_proto(&component(json!({"type": "stop", "words": null}))).unwrap();
+            assert!(matches!(stop, TokenFilterConfig::Stop { words: None }));
+        }
+
+        #[test]
+        fn errors_name_the_analyzer_and_the_component() {
+            let analyzer = |char_filters, tokenizer, token_filters| v1::Schema {
+                analyzers: HashMap::from([(
+                    "a".to_string(),
+                    v1::AnalyzerDefinition {
+                        char_filters,
+                        tokenizer: Some(tokenizer),
+                        token_filters,
+                    },
+                )]),
+                ..Default::default()
+            };
+            let ok = || component(json!({"type": "lowercase"}));
+            let bad = || component(json!({"type": "limit"}));
+            let whitespace = || component(json!({"type": "whitespace"}));
+            let cases = [
+                (analyzer(vec![], bad(), vec![]), "Analyzer 'a': tokenizer: "),
+                (
+                    analyzer(vec![bad()], whitespace(), vec![]),
+                    "Analyzer 'a': char_filters[0]: ",
+                ),
+                (
+                    analyzer(vec![], whitespace(), vec![ok(), bad()]),
+                    "Analyzer 'a': token_filters[1]: ",
+                ),
+            ];
+            for (schema, prefix) in cases {
+                let err = from_proto(&schema).unwrap_err();
+                assert!(err.starts_with(prefix), "{err}");
+            }
         }
     }
 }

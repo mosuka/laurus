@@ -9,6 +9,7 @@ use crate::convert::json::{
     json_optional_array, json_optional_bool, json_optional_f64, json_optional_object,
     json_optional_str, json_optional_string_array, json_optional_u32, json_optional_u64,
 };
+use crate::convert::proto_struct;
 use crate::proto::laurus::v1;
 
 // ---------------------------------------------------------------------------
@@ -1542,9 +1543,12 @@ pub fn proto_search_response_to_json(response: &v1::SearchResponse) -> Value {
 /// # Errors
 ///
 /// Returns an error when `json` is not an object, has no `tokenizer`, or a
-/// component is invalid, or when `char_filters` or `token_filters` is
+/// component is not an object or is nested too deeply (see
+/// [`json_to_proto_component`]; the message names the component, such as
+/// `token_filters[0]: ...`), or when `char_filters` or `token_filters` is
 /// present and not `null` but not an array, which used to be the same as
-/// omitting it (Issue #1524).
+/// omitting it (Issue #1524). The server checks each component's type and
+/// parameters.
 fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinition, String> {
     let obj = json
         .as_object()
@@ -1553,11 +1557,18 @@ fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinit
     let tokenizer = obj
         .get("tokenizer")
         .ok_or("analyzer definition missing 'tokenizer'")?;
-    let tokenizer = json_to_proto_component(tokenizer)?;
+    let tokenizer = json_to_proto_component(tokenizer).map_err(|e| format!("tokenizer: {e}"))?;
 
     let components = |key: &str| -> Result<Vec<v1::ComponentConfig>, String> {
         json_optional_array(obj, key)?
-            .map(|arr| arr.iter().map(json_to_proto_component).collect())
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        json_to_proto_component(c).map_err(|e| format!("{key}[{i}]: {e}"))
+                    })
+                    .collect()
+            })
             .transpose()
             .map(Option::unwrap_or_default)
     };
@@ -1571,54 +1582,43 @@ fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinit
     })
 }
 
+/// The deepest a component may nest objects and arrays, itself included.
+/// The deepest a component needs is 2 (a `mapping` table, or the `words`
+/// list); the limit keeps a request away from prost's recursion limit,
+/// which makes the server answer `INTERNAL` (500) instead of 400.
+const MAX_COMPONENT_DEPTH: usize = 8;
+
+/// How deeply `json` nests objects and arrays: 0 for a scalar, 1 for an
+/// object or array of scalars.
+fn json_depth(json: &Value) -> usize {
+    match json {
+        Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        Value::Object(obj) => 1 + obj.values().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Converts a JSON analyzer component to the proto message, as it is: the
+/// object, `type` included, becomes `config` (Issue #1478). The server
+/// deserializes it into the core component type, so it checks the type and
+/// the parameters by the rules `schema.toml` is read by.
+///
+/// # Errors
+///
+/// Returns an error when `json` is not an object or nests deeper than
+/// [`MAX_COMPONENT_DEPTH`].
 fn json_to_proto_component(json: &Value) -> Result<v1::ComponentConfig, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| "component config must be an object".to_string())?;
-    let type_name = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or("component config missing 'type'")?
-        .to_string();
-
-    let mut params = HashMap::new();
-    for (k, v) in obj {
-        if k == "type" {
-            continue;
-        }
-        match v {
-            Value::String(s) => {
-                params.insert(k.clone(), s.clone());
-            }
-            Value::Bool(b) => {
-                params.insert(k.clone(), b.to_string());
-            }
-            Value::Number(n) => {
-                params.insert(k.clone(), n.to_string());
-            }
-            Value::Array(arr) => {
-                // Encode arrays as comma-separated strings.
-                let items: Vec<String> = arr
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-                params.insert(k.clone(), items.join(","));
-            }
-            Value::Object(map) => {
-                // Encode nested objects as key=value entries with prefixed keys.
-                for (mk, mv) in map {
-                    if let Some(s) = mv.as_str() {
-                        params.insert(mk.clone(), s.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+    if json_depth(json) > MAX_COMPONENT_DEPTH {
+        return Err(format!(
+            "component config must not nest more than {MAX_COMPONENT_DEPTH} levels deep"
+        ));
     }
-
     Ok(v1::ComponentConfig {
-        r#type: type_name,
-        params,
+        config: Some(proto_struct::json_object_to_proto_struct(obj)),
+        ..Default::default()
     })
 }
 
@@ -1646,12 +1646,16 @@ fn proto_analyzer_definition_to_json(def: &v1::AnalyzerDefinition) -> Value {
     obj
 }
 
+/// Converts a proto analyzer component to JSON: its `config`, in the shape a
+/// request uses, with whole numbers as integers (Issue #1478). The fields of
+/// the form before Issue #1478 are not read; the server never sets them.
 fn proto_component_to_json(comp: &v1::ComponentConfig) -> Value {
-    let mut obj = json!({"type": comp.r#type});
-    for (k, v) in &comp.params {
-        obj[k] = json!(v);
-    }
-    obj
+    Value::Object(
+        comp.config
+            .as_ref()
+            .map(proto_struct::proto_struct_to_json_lenient)
+            .unwrap_or_default(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4177,5 +4181,108 @@ mod tests {
             None
         );
         assert_eq!(proto_field_change_kind_to_json(9999), None);
+    }
+
+    /// Issue #1478: a component goes into `config` as it is, and comes back
+    /// in the same shape. This used to join an array with commas, drop the
+    /// items that were not strings and flatten a nested object.
+    #[test]
+    fn analyzer_components_pass_through_as_sent() {
+        let analyzer = json!({
+            "char_filters": [
+                {"type": "mapping", "mapping": {"type": "t", "ph": "f"}},
+                {"type": "japanese_iteration_mark", "kanji": false}
+            ],
+            "tokenizer": {"type": "ngram", "min_gram": 2, "max_gram": 3},
+            "token_filters": [
+                {"type": "stop", "words": ["new,york", " padded ", "x"]},
+                {"type": "boost", "boost": 0.1},
+                {"type": "stop", "words": []}
+            ]
+        });
+        let proto = json_to_proto_analyzer_definition(&analyzer).unwrap();
+
+        // The proto carries each object in `config`, with nothing in the
+        // fields of the form before Issue #1478.
+        let tokenizer = proto.tokenizer.as_ref().unwrap();
+        #[allow(deprecated)]
+        let legacy_is_empty = tokenizer.r#type.is_empty() && tokenizer.params.is_empty();
+        assert!(legacy_is_empty);
+        assert_eq!(
+            Value::Object(
+                crate::convert::proto_struct::proto_struct_to_json(
+                    proto.token_filters[0].config.as_ref().unwrap()
+                )
+                .unwrap()
+            ),
+            json!({"type": "stop", "words": ["new,york", " padded ", "x"]})
+        );
+
+        // And it comes back unchanged: whole numbers as integers, the
+        // mapping nested with its key `type`, 0.1 as 0.1.
+        let back = proto_analyzer_definition_to_json(&proto);
+        assert_eq!(back, analyzer);
+        assert!(back["tokenizer"]["min_gram"].is_u64());
+    }
+
+    #[test]
+    fn an_analyzer_component_must_be_an_object_and_not_too_deep() {
+        let error = |analyzer: Value| json_to_proto_analyzer_definition(&analyzer).unwrap_err();
+        assert_eq!(
+            error(json!({"tokenizer": "whitespace"})),
+            "tokenizer: component config must be an object"
+        );
+        assert_eq!(
+            error(
+                json!({"tokenizer": {"type": "whitespace"}, "token_filters": [{"type": "lowercase"}, ["stop"]]})
+            ),
+            "token_filters[1]: component config must be an object"
+        );
+
+        // 8 levels (the component and 7 nested objects) is the limit.
+        let nested = |levels: usize| {
+            let mut value = json!("x");
+            for _ in 0..levels {
+                value = json!({"k": value});
+            }
+            value
+        };
+        let at_limit = json!({"type": "mapping", "mapping": nested(MAX_COMPONENT_DEPTH - 1)});
+        assert_eq!(json_depth(&at_limit), MAX_COMPONENT_DEPTH);
+        assert!(json_to_proto_analyzer_definition(&json!({"tokenizer": at_limit})).is_ok());
+        let too_deep = json!({"type": "mapping", "mapping": nested(MAX_COMPONENT_DEPTH)});
+        assert_eq!(
+            error(json!({"tokenizer": too_deep})),
+            "tokenizer: component config must not nest more than 8 levels deep"
+        );
+    }
+
+    /// A whole number in a component's `config` is written as a JSON
+    /// integer, since an integer parameter such as `min_gram` rejects a
+    /// float; the fields of the form before Issue #1478 are not read.
+    #[test]
+    fn a_component_in_a_response_writes_whole_numbers_as_integers() {
+        let config = prost_types::Struct {
+            fields: [
+                (
+                    "type",
+                    prost_types::value::Kind::StringValue("limit".into()),
+                ),
+                ("limit", prost_types::value::Kind::NumberValue(5.0)),
+                ("x", prost_types::value::Kind::NumberValue(2.5)),
+            ]
+            .into_iter()
+            .map(|(k, kind)| (k.to_string(), prost_types::Value { kind: Some(kind) }))
+            .collect(),
+        };
+        #[allow(deprecated)]
+        let component = v1::ComponentConfig {
+            r#type: "ignored".into(),
+            params: HashMap::from([("limit".to_string(), "1".to_string())]),
+            config: Some(config),
+        };
+        let json = proto_component_to_json(&component);
+        assert_eq!(json, json!({"type": "limit", "limit": 5, "x": 2.5}));
+        assert!(json["limit"].is_u64());
     }
 }

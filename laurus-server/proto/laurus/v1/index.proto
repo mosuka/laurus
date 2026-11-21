@@ -1,6 +1,8 @@
 syntax = "proto3";
 package laurus.v1;
 
+import "google/protobuf/struct.proto";
+
 // Service for index lifecycle and schema management.
 service IndexService {
   // Create a new index with the given schema.
@@ -78,12 +80,28 @@ message AnalyzerDefinition {
   repeated ComponentConfig token_filters = 3;
 }
 
-// A generic component configuration (tokenizer, char filter, or token filter).
+// A component of an analyzer: a tokenizer, a char filter or a token filter.
+//
+// Before Issue #1478 a component was `type` and `params`, which carried every
+// parameter as a string and so could not carry a list or a table as sent. A
+// server since then rejects a component that sets either of them, and a
+// client since then rejects such a component in a response, so that a server
+// and a client of different versions fail instead of building the component
+// with defaults.
 message ComponentConfig {
-  // Component type name (e.g. "whitespace", "lowercase", "unicode_normalization").
-  string type = 1;
-  // Type-specific parameters as string key-value pairs.
-  map<string, string> params = 2;
+  // The component's type before Issue #1478. Must be empty; see `config`.
+  string type = 1 [deprecated = true];
+  // The component's parameters before Issue #1478. Must be empty; see
+  // `config`.
+  map<string, string> params = 2 [deprecated = true];
+  // The component in the shape `schema.toml` and the HTTP API use: its
+  // `type` and its parameters, for example
+  // `{"type": "stop", "words": ["new,york", "the"]}` or
+  // `{"type": "ngram", "min_gram": 2, "max_gram": 3}`. The keys a type
+  // requires are the ones `schema.toml` requires. Numbers travel as
+  // doubles, so a whole number such as `2.0` also fills an integer
+  // parameter. A top-level `null` is the same as omitting the key.
+  google.protobuf.Struct config = 3;
 }
 
 // A field configuration, exactly one variant must be set.

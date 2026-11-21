@@ -4,7 +4,11 @@
 
 - **Rust** 1.89 以降（edition 2024）
 - **Cargo**（Rust に付属）
-- **protobuf コンパイラ**（`protoc`）-- `laurus-server` のビルドに必要
+- **protobuf コンパイラ**（`protoc`）-- `laurus-server` のビルドに必要。
+  標準の `.proto` ファイル（`google/protobuf/struct.proto`）も必要です。
+  protobuf のリリースのアーカイブでは、`bin/protoc` と並ぶ `include/` に入っています。
+  Debian と Ubuntu では `libprotobuf-dev` に入っており、`protobuf-compiler`
+  はこれを推奨するだけです
 - **[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)** --
   任意。静的リンクの musl バイナリをローカルでクロスビルドする場合のみ必要
   （[静的リンクの musl バイナリをクロスビルドする](#静的リンクの-musl-バイナリをクロスビルドする)を参照）
