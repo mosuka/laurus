@@ -30,9 +30,25 @@ use laurus_server::proto::laurus::v1::{
 use crate::convert;
 
 // ── Parameter structs ─────────────────────────────────────────────────────────
+//
+// Every tool reads its arguments into one of these structs, and each sets
+// `deny_unknown_fields` (Issue #1707): rmcp reads the arguments with
+// `serde_json::from_value` and turns a failure into a tool error, so an
+// argument a tool does not take, such as `"dryrun"` for `dry_run`, is
+// reported by name before the tool runs, instead of being dropped. A tool
+// that takes no arguments reads them into `NoArguments` for the same reason.
+// The rule also closes each tool's input schema (`"additionalProperties":
+// false`). A struct's doc comment becomes its tool's schema description, so
+// the rule is stated here rather than on each struct.
+
+/// Arguments of a tool that takes none: an empty object.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NoArguments {}
 
 /// Parameters for the `connect` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ConnectParams {
     /// gRPC endpoint of the laurus-server to connect to.
     ///
@@ -42,6 +58,7 @@ struct ConnectParams {
 
 /// Parameters for the `create_index` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateIndexParams {
     /// Schema definition as a JSON string.
     ///
@@ -75,6 +92,7 @@ struct CreateIndexParams {
 
 /// Parameters for the `put_document` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PutDocumentParams {
     /// External document identifier (used for retrieval and deduplication).
     id: String,
@@ -87,6 +105,7 @@ struct PutDocumentParams {
 
 /// Parameters for the `add_document` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddDocumentParams {
     /// External document identifier (used for retrieval and deduplication).
     id: String,
@@ -99,6 +118,7 @@ struct AddDocumentParams {
 
 /// Parameters for the `put_documents` / `add_documents` tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BulkDocumentsParams {
     /// Array of `{"id": "...", "fields": {...}}` entries, applied
     /// sequentially in input order with one WAL fsync for the whole batch.
@@ -110,6 +130,7 @@ struct BulkDocumentsParams {
 
 /// Parameters for the `get_documents` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetDocumentsParams {
     /// External document identifier to look up.
     id: String,
@@ -117,6 +138,7 @@ struct GetDocumentsParams {
 
 /// Parameters for the `delete_documents` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteDocumentsParams {
     /// External document identifier to delete.
     id: String,
@@ -124,6 +146,7 @@ struct DeleteDocumentsParams {
 
 /// Parameters for the `search` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchParams {
     /// Search query string in the laurus unified query DSL.
     ///
@@ -210,6 +233,7 @@ struct SearchParams {
 
 /// Parameters for the `search_batch` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchBatchParams {
     /// Array of query strings, each in the laurus unified query DSL (same
     /// syntax as the `search` tool's `query`). All queries are executed in
@@ -235,6 +259,7 @@ struct SearchBatchParams {
 
 /// Parameters for the `add_field` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddFieldParams {
     /// The name of the new field to add.
     name: String,
@@ -254,6 +279,7 @@ struct AddFieldParams {
 
 /// Parameters for the `delete_field` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteFieldParams {
     /// The name of the field to remove from the index schema.
     name: String,
@@ -261,6 +287,7 @@ struct DeleteFieldParams {
 
 /// Parameters for the `update_field` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateFieldParams {
     /// The name of the field to update. Must already exist.
     name: String,
@@ -397,7 +424,10 @@ impl LaurusMcpServer {
     #[tool(
         description = "Get statistics for the current search index, including document count and vector field information."
     )]
-    async fn get_stats(&self) -> Result<CallToolResult, McpError> {
+    async fn get_stats(
+        &self,
+        Parameters(NoArguments {}): Parameters<NoArguments>,
+    ) -> Result<CallToolResult, McpError> {
         let channel = match self.channel.read().await.clone() {
             Some(ch) => ch,
             None => {
@@ -429,7 +459,10 @@ impl LaurusMcpServer {
     #[tool(
         description = "Get the current index schema, including all field definitions and their configurations. Returns the schema as a JSON object."
     )]
-    async fn get_schema(&self) -> Result<CallToolResult, McpError> {
+    async fn get_schema(
+        &self,
+        Parameters(NoArguments {}): Parameters<NoArguments>,
+    ) -> Result<CallToolResult, McpError> {
         let channel = match self.channel.read().await.clone() {
             Some(ch) => ch,
             None => {
@@ -896,7 +929,10 @@ impl LaurusMcpServer {
     #[tool(
         description = "Commit pending changes to disk. Must be called after put_document, add_document, or delete_documents to make changes searchable and durable."
     )]
-    async fn commit(&self) -> Result<CallToolResult, McpError> {
+    async fn commit(
+        &self,
+        Parameters(NoArguments {}): Parameters<NoArguments>,
+    ) -> Result<CallToolResult, McpError> {
         let channel = match self.channel.read().await.clone() {
             Some(ch) => ch,
             None => {
@@ -1164,8 +1200,153 @@ pub async fn run(endpoint: Option<&str>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use laurus_server::proto::laurus::v1::GroupByParams;
+    use serde::de::DeserializeOwned;
 
     use super::*;
+
+    /// Issue #1707: every tool's input schema, generated from the type its
+    /// arguments are read into, is closed (`"additionalProperties": false`),
+    /// so every tool, including one added later, rejects an argument it
+    /// does not take.
+    #[test]
+    fn every_tool_input_schema_is_closed() {
+        let tools = LaurusMcpServer::tool_router().list_all();
+        assert!(tools.len() >= 16, "only {} tools listed", tools.len());
+        let open: Vec<String> = tools
+            .iter()
+            .filter(|tool| tool.input_schema.get("additionalProperties") != Some(&json!(false)))
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(open.is_empty(), "tools with an open input schema: {open:?}");
+    }
+
+    /// Why `valid`, read as `T` the way rmcp reads a tool's arguments
+    /// (`serde_json::from_value`), is not accepted alone and rejected, naming
+    /// the key, with an unknown key added; `None` if it is.
+    fn unknown_key_problem<T: DeserializeOwned + std::fmt::Debug>(valid: Value) -> Option<String> {
+        if let Err(e) = serde_json::from_value::<T>(valid.clone()) {
+            return Some(format!("the valid arguments were rejected: {e}"));
+        }
+        let mut with_unknown = valid;
+        with_unknown
+            .as_object_mut()
+            .expect("arguments are an object")
+            .insert("__unknown__".to_string(), json!(true));
+        match serde_json::from_value::<T>(with_unknown) {
+            Ok(arguments) => Some(format!("accepted as {arguments:?}")),
+            Err(e) if !e.to_string().contains("unknown field `__unknown__`") => {
+                Some(format!("rejected without naming the key: {e}"))
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Issue #1707: each argument struct, and `NoArguments`, rejects a key
+    /// it does not declare, naming it, and still reads valid arguments.
+    #[test]
+    fn every_argument_struct_rejects_an_unknown_key() {
+        let document = json!({"id": "a", "fields": {"body": "x"}});
+        let field = json!({"name": "body", "field_option_json": "{\"Text\": {}}"});
+        let cases = [
+            ("NoArguments", unknown_key_problem::<NoArguments>(json!({}))),
+            (
+                "ConnectParams",
+                unknown_key_problem::<ConnectParams>(json!({"endpoint": "http://localhost:50051"})),
+            ),
+            (
+                "CreateIndexParams",
+                unknown_key_problem::<CreateIndexParams>(json!({"schema_json": "{}"})),
+            ),
+            (
+                "PutDocumentParams",
+                unknown_key_problem::<PutDocumentParams>(document.clone()),
+            ),
+            (
+                "AddDocumentParams",
+                unknown_key_problem::<AddDocumentParams>(document.clone()),
+            ),
+            (
+                "BulkDocumentsParams",
+                unknown_key_problem::<BulkDocumentsParams>(json!({"documents": [document]})),
+            ),
+            (
+                "GetDocumentsParams",
+                unknown_key_problem::<GetDocumentsParams>(json!({"id": "a"})),
+            ),
+            (
+                "DeleteDocumentsParams",
+                unknown_key_problem::<DeleteDocumentsParams>(json!({"id": "a"})),
+            ),
+            (
+                "SearchParams",
+                unknown_key_problem::<SearchParams>(json!({"query": "body:x"})),
+            ),
+            (
+                "SearchBatchParams",
+                unknown_key_problem::<SearchBatchParams>(json!({"queries": ["body:x"]})),
+            ),
+            (
+                "AddFieldParams",
+                unknown_key_problem::<AddFieldParams>(field.clone()),
+            ),
+            (
+                "DeleteFieldParams",
+                unknown_key_problem::<DeleteFieldParams>(json!({"name": "body"})),
+            ),
+            (
+                "UpdateFieldParams",
+                unknown_key_problem::<UpdateFieldParams>(field),
+            ),
+        ];
+        let failures: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(name, problem)| problem.map(|p| format!("{name}: {p}")))
+            .collect();
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Issue #1707: called through rmcp as an MCP client calls it,
+    /// `update_field` with `"dryrun": true` (meant as `dry_run`) is a tool
+    /// error naming `dryrun`, instead of a call that applies the change. The
+    /// laurus server's endpoint here accepts no connection, so a call that
+    /// got through to it would fail with a connection error instead.
+    #[tokio::test]
+    async fn update_field_with_a_misspelled_dry_run_is_a_tool_error_through_rmcp() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let server = LaurusMcpServer::new(Some(channel));
+        let server_task = tokio::spawn(async move {
+            let running = server.serve(server_io).await?;
+            running.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = ().serve(client_io).await.expect("the client connects");
+
+        let arguments = json!({
+            "name": "body",
+            "field_option_json": "{\"Text\": {\"stored\": false}}",
+            "dryrun": true,
+            "reindex": true,
+        });
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("update_field")
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .expect("the call returns a result");
+
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("unknown field `dryrun`"), "{result}");
+
+        client.cancel().await.expect("the client cancels");
+        server_task
+            .await
+            .expect("the server task")
+            .expect("the server");
+    }
 
     fn search_params(group_by: Option<&str>) -> SearchParams {
         SearchParams {

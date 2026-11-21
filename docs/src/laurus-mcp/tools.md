@@ -2,6 +2,8 @@
 
 The laurus MCP server exposes the following tools.
 
+An argument a tool does not take, such as a misspelled `"dryrun"` for `dry_run`, is a tool error that names it, such as ``failed to deserialize parameters: unknown field `dryrun` ...``, and the tool does nothing (Issue #1707). A tool that takes no arguments rejects any. The JSON inside `fusion`, `field_boosts`, `highlight`, `rescore` and `group_by` is read the way the HTTP gateway reads a request body, and still drops a key it does not know (Issue #1706).
+
 ## connect
 
 Connect to a running laurus-server gRPC endpoint. Call this before using other
