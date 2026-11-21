@@ -449,9 +449,8 @@ impl LexicalStore {
 
     /// The steps of [`Self::commit`] that follow the writer's commit.
     fn finish_commit(&self) -> Result<()> {
-        // Sync storage to ensure all file metadata (creation, rename, size) is
-        // flushed to disk. This is critical on Windows where directory listings
-        // and file visibility may be cached until the directory is synced.
+        // Sync the storage, so what the commit wrote, including the names of
+        // the files it created, renamed or removed, survives a crash.
         self.index.storage().sync()?;
         // Auto-merge after the new segment is visible (Issue #755): keeps the
         // segment count bounded without a manual `optimize()`. A no-op below the

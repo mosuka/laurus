@@ -578,9 +578,8 @@ impl UnifiedDocumentStore {
         };
 
         // temp + CRC-32 trailer + rename + sync, shared with every other
-        // control file in the tree (#1022). The sync matters beyond
-        // durability here: on Windows a cached directory listing would hide
-        // the renamed manifest and the new segment files from later reads.
+        // control file in the tree (#1022). The sync makes the names of the
+        // renamed manifest and the new segment files durable.
         manifest_io::save_checksummed_json(self.storage.as_ref(), MANIFEST_FILE, None, &manifest)
     }
 

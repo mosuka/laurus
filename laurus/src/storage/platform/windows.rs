@@ -15,8 +15,9 @@
 //! too, with `LAURUS_NO_MMAP=1` available as an opt-out for hosts
 //! where mmap misbehaves.
 //!
-//! Directories cannot be opened as files through `std`, so
-//! [`sync_dir`] is a no-op here.
+//! `std` opens a directory as a file only with
+//! `FILE_FLAG_BACKUP_SEMANTICS`, which [`sync_dir`] passes to flush the
+//! directory's entries (Issue #1667).
 //!
 //! An index directory's lock file (Issue #1665) is opened without
 //! `FILE_SHARE_DELETE`, so it cannot be removed or renamed while any call
@@ -29,6 +30,24 @@ use std::path::Path;
 
 /// `FILE_SHARE_READ | FILE_SHARE_WRITE`, without `FILE_SHARE_DELETE`.
 const LOCK_FILE_SHARE_MODE: u32 = 0x1 | 0x2;
+
+/// `FILE_FLAG_BACKUP_SEMANTICS`, without which a directory cannot be opened.
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// `FILE_ADD_FILE` (`FILE_WRITE_DATA`): the right to create a file in a
+/// directory.
+const FILE_ADD_FILE: u32 = 0x2;
+
+/// `FILE_ADD_SUBDIRECTORY` (`FILE_APPEND_DATA`): the right to create a
+/// subdirectory in a directory.
+const FILE_ADD_SUBDIRECTORY: u32 = 0x4;
+
+/// `ERROR_INVALID_FUNCTION`, which an SMB share returns for the flush of a
+/// directory.
+const ERROR_INVALID_FUNCTION: i32 = 1;
+
+/// `ERROR_NOT_SUPPORTED`.
+const ERROR_NOT_SUPPORTED: i32 = 50;
 
 /// Returns the platform default for [`crate::storage::file::FileStorageConfig::use_mmap`].
 ///
@@ -43,18 +62,65 @@ pub fn default_use_mmap() -> bool {
     !matches!(std::env::var("LAURUS_NO_MMAP").as_deref(), Ok("1"))
 }
 
-/// Does nothing: `std` cannot open a directory as a file on Windows, so
-/// there is no handle to flush (Issue #1587).
+/// Flush `dir`'s entries (the names created, renamed or removed in it) to
+/// disk, by opening the directory and calling `FlushFileBuffers` on it
+/// (Issue #1667).
 ///
-/// The file storage's own directory sync skips Windows the same way. A
-/// file's contents are still flushed by `File::sync_all`, and a rename is
-/// atomic, but the directory entries are not forced to disk.
+/// The flush needs a handle with the right to add a file or a subdirectory
+/// to `dir`. The directory is opened with the first, or with the second if
+/// the first is denied: a volume's root directory grants a user without
+/// administrator rights only the second.
+///
+/// Windows documents that the flush persists the directory's entries on
+/// NTFS only (MS-FSA, section 2.1.5.7); other file systems, such as ReFS
+/// and FAT, complete it without doing so. A file system that cannot flush
+/// a directory at all, such as an SMB share, fails it with
+/// `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED`; the sync then does
+/// nothing, logs that at debug level, and leaves the entries to the file
+/// system, as on any file system before Issue #1667.
 ///
 /// # Errors
 ///
-/// Never returns an error.
-pub fn sync_dir(_dir: &Path) -> io::Result<()> {
-    Ok(())
+/// Returns the error from opening the directory, including
+/// [`io::ErrorKind::NotFound`] for a missing one and
+/// [`io::ErrorKind::PermissionDenied`] when neither right is granted, or
+/// from flushing it, other than the two above.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    let file = open_dir_to_flush(dir)?;
+    match file.sync_all() {
+        Err(err) if cannot_flush_a_directory(&err) => {
+            log::debug!(
+                "{} cannot be flushed on its file system ({err}); its entries are left to the file system",
+                dir.display()
+            );
+            Ok(())
+        }
+        flushed => flushed,
+    }
+}
+
+/// Open the directory `dir` with the access a flush needs: the right to add
+/// a file, or the right to add a subdirectory if the first is denied.
+fn open_dir_to_flush(dir: &Path) -> io::Result<File> {
+    let open = |access| {
+        OpenOptions::new()
+            .access_mode(access)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+    };
+    match open(FILE_ADD_FILE) {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => open(FILE_ADD_SUBDIRECTORY),
+        opened => opened,
+    }
+}
+
+/// Whether `err`, from flushing a directory, means that its file system
+/// cannot flush a directory.
+fn cannot_flush_a_directory(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+    )
 }
 
 /// Does nothing: a new file inherits its access control list from the
@@ -133,4 +199,80 @@ pub fn remove_lock_file(file: File, path: &Path) -> io::Result<()> {
     let _ = file.unlock();
     drop(file);
     std::fs::remove_file(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_dir_syncs_a_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        sync_dir(dir.path()).unwrap();
+    }
+
+    /// Issue #1667: the directory is really opened; the body that only
+    /// returned `Ok(())` does not fail here.
+    #[test]
+    fn sync_dir_fails_on_a_missing_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = sync_dir(&dir.path().join("missing")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Issue #1667: a directory that denies the right to add a file is
+    /// opened with the right to add a subdirectory, which is all a volume's
+    /// root grants a user without administrator rights.
+    #[test]
+    fn sync_dir_opens_with_the_right_to_add_a_subdirectory_when_adding_a_file_is_denied() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let dir = parent.path().join("no_add_file");
+        std::fs::create_dir(&dir).unwrap();
+        // `*S-1-1-0` is Everyone, and `WD` is `FILE_ADD_FILE`.
+        let output = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/deny", "*S-1-1-0:(WD)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls failed: {output:?}");
+
+        let add_file = OpenOptions::new()
+            .access_mode(FILE_ADD_FILE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&dir);
+        if add_file.is_ok() {
+            // A process whose backup privilege is enabled bypasses the ACL,
+            // so the first open succeeds and the fallback is not reached.
+            eprintln!("the ACL is not enforced for this process; skipping");
+            return;
+        }
+        assert_eq!(
+            add_file.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        sync_dir(&dir).unwrap();
+    }
+
+    /// Issue #1667: only the errors of a file system that cannot flush a
+    /// directory make the sync do nothing.
+    #[test]
+    fn only_the_errors_of_a_file_system_without_directory_flushes_are_ignored() {
+        for code in [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED] {
+            assert!(
+                cannot_flush_a_directory(&io::Error::from_raw_os_error(code)),
+                "os error {code}"
+            );
+        }
+        // ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION.
+        for code in [2, 5, 32] {
+            assert!(
+                !cannot_flush_a_directory(&io::Error::from_raw_os_error(code)),
+                "os error {code}"
+            );
+        }
+        assert!(!cannot_flush_a_directory(&io::Error::other(
+            "not an os error"
+        )));
+    }
 }

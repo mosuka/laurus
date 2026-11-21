@@ -141,8 +141,8 @@ mod tests {
         sync_dir(dir.path()).unwrap();
     }
 
-    /// The directory is really opened: a body that only returns `Ok(())`,
-    /// as on Windows, would not fail here.
+    /// The directory is really opened: a body that only returns `Ok(())`
+    /// would not fail here.
     #[test]
     fn sync_dir_fails_on_a_missing_directory() {
         let dir = tempfile::TempDir::new().unwrap();

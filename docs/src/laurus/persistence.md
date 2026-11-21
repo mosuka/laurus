@@ -511,9 +511,15 @@ been written under it. On Windows, a sync needs write access to the file, so
 a `schema.toml` that cannot be opened for writing (a read-only file, for
 example) is read without the sync, and a warning is logged.
 
-On Windows, `std` cannot open a directory to sync it, so only the file
-contents and the atomicity of the rename hold there, as for the storage's
-own directory syncs.
+On Windows, these directory syncs, like the storage's own after a commit,
+open the directory with `FILE_FLAG_BACKUP_SEMANTICS` and flush it
+([#1667](https://github.com/mosuka/laurus/issues/1667)). The flush needs the
+right to add a file or a subdirectory to the directory. Windows documents
+that it persists the directory's entries on NTFS only: other file systems,
+such as ReFS and FAT, complete it without doing so. A file system that
+cannot flush a directory at all, such as an SMB share, fails the flush, and
+the sync then does nothing. On file systems other than NTFS, only the file
+contents and the atomicity of the rename hold.
 
 ### Concurrent creates and opens
 

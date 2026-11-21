@@ -847,10 +847,8 @@ impl VectorStore {
         };
         drop(writer_guard);
         let finished = finished
-            // Sync storage to ensure all file metadata (creation, rename,
-            // size) is flushed to disk. This is critical on Windows where
-            // directory listings and file visibility may be cached until the
-            // directory is synced.
+            // Sync the storage, so what the commit wrote, including the names
+            // of the files it created, renamed or removed, survives a crash.
             .and_then(|()| self.index.storage().sync())
             .and_then(|()| self.index.refresh());
         // On the error paths too (Issue #1435): the flush above, or a merge

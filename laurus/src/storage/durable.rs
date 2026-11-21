@@ -10,9 +10,10 @@
 //!
 //! A name created, renamed or removed in a directory is durable only once
 //! that directory is synced, so every operation here syncs the directory
-//! that holds what it created, or held what it removed. On Windows,
-//! directories cannot be synced through `std` (see [`super::platform`]), and
-//! only the file contents and the atomicity of a rename hold.
+//! that holds what it created, or held what it removed. On Windows, a
+//! directory sync persists the entries on NTFS (Issue #1667); on a file
+//! system that cannot flush a directory, such as an SMB share, it does
+//! nothing, and only the file contents and the atomicity of a rename hold.
 //!
 //! # Test hooks
 //!
@@ -78,8 +79,8 @@ thread_local! {
 /// test sees its own operations and none of the tests running beside it.
 /// Code under test that moves the work to another thread (`spawn_blocking`,
 /// rayon) is not seen. Every event is recorded before the operation runs and
-/// on every platform, including the directory syncs that do nothing on
-/// Windows.
+/// on every platform, including a directory sync that does nothing on a file
+/// system that cannot flush a directory.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct SyncTrace {
@@ -161,7 +162,8 @@ pub(crate) fn parent_dir(path: &Path) -> &Path {
     }
 }
 
-/// Sync the entries of the directory `dir` (a no-op on Windows).
+/// Sync the entries of the directory `dir` (see the module documentation
+/// for Windows).
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     if record(SyncEvent::Dir(dir.to_path_buf())) {
         return Err(io::Error::other(format!(
