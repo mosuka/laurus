@@ -227,6 +227,10 @@ impl Schema {
     /// - An entry in [`Self::analyzers`] uses a name reserved for a built-in
     ///   analyzer (see [`validate_analyzer_name`]). Such an entry would
     ///   never be used, because the built-in is resolved first.
+    /// - An entry in [`Self::analyzers`] has a `boost` token filter whose
+    ///   factor is not finite or is negative (see
+    ///   [`validate_analyzer_definition`], Issue #1701). When the index is
+    ///   reopened, such a filter is left out with a warning.
     /// - A [`FieldOption::MultiVector`] field has a zero dimension or a
     ///   distance other than `Cosine` / `DotProduct` (see
     ///   [`MultiVectorOption::validate`]).
@@ -247,13 +251,15 @@ impl Schema {
     ///   (Issue #1457).
     ///
     /// [`validate_analyzer_name`]: crate::analysis::analyzer::registry::validate_analyzer_name
+    /// [`validate_analyzer_definition`]: crate::analysis::analyzer::registry::validate_analyzer_definition
     pub fn validate_for_create(&self) -> crate::error::Result<()> {
         for (name, option) in &self.fields {
             validate_field_name(name)?;
             validate_field_option(name, option)?;
         }
-        for name in self.analyzers.keys() {
+        for (name, definition) in &self.analyzers {
             crate::analysis::analyzer::registry::validate_analyzer_name(name)?;
+            crate::analysis::analyzer::registry::validate_analyzer_definition(name, definition)?;
         }
         Ok(())
     }
@@ -1226,6 +1232,38 @@ mod tests {
             msg.contains("Analyzer name 'standard' is reserved for a built-in analyzer"),
             "got: {msg}"
         );
+    }
+
+    /// Issue #1701: a `boost` token filter's factor must be finite and at
+    /// least 0, the range of a query boost, since the query parser
+    /// multiplies a query term's boost by it. The message names the
+    /// analyzer and the filter.
+    #[test]
+    fn validate_for_create_checks_the_factor_of_a_boost_token_filter() {
+        use self::analyzer::TokenFilterConfig;
+
+        let with_boost = |boost: f32| {
+            let mut schema = Schema::new();
+            let mut definition = whitespace_analyzer();
+            definition.token_filters = vec![
+                TokenFilterConfig::Lowercase,
+                TokenFilterConfig::Boost { boost },
+            ];
+            schema.analyzers.insert("a".to_string(), definition);
+            schema.validate_for_create()
+        };
+        for boost in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            let msg = with_boost(boost).unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!(
+                    "Analyzer 'a': token_filters[1]: boost must be finite and at least 0, got {boost}"
+                )),
+                "{boost}: {msg}"
+            );
+        }
+        for boost in [0.0, 1.0, 10.0] {
+            assert!(with_boost(boost).is_ok(), "{boost}");
+        }
     }
 
     #[test]

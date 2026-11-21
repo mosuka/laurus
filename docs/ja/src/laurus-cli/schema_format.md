@@ -535,7 +535,7 @@ token_filters = [{ type = "...", ... }, ...]  # 省略可能
 | `"lowercase"` | -- | -- | 各トークンを小文字にする |
 | `"stop"` | -- | `words`（デフォルト: 英語のストップワード） | ストップワードを取り除く |
 | `"stem"` | -- | `stem_type`（`"porter"`（デフォルト）/ `"simple"` / `"identity"`） | 各トークンを語幹にする |
-| `"boost"` | `boost` | -- | 各トークンのブーストに `boost` を掛ける |
+| `"boost"` | `boost` | -- | 各トークンのブーストに `boost` を掛ける。`boost` は有限で 0 以上。フィールドへのクエリは各語のブーストにトークンのブーストを掛けるので、このフィルターはフィールドのクエリの語に重みを付ける。索引の時にはトークンのブーストを使わない（Issue #1701。[クエリ DSL → ブースト](../concepts/query_dsl.md#ブースト) を参照） |
 | `"limit"` | `limit` | -- | 先頭の `limit` 個のトークンだけを残す |
 | `"strip"` | -- | -- | 各トークンの前後の空白を取り除く |
 | `"remove_empty"` | -- | -- | 空のトークンを取り除く |
@@ -561,7 +561,7 @@ analyzer = "english_stemmed"
 エラーは次の 3 つの時点で起きます:
 
 - 未知の `type` や必須キーの欠落は、スキーマの解析時にエラーになります。このとき `create index` は何も作りません。
-- 組み込みと同じ名前のエントリは、インデックスの作成時に `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name` というエラーになります。このとき `create index` は何も作りません。各バインディングの `addAnalyzer` / `add_analyzer`（WASM では `addAnalyzerDefinition`）も同じエラーを返します。この検査より前に作ったインデックスは、これまでどおり開けます。エントリは使われないままで、開くときに `log` クレートで警告を出します（`laurus-server` はこれをログに表示します）。
+- 組み込みと同じ名前のエントリは、インデックスの作成時に `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name` というエラーになります。このとき `create index` は何も作りません。各バインディングの `addAnalyzer` / `add_analyzer`（WASM では `addAnalyzerDefinition`）も同じエラーを返します。この検査より前に作ったインデックスは、これまでどおり開けます。エントリは使われないままで、開くときに `log` クレートで警告を出します（`laurus-server` はこれをログに表示します）。`boost` が有限でないか負の `boost` トークンフィルターも、同じく `Analyzer 'a': token_filters[0]: boost must be finite and at least 0, got NaN` というエラーになります（Issue #1701）。バインディングの `addAnalyzer` はこれを検査せず、インデックスの作成が検査します。この検査より前に作ったインデックスは、そのフィルターを外して警告を出したうえで開くので、それまでの検索結果のままです。Issue #1701 より前は、このフィルターはどのスコアも変えていませんでした。
 - 不正な値（誤った正規表現、未知の `form` や `stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。このとき `create index` は何も作りません — `schema.toml` と `store/` は、呼び出し前の状態（何もなければ「何もない」状態）まで巻き戻されます。
 
 ### 例: ステミング付きの英語テキスト

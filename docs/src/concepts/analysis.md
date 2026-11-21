@@ -365,7 +365,7 @@ let analyzer = PipelineAnalyzer::new(Arc::new(RegexTokenizer::new()?))
 | `StopFilter` | Removes common words ("the", "is", "a") |
 | `StemFilter` | Reduces words to their root form ("running" → "run") |
 | `SynonymGraphFilter` | Expands tokens with synonyms from a dictionary |
-| `BoostFilter` | Adjusts token boost values |
+| `BoostFilter` | Multiplies token boost values; a query multiplies each term's boost by its tokens' boost (Issue #1701), while indexing does not use them |
 | `LimitFilter` | Limits the number of tokens |
 | `StripFilter` | Strips leading/trailing whitespace from tokens |
 | `FlattenGraphFilter` | Flattens token graphs. Indexing already does this, so leave it out of an analyzer that also parses queries (see [The token graph](#the-token-graph)) |

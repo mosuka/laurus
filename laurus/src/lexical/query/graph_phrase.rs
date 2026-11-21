@@ -44,7 +44,22 @@ impl PhraseArc {
 ///
 /// An arc no path uses, such as a dead end of a hand-built token stream, is
 /// dropped. The result is empty when no path goes from `first` to `last`.
-pub(crate) fn complete_paths(mut arcs: Vec<PhraseArc>, first: u32, last: u32) -> Vec<PhraseArc> {
+pub(crate) fn complete_paths(arcs: Vec<PhraseArc>, first: u32, last: u32) -> Vec<PhraseArc> {
+    complete_paths_with_origins(arcs, first, last)
+        .into_iter()
+        .map(|(arc, _)| arc)
+        .collect()
+}
+
+/// [`complete_paths`], with each arc it keeps paired with its `(from, to)`
+/// before the nodes were renumbered, so that a caller can look up what it
+/// keyed by the original nodes: the query parser's token boosts (Issue
+/// #1701).
+pub(crate) fn complete_paths_with_origins(
+    mut arcs: Vec<PhraseArc>,
+    first: u32,
+    last: u32,
+) -> Vec<(PhraseArc, (u32, u32))> {
     arcs.sort_by_key(|arc| (arc.from, arc.to));
 
     // Arcs only go forward, so one pass in each direction settles which
@@ -70,11 +85,14 @@ pub(crate) fn complete_paths(mut arcs: Vec<PhraseArc>, first: u32, last: u32) ->
         .into_iter()
         .zip(0..)
         .collect();
-    for arc in &mut arcs {
-        arc.from = nodes[&arc.from];
-        arc.to = nodes[&arc.to];
-    }
-    arcs
+    arcs.into_iter()
+        .map(|mut arc| {
+            let origin = (arc.from, arc.to);
+            arc.from = nodes[&arc.from];
+            arc.to = nodes[&arc.to];
+            (arc, origin)
+        })
+        .collect()
 }
 
 /// A phrase query whose positions form a graph: it matches where any path

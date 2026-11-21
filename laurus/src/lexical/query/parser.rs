@@ -40,7 +40,9 @@ use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::fuzzy::FuzzyQuery;
 use crate::lexical::query::geo::{GeoBoundingBoxQuery, GeoDistanceQuery};
 use crate::lexical::query::geo3d::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery};
-use crate::lexical::query::graph_phrase::{GraphPhraseQuery, PhraseArc, complete_paths};
+use crate::lexical::query::graph_phrase::{
+    GraphPhraseQuery, PhraseArc, complete_paths_with_origins,
+};
 use crate::lexical::query::phrase::PhraseQuery;
 use crate::lexical::query::range::{Bound, DateTimeRangeQuery, NumericRangeQuery, RangeQuery};
 use crate::lexical::query::synonym::SynonymQuery;
@@ -867,9 +869,10 @@ impl LexicalQueryParser {
 
             let slop = slop.unwrap_or(0);
             // The boost goes on each clause here.
-            let one_position =
-                |alternatives: Vec<String>| one_position_query(field_name, alternatives, boost);
-            let phrase = |positions: Vec<Vec<String>>| -> Box<dyn Query> {
+            let one_position = |alternatives: Vec<String>, boost: f32| {
+                one_position_query(field_name, alternatives, boost)
+            };
+            let phrase = |positions: Vec<Vec<String>>, boost: f32| -> Box<dyn Query> {
                 Box::new(
                     PhraseQuery::from_positions(field_name, positions)
                         .with_slop(slop)
@@ -877,10 +880,18 @@ impl LexicalQueryParser {
                 )
             };
             let mut clauses: Vec<Box<dyn Query>> = match phrase_graph(&tokens) {
+                // The tokens' boosts multiply the query's (Issue #1701), as
+                // in Lucene's `QueryBuilder`: one position's boost, or the
+                // product over a phrase's positions.
                 PhraseGraph::Flat(mut positions) if positions.len() == 1 => {
-                    vec![one_position(positions.remove(0))]
+                    let position = positions.remove(0);
+                    vec![one_position(position.terms, boost * position.boost)]
                 }
-                PhraseGraph::Flat(positions) => vec![phrase(positions)],
+                PhraseGraph::Flat(positions) => {
+                    let tokens_boost: f32 = positions.iter().map(|p| p.boost).product();
+                    let positions = positions.into_iter().map(|p| p.terms).collect();
+                    vec![phrase(positions, boost * tokens_boost)]
+                }
                 PhraseGraph::Graph { direct, arcs } => {
                     // `direct` and any phrase/graph-path clause below stay
                     // sibling `Should` clauses: a document matching both
@@ -888,22 +899,36 @@ impl LexicalQueryParser {
                     // different phrase paths and both contribute, unlike
                     // the stacked-alternative case `one_position` folds
                     // into a single term.
-                    let mut clauses: Vec<Box<dyn Query>> = if direct.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![one_position(direct)]
+                    let mut clauses: Vec<Box<dyn Query>> = match direct {
+                        None => Vec::new(),
+                        Some(direct) => {
+                            vec![one_position(direct.terms, boost * direct.boost)]
+                        }
                     };
-                    if arcs.windows(2).all(|pair| pair[0].to == pair[1].from) {
+                    if arcs.windows(2).all(|pair| pair[0].0.to == pair[1].0.from) {
                         // At most one path of two or more positions, as
-                        // without multi-word synonyms.
+                        // without multi-word synonyms: the phrase carries
+                        // the product of its arcs' boosts.
                         if !arcs.is_empty() {
-                            clauses.push(phrase(arcs.into_iter().map(|arc| arc.terms).collect()));
+                            let tokens_boost: f32 = arcs.iter().map(|(_, b)| b).product();
+                            clauses.push(phrase(
+                                arcs.into_iter().map(|(arc, _)| arc.terms).collect(),
+                                boost * tokens_boost,
+                            ));
                         }
                     } else {
+                        // Several paths of two or more positions, which
+                        // `GraphPhraseQuery` matches without listing them,
+                        // so there is no path to multiply the boosts of:
+                        // it keeps the query's boost only. Lucene's
+                        // multi-phrase path does not use them either.
                         clauses.push(Box::new(
-                            GraphPhraseQuery::from_arcs(field_name, arcs)
-                                .with_slop(slop)
-                                .with_boost(boost),
+                            GraphPhraseQuery::from_arcs(
+                                field_name,
+                                arcs.into_iter().map(|(arc, _)| arc).collect(),
+                            )
+                            .with_slop(slop)
+                            .with_boost(boost),
                         ));
                     }
                     clauses
@@ -1038,7 +1063,13 @@ impl LexicalQueryParser {
             let mut positions = group_tokens_by_position(tokens);
 
             if positions.len() == 1 {
-                Ok(one_position_query(field_name, positions.remove(0), boost))
+                // The tokens' boost multiplies the query's (Issue #1701).
+                let position = positions.remove(0);
+                Ok(one_position_query(
+                    field_name,
+                    position.terms,
+                    boost * position.boost,
+                ))
             } else {
                 // The analyzer split one *bare* (unquoted) term into
                 // tokens at several positions. This happens for a
@@ -1057,12 +1088,12 @@ impl LexicalQueryParser {
                 // `"..."` goes through `parse_phrase_query`, which keeps
                 // `PhraseQuery` (and its `~slop` modifier).
                 let mut bool_query = BooleanQuery::new();
-                for alternatives in positions {
-                    // The boost goes on the `BooleanQuery` below, as it did
-                    // before this path grouped by position, so each clause
-                    // is built unboosted.
+                for position in positions {
+                    // The query's boost goes on the `BooleanQuery` below, as
+                    // it did before this path grouped by position, so each
+                    // clause carries only its tokens' boost (Issue #1701).
                     bool_query.add_clause(BooleanClause::new(
-                        one_position_query(field_name, alternatives, 1.0),
+                        one_position_query(field_name, position.terms, position.boost),
                         Occur::Should,
                     ));
                 }
@@ -1114,16 +1145,17 @@ impl LexicalQueryParser {
 #[derive(Debug, PartialEq)]
 enum PhraseGraph {
     /// A graph with no complete path, as the flat positions the index
-    /// stores, each with its alternative terms.
-    Flat(Vec<Vec<String>>),
+    /// stores, each with its alternative terms and their boost.
+    Flat(Vec<PositionTerms>),
     /// A graph with a complete path.
     Graph {
-        /// The terms of the arcs from the first node straight to the last,
-        /// the paths of one position.
-        direct: Vec<String>,
-        /// The other arcs on a complete path, as [`complete_paths`] numbers
-        /// them.
-        arcs: Vec<PhraseArc>,
+        /// The arc from the first node straight to the last, the paths of
+        /// one position: its terms and their boost.
+        direct: Option<PositionTerms>,
+        /// The other arcs on a complete path, as
+        /// [`complete_paths`](crate::lexical::query::graph_phrase::complete_paths)
+        /// numbers them, each with the largest boost of its tokens.
+        arcs: Vec<(PhraseArc, f32)>,
     },
 }
 
@@ -1143,9 +1175,12 @@ enum PhraseGraph {
 fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
     let token_arcs = token_arcs(tokens);
 
-    // (from, to) → alternatives.
+    // (from, to) → alternatives, and their largest boost (Issue #1701).
     let mut arcs: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+    let mut boosts: BTreeMap<(u32, u32), f32> = BTreeMap::new();
     for (token, &arc) in tokens.iter().zip(&token_arcs) {
+        let boost = boosts.entry(arc).or_insert(token.boost);
+        *boost = boost.max(token.boost);
         let alternatives = arcs.entry(arc).or_default();
         if !alternatives.contains(&token.text) {
             alternatives.push(token.text.clone());
@@ -1157,22 +1192,31 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
         .into_iter()
         .map(|((from, to), terms)| PhraseArc::new(from, to, terms))
         .collect();
-    let mut arcs = complete_paths(arcs, first, last);
+    let arcs = complete_paths_with_origins(arcs, first, last);
 
     if arcs.is_empty() {
         return PhraseGraph::Flat(group_tokens_by_position(tokens.to_vec()));
     }
 
-    let last = arcs.iter().map(|arc| arc.to).max().unwrap_or(0);
-    let mut direct = Vec::new();
-    arcs.retain(|arc| {
-        let is_direct = arc.from == 0 && arc.to == last;
-        if is_direct {
-            direct.extend(arc.terms.iter().cloned());
+    let last = arcs.iter().map(|(arc, _)| arc.to).max().unwrap_or(0);
+    let mut direct = None;
+    let mut others = Vec::with_capacity(arcs.len());
+    for (arc, origin) in arcs {
+        let boost = boosts[&origin];
+        if arc.from == 0 && arc.to == last {
+            // Each (from, to) is one arc, so there is at most one.
+            direct = Some(PositionTerms {
+                terms: arc.terms,
+                boost,
+            });
+        } else {
+            others.push((arc, boost));
         }
-        !is_direct
-    });
-    PhraseGraph::Graph { direct, arcs }
+    }
+    PhraseGraph::Graph {
+        direct,
+        arcs: others,
+    }
 }
 
 /// The query for one field position's `alternatives`.
@@ -1184,7 +1228,8 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
 /// scores would double-count it. A single alternative stays a plain
 /// `TermQuery`. Shared by the quoted ([`LexicalQueryParser::parse_phrase_query`])
 /// and bare ([`LexicalQueryParser::parse_simple_term`]) paths; each passes
-/// the `boost` its own shape puts on a clause.
+/// the `boost` its own shape puts on a clause, with the position's tokens'
+/// boost multiplied in ([`PositionTerms::boost`], Issue #1701).
 fn one_position_query(
     field_name: &str,
     mut alternatives: Vec<String>,
@@ -1197,22 +1242,44 @@ fn one_position_query(
     }
 }
 
+/// One field position of analyzed text: the alternative terms the analyzer
+/// put there and the largest of their tokens' boosts.
+///
+/// The boost multiplies the query's when the position becomes a query
+/// (Issue #1701), as Lucene's `QueryBuilder` applies a token's
+/// `BoostAttribute`. Lucene gives each alternative of a `SynonymQuery` its
+/// own boost; one factor for the position applies a uniform boost, such as
+/// a `boost` token filter's, exactly, but not a synonym weight that differs
+/// between the alternatives (`SynonymGraphFilter::with_boost`).
+#[derive(Debug, PartialEq)]
+struct PositionTerms {
+    /// The alternative terms, deduplicated, in token order.
+    terms: Vec<String>,
+    /// The largest boost of the tokens at the position.
+    boost: f32,
+}
+
 /// Group `tokens` by field position, each position paired with its
 /// alternative terms — several when the analyzer stacks synonyms there
-/// (`position_increment = 0`). Shared by [`phrase_graph`]'s flat fallback
-/// and [`LexicalQueryParser::parse_simple_term`], the two places that need
-/// a bare term's tokens grouped this way without a full phrase graph.
-fn group_tokens_by_position(tokens: Vec<Token>) -> Vec<Vec<String>> {
+/// (`position_increment = 0`) — and their largest boost. Shared by
+/// [`phrase_graph`]'s flat fallback and
+/// [`LexicalQueryParser::parse_simple_term`], the two places that need a
+/// bare term's tokens grouped this way without a full phrase graph.
+fn group_tokens_by_position(tokens: Vec<Token>) -> Vec<PositionTerms> {
     let flat = flatten_token_graph(tokens);
     let positions = token_positions(&flat);
-    let mut by_position: Vec<Vec<String>> = Vec::new();
+    let mut by_position: Vec<PositionTerms> = Vec::new();
     for (token, (i, &position)) in flat.iter().zip(positions.iter().enumerate()) {
         if i == 0 || positions[i - 1] != position {
-            by_position.push(Vec::new());
+            by_position.push(PositionTerms {
+                terms: Vec::new(),
+                boost: token.boost,
+            });
         }
-        let alternatives = by_position.last_mut().expect("pushed above");
-        if !alternatives.contains(&token.text) {
-            alternatives.push(token.text.clone());
+        let current = by_position.last_mut().expect("pushed above");
+        current.boost = current.boost.max(token.boost);
+        if !current.terms.contains(&token.text) {
+            current.terms.push(token.text.clone());
         }
     }
     by_position
@@ -2706,6 +2773,183 @@ mod tests {
         assert_eq!(
             should_clauses(query.as_ref()),
             vec![phrase(&[&["a"], &["b"]], 0, 1.0)]
+        );
+    }
+
+    // ---- Token boosts reach the query (Issue #1701) ----
+
+    /// A graph without a complete path falls back to its flat positions,
+    /// and the phrase still carries the product of their token boosts:
+    /// 2 × 3 = 6.
+    #[test]
+    fn the_flat_fallback_carries_the_product_of_its_token_boosts() {
+        let tokens = vec![
+            Token::new("a", 0).with_position_length(2).with_boost(2.0),
+            Token::new("b", 1).with_position_length(3).with_boost(3.0),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+        let query = parser.parse("\"anything\"").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            vec![phrase(&[&["a"], &["b"]], 0, 6.0)]
+        );
+    }
+
+    /// A parser whose analyzer is `tokenizer` followed by a `BoostFilter`
+    /// of `boost`.
+    fn boost_filter_parser(
+        tokenizer: Arc<dyn crate::analysis::tokenizer::Tokenizer>,
+        boost: f32,
+    ) -> LexicalQueryParser {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::token_filter::boost::BoostFilter;
+
+        let analyzer =
+            PipelineAnalyzer::new(tokenizer).add_filter(Arc::new(BoostFilter::new(boost)));
+        LexicalQueryParser::new(Arc::new(analyzer)).with_default_field("body")
+    }
+
+    fn whitespace_boost_parser(boost: f32) -> LexicalQueryParser {
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+        boost_filter_parser(Arc::new(WhitespaceTokenizer::new()), boost)
+    }
+
+    /// A bare term's token boost multiplies the query's: a `BoostFilter`
+    /// of 2 makes `rust` a `TermQuery` of boost 2, and `rust^3` one of 6.
+    /// The filter used to change no score.
+    #[test]
+    fn a_bare_term_carries_its_token_boost() {
+        let parser = whitespace_boost_parser(2.0);
+        for (input, expected) in [("rust", 2.0), ("rust^3", 6.0)] {
+            let query = parser.parse(input).unwrap();
+            assert_eq!(
+                should_clauses(query.as_ref()),
+                vec![term("rust", expected)],
+                "{input}"
+            );
+        }
+    }
+
+    /// A bare term the analyzer splits into several positions carries each
+    /// position's token boost on its clause, and the query's boost on the
+    /// `BooleanQuery` around them.
+    #[test]
+    fn each_position_of_a_split_bare_term_carries_its_token_boost() {
+        use crate::analysis::tokenizer::regex::RegexTokenizer;
+
+        let parser = boost_filter_parser(Arc::new(RegexTokenizer::new().unwrap()), 2.0);
+        for (input, query_boost) in [("rust-lang", 1.0), ("rust-lang^3", 3.0)] {
+            let query = parser.parse(input).unwrap();
+            let boolean = query
+                .as_any()
+                .downcast_ref::<BooleanQuery>()
+                .unwrap_or_else(|| panic!("{input}: {query:?}"));
+            assert_eq!(boolean.boost(), query_boost, "{input}");
+            let clauses = sorted(
+                boolean
+                    .clauses()
+                    .iter()
+                    .map(|c| (c.query.description(), c.query.boost()))
+                    .collect(),
+            );
+            assert_eq!(
+                clauses,
+                sorted(vec![term("rust", 2.0), term("lang", 2.0)]),
+                "{input}"
+            );
+        }
+    }
+
+    /// A quoted phrase carries the product of its positions' token boosts,
+    /// as in Lucene's `QueryBuilder::analyzePhrase`: 2 × 2 = 4, and 12 with
+    /// `^3`.
+    #[test]
+    fn a_phrase_carries_the_product_of_its_token_boosts() {
+        let parser = whitespace_boost_parser(2.0);
+        for (input, expected) in [("\"rust lang\"", 4.0), ("\"rust lang\"^3", 12.0)] {
+            let query = parser.parse(input).unwrap();
+            assert_eq!(
+                should_clauses(query.as_ref()),
+                vec![phrase(&[&["rust"], &["lang"]], 0, expected)],
+                "{input}"
+            );
+        }
+    }
+
+    /// The alternatives stacked at one position share their largest token
+    /// boost, not the first token's: here the first is 0.5 and the largest
+    /// 1.0.
+    #[test]
+    fn stacked_alternatives_share_their_largest_token_boost() {
+        let tokens = vec![
+            Token::new("large", 0).with_boost(0.5),
+            Token::new("big", 0)
+                .with_position_increment(0)
+                .with_boost(1.0),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+        for input in ["anything", "\"anything\""] {
+            let query = parser.parse(input).unwrap();
+            assert_eq!(
+                should_clauses(query.as_ref()),
+                vec![synonym(&["large", "big"], 1.0)],
+                "{input}"
+            );
+        }
+    }
+
+    /// In a graph with one path of several positions next to the one-position
+    /// path, as Lucene's `QueryBuilder::analyzeGraphPhrase` does for each
+    /// path: the one-position path carries its token boost and the phrase
+    /// the product of its arcs' boosts.
+    #[test]
+    fn each_path_of_a_one_phrase_graph_carries_its_token_boosts() {
+        let tokens = vec![
+            Token::new("nyc", 0).with_position_length(2).with_boost(2.0),
+            Token::new("new", 0)
+                .with_position_increment(0)
+                .with_boost(2.0),
+            Token::new("york", 1).with_boost(2.0),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+        let query = parser.parse("\"anything\"").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            sorted(vec![
+                term("nyc", 2.0),
+                phrase(&[&["new"], &["york"]], 0, 4.0)
+            ])
+        );
+    }
+
+    /// A graph with several paths of two or more positions is one
+    /// `GraphPhraseQuery`, which matches them without listing them, so it
+    /// keeps the query's boost only: Lucene's multi-phrase path does not use
+    /// token boosts either.
+    #[test]
+    fn a_graph_phrase_keeps_the_query_boost_only() {
+        let tokens = vec![
+            Token::new("ml", 0).with_position_length(2).with_boost(2.0),
+            Token::new("machine", 0)
+                .with_position_increment(0)
+                .with_boost(2.0),
+            Token::new("learning", 1).with_boost(2.0),
+            Token::new("is", 2).with_boost(2.0),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+        let query = parser.parse("\"anything\"").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            vec![graph(
+                &[
+                    (0, 1, &["machine"]),
+                    (0, 2, &["ml"]),
+                    (1, 2, &["learning"]),
+                    (2, 3, &["is"]),
+                ],
+                0,
+                1.0
+            )]
         );
     }
 }

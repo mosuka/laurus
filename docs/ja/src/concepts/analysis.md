@@ -350,7 +350,7 @@ let analyzer = PipelineAnalyzer::new(Arc::new(RegexTokenizer::new()?))
 | `StopFilter` | 一般的な単語を除去（"the"、"is"、"a"） |
 | `StemFilter` | 単語を語幹に縮約（"running" → "run"） |
 | `SynonymGraphFilter` | 同義語辞書でトークンを展開 |
-| `BoostFilter` | トークンのブースト値を調整 |
+| `BoostFilter` | トークンのブースト値に掛ける。クエリは各語のブーストにトークンのブーストを掛ける（Issue #1701）。索引の時には使わない |
 | `LimitFilter` | トークン数を制限 |
 | `StripFilter` | トークンの先頭/末尾の空白を除去 |
 | `FlattenGraphFilter` | トークングラフをフラット化。インデックス時は自動でフラット化されるため、クエリのパースにも使うアナライザーには入れない（[トークングラフ](#トークングラフ)を参照） |
