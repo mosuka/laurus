@@ -49,4 +49,7 @@ embeddings-all = [
 ]
 
 [dev-dependencies]
+# `client` lets the tests call the tools through an in-process rmcp client,
+# as an MCP client does (Issue #1707).
+rmcp = { workspace = true, features = ["client"] }
 tempfile = { workspace = true }

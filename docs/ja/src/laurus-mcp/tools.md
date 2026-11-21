@@ -2,6 +2,8 @@
 
 laurus MCP サーバーは以下のツールを公開しています。
 
+ツールが取らない引数（`dry_run` を書き間違えた `"dryrun"` など）は、その引数を名指しするツールのエラーになり（例: ``failed to deserialize parameters: unknown field `dryrun` ...``）、ツールは何もしません（Issue #1707）。引数を取らないツールは、どの引数も拒否します。`fusion`・`field_boosts`・`highlight`・`rescore`・`group_by` の中の JSON は、HTTP の gateway が要求の本文を読むのと同じ読み方をするので、知らないキーを今も捨てます（Issue #1706）。
+
 ## connect
 
 実行中の laurus-server gRPC エンドポイントに接続します。`--endpoint` フラグなしでサーバーを起動した場合や、実行時に別の laurus-server に切り替える場合に、他のツールを使用する前にこのツールを呼び出してください。
