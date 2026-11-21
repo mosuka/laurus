@@ -350,6 +350,12 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             skip_embedding_features: true
+          # Builds the tests on Windows, where a Unix-only test that is not
+          # gated on cfg(unix) fails to compile (Issue #1698). Embedding
+          # features are skipped as on the Windows leg of `Test laurus`.
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            skip_embedding_features: true
         toolchain: [stable]
     runs-on: ${{ matrix.platform.runner }}
     steps:

@@ -258,11 +258,7 @@ async fn shutdown_signal(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use laurus::{CommitPolicy, Document, Schema, TextOption, WalSyncPolicy};
-    use tokio::sync::RwLock;
+    use laurus::{CommitPolicy, Schema, WalSyncPolicy};
 
     use super::*;
 
@@ -368,8 +364,17 @@ mod tests {
     /// Ctrl+C does, reaching the commit and (once the last `Engine` handle
     /// is dropped, as happens when `run()` returns) the lock release --
     /// instead of the OS default disposition killing the process first.
+    ///
+    /// Unix only, as SIGTERM and its handler are (Issue #1698).
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_signal_commits_and_releases_the_lock_on_sigterm() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use laurus::{Document, TextOption};
+        use tokio::sync::RwLock;
+
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("idx");
         let schema = Schema::builder()
