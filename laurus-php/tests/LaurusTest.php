@@ -3118,12 +3118,17 @@ class LaurusTest extends TestCase
             "missing field `type`" => ["model" => "x"],
         ];
         foreach ($cases as $message => $config) {
+            // Checked outside the `try`: `fail()` throws an exception, too,
+            // and its message would contain `$message`, so a config that was
+            // accepted would pass a check inside the `catch`.
+            $error = null;
             try {
                 (new Laurus\Schema())->addEmbedder("e", $config);
-                $this->fail("accepted an invalid embedder config: $message");
             } catch (\Exception $e) {
-                $this->assertStringContainsString($message, $e->getMessage());
+                $error = $e->getMessage();
             }
+            $this->assertNotNull($error, "accepted an invalid embedder config: $message");
+            $this->assertStringContainsString($message, $error);
         }
     }
 
