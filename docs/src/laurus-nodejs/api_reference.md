@@ -238,6 +238,8 @@ class Schema {
 
 Every `add*Field` method above throws when `name` starts with `_` (other than `_id`), and adds nothing. A schema loaded with `fromToml` / `fromTomlFile` keeps accepting such a field, so a persisted schema still loads; creating a new `Index` from it throws. See [Field Naming](../laurus-cli/schema_format.md#field-naming).
 
+A key the schema format does not declare throws an error naming the key, instead of a setting that silently keeps its default (Issue #1700): in an `addAnalyzer` component (also one that takes no parameters, such as `{ type: "lowercase", words: ["the"] }`), in an `addEmbedder` `config`, and in the TOML of `fromToml` / `fromTomlFile`, as in ``invalid tokenizer: unknown field `gap` ...``. So does opening an index whose `schema.toml` holds such a key (edited by hand, or written by a newer laurus); the message names the file and the key.
+
 #### Dynamic field policy
 
 Controls what happens when a document is ingested with field names that are

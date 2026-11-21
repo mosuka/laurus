@@ -56,7 +56,10 @@ use crate::vector::core::vector::Vector;
 /// #481 Stage 1 mandates int8 quantization for all vector fields. The
 /// on-disk format reserves `quant_kind = 0` for a future re-introduction
 /// of an unquantized variant if ever needed.
+///
+/// An unknown key in a struct variant is an error (Issue #1700).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum QuantizationMethod {
     /// Scalar quantization to 8-bit integers using per-segment global
     /// affine `(offset, scale)`. 4× memory reduction vs unquantized

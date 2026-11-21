@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod embedder;
+mod no_parameters;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,7 +139,12 @@ pub(crate) fn validate_field_option(name: &str, option: &FieldOption) -> crate::
 /// The schema also carries a [`DynamicFieldPolicy`] that controls how
 /// undeclared fields are handled during document ingestion. The default is
 /// [`DynamicFieldPolicy::Dynamic`].
+///
+/// An unknown key is an error at every level of a schema: here, in a field
+/// option, in an analyzer definition or component and in an embedder
+/// definition (Issue #1700). A persisted schema is read by the same rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Schema {
     /// Custom analyzer definitions, keyed by name.
     /// These can be referenced from text field `analyzer` settings.
@@ -269,12 +275,16 @@ impl Schema {
     /// [`Schema::to_toml`] produces).
     ///
     /// This also reads schemas persisted by existing indexes, so it does
-    /// not run [`Self::validate_for_create`].
+    /// not run [`Self::validate_for_create`]. An unknown key is an error
+    /// either way (Issue #1700): a persisted schema with one was edited by
+    /// hand or written by a newer laurus, and reading it anyway would run
+    /// without what the key was meant to set.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::LaurusError::Schema`] if `s` is not valid
-    /// TOML or does not match the schema shape.
+    /// TOML, does not match the schema shape, or has a key the schema does
+    /// not declare.
     pub fn from_toml(s: &str) -> crate::error::Result<Self> {
         toml::from_str(s).map_err(|e| {
             crate::error::LaurusError::schema(format!(

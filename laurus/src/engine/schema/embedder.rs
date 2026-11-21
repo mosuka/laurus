@@ -26,11 +26,15 @@ use serde::{Deserialize, Serialize};
 /// For embedders that require API keys (e.g. OpenAI), the key is read
 /// from an environment variable at engine initialization time, **not**
 /// stored in the schema.
+///
+/// A key the embedder type does not take is an error, also for
+/// [`Precomputed`](Self::Precomputed), which takes none (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EmbedderDefinition {
     /// Pre-computed vectors — no embedding is performed.
     /// Use this when vectors are computed externally and passed directly.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     Precomputed,
 
     /// Candle-based BERT embedder for text embedding.

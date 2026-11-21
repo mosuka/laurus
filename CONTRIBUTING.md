@@ -166,6 +166,15 @@ cargo doc --all-features --open # All features
 - `crossbeam` for concurrent data structures
 - `Arc` for shared ownership across async boundaries
 
+### Schema Types
+
+The types a schema is read into (`Schema`, the field options, the analyzer and embedder definitions and their components, `QuantizationMethod`) are the one place that decides which keys a schema may have. Every entry point (`schema.toml`, the server, the CLI, MCP and the bindings) reads through them, and a persisted `schema.toml` is read by the same rules, so an unknown key is an error everywhere (Issue #1700).
+
+- Every such type sets `#[serde(deny_unknown_fields)]`. A unit variant of an internally tagged enum ignores extra keys even then, so it also sets `#[serde(deserialize_with = "super::no_parameters::deserialize")]`.
+- A new variant goes into the fixture of `laurus/tests/schema_unknown_keys_test.rs`; `fixture_holds_every_variant` fails until it does.
+- Removing or renaming a key keeps the old one readable (`#[serde(alias = "...")]` or a migration): a persisted `schema.toml` with it would otherwise no longer open.
+- A new optional key is left out of the serialized schema while it has its default value (`skip_serializing_if`), so that an older laurus can still open an index that does not use the new setting.
+
 ## Module Organization
 
 Each major component uses a two-level module pattern:

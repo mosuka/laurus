@@ -732,6 +732,10 @@ be serialized. Register the callbacks again in the schema passed to
 which WASM does not have (see
 [Embedding Strategies](../laurus-wasm.md#embedding-strategies)).
 
+A key the `type` does not take, such as `model` on `"precomputed"` or
+`dimension` on `"callback"`, throws an error naming it (Issue #1700), as an
+embedder definition does in the other bindings.
+
 ```javascript
 // Precomputed embedder
 schema.addEmbedder("precomputed-embedder", { type: "precomputed" });
@@ -771,6 +775,11 @@ below) — keys inside a component stay snake_case, matching that wire
 format. Only the two outer wrapper keys (`charFilters`/`tokenFilters`)
 follow this binding's own camelCase convention.
 
+A key of `definition` other than these three, and a key a component does
+not take (also on one that takes no parameters, such as `words` on
+`{ type: "lowercase" }`), throws an error naming it (Issue #1700). A
+property set to `undefined` is the same as leaving it out.
+
 A name reserved for a built-in analyzer (`standard`, `keyword`, `english`,
 `simple`, `noop`) throws, and so does `Index.create` or a first
 `Index.open` with a schema that defines one (e.g. loaded with `fromToml`).
@@ -794,7 +803,8 @@ Returns the names of custom analyzers registered via
 
 Parse a schema from a TOML string, in the same format
 `laurus-cli create index --schema` accepts. No file-path variant is
-provided: the browser WASM target has no filesystem.
+provided: the browser WASM target has no filesystem. A key the format does
+not declare throws an error naming it (Issue #1700).
 
 #### `toToml()`
 

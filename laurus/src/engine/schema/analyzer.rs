@@ -16,12 +16,14 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Reference to an analyzer for a text field.
 ///
-/// Two shapes are accepted (decoded via serde's untagged representation):
+/// Two shapes are accepted:
 ///
 /// 1. **A bare string** — the name of a built-in or user-defined analyzer.
 ///    Example: `"standard"`, `"english"`, `"keyword"`, `"simple"`,
@@ -29,6 +31,11 @@ use serde::{Deserialize, Serialize};
 /// 2. **A structured object** — a parameterized built-in analyzer.
 ///    Currently only the language-specific Japanese preset:
 ///    `{"language": "japanese", "mode": "normal", "dict": "/path/to/ipadic"}`.
+///
+/// It is written as serde's untagged representation. It is read by the
+/// shape of the input instead, so that an object with an unknown key fails
+/// with an error naming the key (Issue #1700), where an untagged read would
+/// report only that no variant matched.
 ///
 /// # JSON Examples
 ///
@@ -39,7 +46,9 @@ use serde::{Deserialize, Serialize};
 /// // Japanese preset that requires a dictionary path.
 /// {"language": "japanese", "mode": "normal", "dict": "/var/lib/lindera/ipadic"}
 /// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// [`Schema::analyzers`]: crate::engine::schema::Schema::analyzers
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AnalyzerSpec {
     /// Built-in or user-defined analyzer referenced by name.
@@ -48,11 +57,41 @@ pub enum AnalyzerSpec {
     Builtin(BuiltinAnalyzerSpec),
 }
 
+impl<'de> Deserialize<'de> for AnalyzerSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AnalyzerSpecVisitor;
+
+        impl<'de> Visitor<'de> for AnalyzerSpecVisitor {
+            type Value = AnalyzerSpec;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an analyzer name or a builtin analyzer table")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(AnalyzerSpec::Named(value.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(AnalyzerSpec::Named(value))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                BuiltinAnalyzerSpec::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(AnalyzerSpec::Builtin)
+            }
+        }
+
+        deserializer.deserialize_any(AnalyzerSpecVisitor)
+    }
+}
+
 /// Parameterized built-in analyzer presets.
 ///
-/// Variants are tagged by the `"language"` discriminator in JSON.
+/// Variants are tagged by the `"language"` discriminator in JSON. An
+/// unknown key is an error (Issue #1700).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "language", rename_all = "snake_case")]
+#[serde(tag = "language", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BuiltinAnalyzerSpec {
     /// Japanese analyzer (Lindera + Japanese filters).
     Japanese {
@@ -99,7 +138,10 @@ fn default_lindera_mode() -> String {
 /// * `char_filters` - Applied to raw text before tokenization.
 /// * `tokenizer` - Splits text into tokens.
 /// * `token_filters` - Applied sequentially to the token stream.
+///
+/// An unknown key, here or in a component, is an error (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzerDefinition {
     /// Char filters applied to raw text before tokenization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,14 +158,17 @@ pub struct AnalyzerDefinition {
 /// Configuration for a tokenizer component.
 ///
 /// Uses `{"type": "..."}` JSON format via serde's internally tagged
-/// representation.
+/// representation. A key the tokenizer does not take is an error, also for
+/// a tokenizer that takes none (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenizerConfig {
     /// Splits on whitespace boundaries.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     Whitespace,
 
     /// Splits on Unicode word boundaries.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     UnicodeWord,
 
     /// Splits using a regular expression pattern.
@@ -162,12 +207,15 @@ pub enum TokenizerConfig {
     },
 
     /// Treats the entire input as a single token.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     Whole,
 }
 
 /// Configuration for a char filter component.
+///
+/// A key the char filter does not take is an error (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CharFilterConfig {
     /// Applies Unicode normalization (NFC, NFD, NFKC, or NFKD).
     UnicodeNormalization {
@@ -202,10 +250,14 @@ pub enum CharFilterConfig {
 }
 
 /// Configuration for a token filter component.
+///
+/// A key the token filter does not take is an error, also for a filter that
+/// takes none (Issue #1700).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TokenFilterConfig {
     /// Converts tokens to lowercase.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     Lowercase,
 
     /// Removes stop words from the token stream.
@@ -237,14 +289,17 @@ pub enum TokenFilterConfig {
     },
 
     /// Strips leading and trailing whitespace from tokens.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     Strip,
 
     /// Removes empty tokens from the stream.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     RemoveEmpty,
 
     /// Flattens a synonym graph into a linear token stream. Indexing already
     /// does this, and since the analyzer also parses queries, the filter makes
     /// quoted multi-word synonyms inexact there.
+    #[serde(deserialize_with = "super::no_parameters::deserialize")]
     FlattenGraph,
 }
 

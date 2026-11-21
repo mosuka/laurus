@@ -240,6 +240,8 @@ Every `add_*_field` method above raises `ValueError` when `name` starts with `_`
 | `dynamic_field_policy()` | Return the current policy as a lowercase string. |
 | `field_names()` | Return all field names. |
 
+A key the schema format does not declare raises `ValueError` naming the key, instead of a setting that silently keeps its default (Issue #1700): in an `add_analyzer` component (also one that takes no parameters, such as `{"type": "lowercase", "words": ["the"]}`), in an `add_embedder` `config`, in the `analyzer` dict of `add_text_field`, and in the TOML of `from_toml` / `from_toml_file`, as in ``invalid tokenizer: unknown field `gap` ...``. The `analyzer` dict is read the way the schema TOML reads it, so a value of the wrong type in it, such as a numeric `mode`, raises `ValueError` as well (it raised `TypeError` before).
+
 #### Dynamic field policy
 
 Controls what happens when a document is ingested with field names that are

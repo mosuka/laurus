@@ -243,6 +243,8 @@ class Schema:
 | `dynamic_field_policy()` | 現在のポリシーを小文字の文字列で返す。 |
 | `field_names()` | 全フィールド名を返す。 |
 
+スキーマのフォーマットが宣言していないキーは、黙ってデフォルト値のままにされるのではなく、キーを名指しする `ValueError` になります（Issue #1700）。`add_analyzer` のコンポーネント（`{"type": "lowercase", "words": ["the"]}` のように、引数を取らないコンポーネントも同じ）、`add_embedder` の `config`、`add_text_field` の `analyzer` の dict、`from_toml` / `from_toml_file` の TOML が対象で、エラーは ``invalid tokenizer: unknown field `gap` ...`` のようになります。`analyzer` の dict はスキーマの TOML と同じ読み方をするので、数値の `mode` のように型の違う値も `ValueError` になります（以前は `TypeError` でした）。
+
 #### Dynamic field policy（動的フィールドポリシー）
 
 ドキュメントに含まれるがスキーマに宣言されていないフィールドの扱いを制御します:

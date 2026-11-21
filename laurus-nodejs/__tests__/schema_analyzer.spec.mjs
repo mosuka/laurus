@@ -364,3 +364,74 @@ describe("Schema#toToml / toTomlFile round trip", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Unknown keys (Issue #1700): an error naming the key, not a setting that
+// silently keeps its default
+// ---------------------------------------------------------------------------
+
+describe("unknown keys", () => {
+  it.each([
+    [
+      "a misspelled regex gaps",
+      { type: "regex", gap: true },
+      undefined,
+      undefined,
+      /invalid tokenizer: unknown field `gap`/,
+    ],
+    [
+      "a key on a tokenizer that takes none",
+      { type: "whitespace", pattern: "x" },
+      undefined,
+      undefined,
+      /invalid tokenizer: unknown field `pattern`/,
+    ],
+    [
+      "a key a char filter does not take",
+      { type: "whitespace" },
+      [{ type: "unicode_normalization", form: "nfkc", from: "x" }],
+      undefined,
+      /invalid charFilters\[0\]: unknown field `from`/,
+    ],
+    [
+      "a key on a filter that takes none",
+      { type: "whitespace" },
+      undefined,
+      [{ type: "lowercase", words: ["the"] }],
+      /invalid tokenFilters\[0\]: unknown field `words`/,
+    ],
+  ])("addAnalyzer rejects %s", (_label, tokenizer, charFilters, tokenFilters, message) => {
+    const schema = new Schema();
+    expect(() => schema.addAnalyzer("a", tokenizer, charFilters, tokenFilters)).toThrow(message);
+  });
+
+  it.each([
+    [{ type: "precomputed", model: "x" }, /unknown field `model`/],
+    [{ type: "candle_bert", model: "m", modle: "x" }, /unknown field `modle`/],
+  ])("addEmbedder rejects %j", (config, message) => {
+    expect(() => new Schema().addEmbedder("e", config)).toThrow(message);
+  });
+
+  it("fromToml rejects an unknown key", () => {
+    expect(() => Schema.fromToml("[fields.body.Text]\nindexd = false\n")).toThrow(
+      /unknown field `indexd`/,
+    );
+  });
+
+  it("does not open an index whose schema.toml has an unknown key", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "laurus-unknown-key-"));
+    try {
+      const schemaPath = path.join(dir, "schema.toml");
+      fs.writeFileSync(schemaPath, "[fields.body.Text]\nindexd = false\n");
+      const error = await Index.create(dir).then(
+        () => null,
+        (e) => e,
+      );
+      expect(error).not.toBeNull();
+      expect(error.message).toContain(`${schemaPath}: invalid schema TOML:`);
+      expect(error.message).toContain("unknown field `indexd`");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

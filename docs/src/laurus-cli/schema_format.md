@@ -32,6 +32,44 @@ default_fields = ["title", "body"]
 - **`embedders`** — A map of names to embedding models. A vector field uses one by naming it in its `embedder` option. Optional. See [Embedders](#embedders).
 - **`fields`** — A map of field names to their typed configuration. Each field must specify exactly one field type.
 
+### Unknown keys
+
+Every table takes only the keys this page lists for it: the top level, a field option, an analyzer definition and each of its components, a builtin analyzer table, an embedder and a quantizer. A key that is not listed, such as a misspelled `indexd`, or `words` on a `lowercase` filter, which takes no parameters, is an error that names the key, rather than a setting that silently keeps its default (Issue #1700). `create index` then creates nothing:
+
+```toml
+# schema.toml
+[fields.title.Text]
+indexd = false
+```
+
+```text
+$ laurus --index-dir index create index --schema schema.toml
+Error: Failed to parse schema TOML
+
+Caused by:
+    Schema error: invalid schema TOML: TOML parse error at line 2, column 1
+      |
+    2 | indexd = false
+      | ^^^^^^
+    unknown field `indexd`, expected one of `indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`
+```
+
+The same rule applies to the `schema.toml` of an existing index. laurus writes only keys it knows there, so an unknown key in it was added by hand or by a newer laurus; such an index does not open, and the error names the file and the key. Here `index/schema.toml` was edited to hold the same `indexd`:
+
+```text
+$ laurus --index-dir index get stats
+Error: Failed to read schema file
+
+Caused by:
+    Schema error: index/schema.toml: invalid schema TOML: TOML parse error at line 2, column 1
+      |
+    2 | indexd = false
+      | ^^^^^^
+    unknown field `indexd`, expected one of `indexed`, `stored`, `multi_valued`, `position_increment_gap`, `term_vectors`, `doc_values`, `analyzer`
+```
+
+Remove the key, or open the index with the laurus version that wrote it. A new optional key is written to `schema.toml` only when it is set to something other than its default, so only an index that uses a newer setting stops opening on an older version.
+
 ## Field Naming
 
 - Field names are arbitrary strings (e.g., `title`, `body_vec`, `created_at`).
@@ -564,7 +602,7 @@ Because built-ins are checked first, the names `standard`, `keyword`, `english`,
 
 Errors surface at three points:
 
-- An unknown `type` or a missing required key is rejected when the schema is parsed; `create index` creates nothing.
+- An unknown `type`, a missing required key or a key the component does not take (see [Unknown keys](#unknown-keys)) is rejected when the schema is parsed; `create index` creates nothing.
 - An entry named after a built-in is rejected when the index is created, with `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name`; `create index` creates nothing. Every binding's `addAnalyzer` / `add_analyzer` (WASM: `addAnalyzerDefinition`) raises the same error. An index created before this check keeps opening and the entry stays unused; opening it emits a warning through the `log` crate, which `laurus-server` prints in its log. So is a `boost` token filter whose `boost` is not finite or is negative, with `Analyzer 'a': token_filters[0]: boost must be finite and at least 0, got NaN` (Issue #1701); the bindings' `addAnalyzer` does not check it, the index creation does. An index created before this check opens with that filter left out, with a warning, so it keeps the results it had: before Issue #1701 the filter changed no score.
 - An invalid value (a malformed regular expression, an unknown `form` or `stem_type`, a missing Lindera dictionary) or an `analyzer` name that resolves to nothing is rejected when the index is built, with an error such as `Failed to resolve analyzer for field 'body': ...`; `create index` creates nothing — `schema.toml` and `store/` are rolled back to whatever state (if any) existed before the call.
 

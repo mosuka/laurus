@@ -1256,6 +1256,65 @@ mod tests {
         );
     }
 
+    /// Issue #1700: the JSON of `create_index`, `add_field` and
+    /// `update_field` is read with the core types, so an unknown key is a
+    /// tool error naming it, returned before any request reaches the server
+    /// (whose endpoint here accepts no connection), instead of a field whose
+    /// `indexed` keeps its default.
+    #[tokio::test]
+    async fn schema_tools_reject_an_unknown_key() {
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let server = LaurusMcpServer::new(Some(channel));
+        let field_option_json = r#"{"Text": {"indexd": false}}"#.to_string();
+        let results = [
+            (
+                "create_index",
+                server
+                    .create_index(Parameters(CreateIndexParams {
+                        schema_json: r#"{"fields": {"body": {"Text": {"indexd": false}}}}"#
+                            .to_string(),
+                    }))
+                    .await
+                    .unwrap(),
+                "Failed to parse schema JSON: unknown field `indexd`",
+            ),
+            (
+                "add_field",
+                server
+                    .add_field(Parameters(AddFieldParams {
+                        name: "title".to_string(),
+                        field_option_json: field_option_json.clone(),
+                    }))
+                    .await
+                    .unwrap(),
+                "Failed to parse field_option_json: unknown field `indexd`",
+            ),
+            (
+                "update_field",
+                server
+                    .update_field(Parameters(UpdateFieldParams {
+                        name: "body".to_string(),
+                        field_option_json,
+                        reindex: false,
+                        dry_run: true,
+                    }))
+                    .await
+                    .unwrap(),
+                "Failed to parse field_option_json: unknown field `indexd`",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (tool, result, expected) in results {
+            let result = serde_json::to_value(result).unwrap();
+            let text = result["content"][0]["text"].as_str().unwrap_or_default();
+            if result["isError"] != json!(true) || !text.starts_with(expected) {
+                wrong.push(format!("{tool}: {result}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Issue #1523: the `search_batch` tool rejects a `highlight` of the
     /// wrong type even when `queries` is empty, and an empty batch with
     /// valid parameters still returns no results without calling the

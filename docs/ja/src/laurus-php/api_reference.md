@@ -200,6 +200,8 @@ new \Laurus\Schema()
 
 上記のどの `add*Field` メソッドも、`name` が `_`（`_id` を除く）で始まる場合は `\ValueError` を投げ、フィールドを追加しない。`fromToml` / `fromTomlFile` で読み込んだスキーマはそのようなフィールドを引き続き受け付けるため、永続化済みのスキーマも読み込めるが、そこから新しい `Index` を作成すると `\ValueError` になる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
 
+スキーマのフォーマットが宣言していないキーは、黙ってデフォルト値のままにされるのではなく、キーを名指しする例外になる（Issue #1700）。`addAnalyzer` のコンポーネント（`["type" => "lowercase", "words" => ["the"]]` のように、引数を取らないコンポーネントも同じ）、`addEmbedder` の `$config`、`fromToml` / `fromTomlFile` の TOML（こちらは `ValueError`）が対象で、エラーは ``invalid tokenizer: unknown field `gap` ...`` のようになる。
+
 ### その他のメソッド
 
 | メソッド | 説明 |

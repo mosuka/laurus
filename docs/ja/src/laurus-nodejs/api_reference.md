@@ -240,6 +240,8 @@ class Schema {
 
 上記のどの `add*Field` メソッドも、`name` が `_`（`_id` を除く）で始まる場合は例外を投げ、フィールドを追加しない。`fromToml` / `fromTomlFile` で読み込んだスキーマはそのようなフィールドを引き続き受け付けるため、永続化済みのスキーマも読み込めるが、そこから新しい `Index` を作成すると例外を投げる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
 
+スキーマのフォーマットが宣言していないキーは、黙ってデフォルト値のままにされるのではなく、キーを名指しする例外になる（Issue #1700）。`addAnalyzer` のコンポーネント（`{ type: "lowercase", words: ["the"] }` のように、引数を取らないコンポーネントも同じ）、`addEmbedder` の `config`、`fromToml` / `fromTomlFile` の TOML が対象で、エラーは ``invalid tokenizer: unknown field `gap` ...`` のようになる。`schema.toml` にそのようなキーがあるインデックス（手で書き換えたもの、新しい版の laurus が書いたもの）も開けず、メッセージはファイルとキーを名指しする。
+
 #### Dynamic field policy（動的フィールドポリシー）
 
 ドキュメントに含まれるがスキーマに宣言されていないフィールドの扱いを制御します:
