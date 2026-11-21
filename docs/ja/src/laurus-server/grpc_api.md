@@ -86,8 +86,12 @@ message AnalyzerDefinition {
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `type` | `string` | コンポーネントタイプ名（例: `"whitespace"`, `"lowercase"`, `"unicode_normalization"`） |
-| `params` | `map<string, string>` | タイプ固有のパラメータ（文字列のキーと値のペア） |
+| `config` | `google.protobuf.Struct` | `schema.toml` と同じ形のコンポーネント。`type` とパラメータを持ちます（例: `{"type": "stop", "words": ["new,york", "the"]}`、`{"type": "ngram", "min_gram": 2, "max_gram": 3}`）。タイプごとのキーは [スキーマフォーマット → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください |
+| `type`、`params` | `string`、`map<string, string>` | 非推奨。空でなければなりません（下記を参照） |
+
+`config` は `schema.toml` と同じ規則で読まれます。必須のキーがない、`type` が未知、値の型が違う（`min_gram` に文字列の `"2"`、真偽値に `"False"` など）といった場合は `INVALID_ARGUMENT` で拒否され、メッセージはアナライザーとコンポーネントを名指しします（例: `Analyzer 'a': token_filters[0]: invalid type: ...`）。ストップワードや mapping のキーなどの文字列は、送ったとおりに保存されます。`config` は protobuf の `Struct` なので、`schema.toml` と違う点が 2 つあります。数値は double なので、`2.0` のような整数値も整数のパラメータに使えます。また、一番上の階層の `null` はキーの省略と同じです。`GetSchema` も同じ形でコンポーネントを返します。デフォルト値は埋めて返し、設定されていない省略可能なパラメータは含めません。
+
+Issue #1478 より前のコンポーネントは、`type` と、文字列のマップの `params` でした。ストップフィルターの `words` はカンマ区切りの 1 つの文字列だったので、カンマを含む語は送れず、各語の前後の空白は削られました。また、`form`・`replacement`・Lindera の `mode` は、省略すると補われていました。それ以降のサーバーは、`type` か `params` を設定したコンポーネントを `INVALID_ARGUMENT` で拒否し、それ以降のクライアント（`laurus-mcp` など）は、`GetSchema` の応答に含まれるそうしたコンポーネントを拒否します。それより前のサーバーは、`type` が空のコンポーネントを未知のタイプとして拒否します。そのため、この変更の前後の版のサーバーとクライアントを組み合わせると、デフォルト値でコンポーネントを作らずに失敗します。
 
 **EmbedderConfig:**
 

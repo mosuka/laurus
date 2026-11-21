@@ -86,8 +86,12 @@ message AnalyzerDefinition {
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `type` | `string` | Component type name (e.g. `"whitespace"`, `"lowercase"`, `"unicode_normalization"`) |
-| `params` | `map<string, string>` | Type-specific parameters as string key-value pairs |
+| `config` | `google.protobuf.Struct` | The component in the shape `schema.toml` uses: its `type` and its parameters, such as `{"type": "stop", "words": ["new,york", "the"]}` or `{"type": "ngram", "min_gram": 2, "max_gram": 3}`. See [Schema Format → Analyzers](../laurus-cli/schema_format.md#analyzers) for the keys of each type |
+| `type`, `params` | `string`, `map<string, string>` | Deprecated; must be empty (see below) |
+
+`config` is read by the rules `schema.toml` is read by: a missing required key, an unknown `type`, or a value of the wrong type (the string `"2"` for `min_gram`, `"False"` for a boolean) is rejected with `INVALID_ARGUMENT`, and the message names the analyzer and the component, such as `Analyzer 'a': token_filters[0]: invalid type: ...`. A stop word, a mapping key and every other string are stored as sent. Two things differ from `schema.toml`, since `config` is a protobuf `Struct`: numbers are doubles, so a whole number such as `2.0` also fills an integer parameter, and a top-level `null` is the same as omitting the key. `GetSchema` returns each component in the same shape, with the defaults filled in and an unset optional parameter left out.
+
+Before Issue #1478, a component was `type` and `params`, a map of strings: a stop filter's `words` was one comma-separated string, so a word with a comma could not be sent and each word was trimmed, and a missing `form`, `replacement` or Lindera `mode` was filled in. A server since then rejects a component that sets `type` or `params` with `INVALID_ARGUMENT`, and a client since then (such as `laurus-mcp`) rejects one in a `GetSchema` response; a server from before then rejects a component with an empty `type` as an unknown type. So a server and a client on either side of that change fail instead of building a component with defaults.
 
 **EmbedderConfig:**
 

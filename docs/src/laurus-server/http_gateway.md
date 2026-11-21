@@ -87,6 +87,26 @@ keys. Anything else, such as `"default_fields": "title"` or
 created (Issue #1524). A server older than this fix read such a value as
 omitted, or dropped the item that was not a string.
 
+An analyzer's char filters, tokenizer and token filters take the shapes of
+[Schema Format → Analyzers](../laurus-cli/schema_format.md#analyzers), such
+as `{"type": "stop", "words": ["new,york", "the"]}`, and the server reads
+them by the rules `schema.toml` is read by (Issue #1478). Each must be an
+object nested at most 8 levels deep. A missing required key, an unknown
+`type` or a value of the wrong type, such as `"min_gram": "2"` or
+`"words": "a,b"`, is rejected with 400 and no index is created; the message
+names the analyzer and the component, as in
+`Analyzer 'a': token_filters[0]: invalid type: string "a,b", expected a sequence`.
+A whole number such as `2.0` also fills an integer parameter, and `null` is
+the same as omitting a key. `GET /v1/schema` returns each component in the
+same shape, with the defaults filled in, so the response can be posted
+back. A server older than this fix joined a list into one comma-separated
+string and split it again, so a stop word with a comma became two words
+and each word lost its surrounding spaces; it dropped an array item or a
+mapping value that was not a string, took `"2"` for a number, read a
+misspelled boolean such as `"False"` as its default, and returned every
+parameter as a string, with a mapping's entries at the top level of the
+component.
+
 If the data directory has a `store/` but no `schema.toml`, the request is
 rejected with 412 and nothing is written or removed, since the `store/` may
 hold the documents of an earlier index (Issue #1560). Restore `schema.toml`
@@ -751,4 +771,4 @@ See [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic
 
 All request and response bodies use JSON. The JSON structure mirrors the gRPC protobuf messages. See [gRPC API Reference](grpc_api.md) for the full message definitions.
 
-Each key takes the JSON types the sections above describe (most take one; `highlight`, for example, takes an array or an object), and for a key that may be omitted, `null` is the same as omitting it. A value of another type is rejected with `400 Bad Request` whose message names the key, and nothing is written or searched: the string `"true"` or the number `1` for a boolean (Issue #1511), and the string `"2"` for a number, the number `1` for a string, or a string or an array for an object (Issue #1524). A server older than these fixes read such a value as omitted, or dropped it. The parameters of an analyzer's char filters, tokenizer and token filters are not checked this way yet (Issue #1478). In `POST /v1/search/batch`, the message starts with the position of the query that failed, such as `queries[1]: query must be a string`, and none of the queries is run.
+Each key takes the JSON types the sections above describe (most take one; `highlight`, for example, takes an array or an object), and for a key that may be omitted, `null` is the same as omitting it. A value of another type is rejected with `400 Bad Request` whose message names the key, and nothing is written or searched: the string `"true"` or the number `1` for a boolean (Issue #1511), and the string `"2"` for a number, the number `1` for a string, or a string or an array for an object (Issue #1524). A server older than these fixes read such a value as omitted, or dropped it. The server checks the parameters of an analyzer's char filters, tokenizer and token filters instead (Issue #1478): its message names the analyzer and the component and then gives serde's description of the problem, which names a missing key but, for a value of the wrong type, only the type expected (see [Create an Index](#create-an-index)). In `POST /v1/search/batch`, the message starts with the position of the query that failed, such as `queries[1]: query must be a string`, and none of the queries is run.

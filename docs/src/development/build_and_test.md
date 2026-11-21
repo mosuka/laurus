@@ -4,7 +4,12 @@
 
 - **Rust** 1.89 or later (edition 2024)
 - **Cargo** (included with Rust)
-- **protobuf compiler** (`protoc`) -- required for building `laurus-server`
+- **protobuf compiler** (`protoc`) -- required for building `laurus-server`,
+  together with its standard `.proto` files (`google/protobuf/struct.proto`).
+  The archives of the protobuf releases have them in `include/`, next to
+  `bin/protoc`;
+  on Debian and Ubuntu they are in `libprotobuf-dev`, which
+  `protobuf-compiler` only recommends
 - **[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)** --
   optional, only needed to cross-compile static musl binaries locally (see
   [Cross-compiling static musl binaries](#cross-compiling-static-musl-binaries))
