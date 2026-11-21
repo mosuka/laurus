@@ -462,6 +462,11 @@ fn analyzer_spec_to_json(spec: &v1::AnalyzerSpec) -> Option<Value> {
 /// The JSON object must contain exactly one key identifying the field type
 /// (e.g. `"text"`, `"integer"`, `"hnsw"`) with its configuration as the value.
 ///
+/// An omitted or `null` `indexed`, `stored`, `term_vectors` or `doc_values`
+/// is left unset in the proto option, which the server reads as the
+/// engine's default (`true`; Issue #1709 for `indexed` and `stored`). An
+/// omitted or `null` `multi_valued` is `false`, the engine's default too.
+///
 /// # Arguments
 ///
 /// * `json` - The JSON value representing a single field option.
@@ -519,12 +524,14 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "text" => {
             let v = option_object(value, kind)?;
             Opt::Text(v1::TextOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
-                // Unset (omitted by the client) is distinct from an explicit
-                // `false`: it means "use the engine's default" (#1083), unlike
-                // `indexed`/`stored` above, which have no such tri-state and
-                // are `false` when omitted.
+                // Unset (omitted by the client, or `null`) is distinct from
+                // an explicit `false`: the server reads it as the engine's
+                // default, as `schema.toml` does, so the gateway keeps no
+                // default of its own. These two read an omitted key as
+                // `false` before Issue #1709.
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
+                // Same tri-state treatment for the same reason (#1083).
                 term_vectors: json_optional_bool(v, "term_vectors")?,
                 // Same tri-state treatment for the same reason (#1047).
                 doc_values: json_optional_bool(v, "doc_values")?,
@@ -545,8 +552,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "integer" => {
             let v = option_object(value, kind)?;
             Opt::Integer(v1::IntegerOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
                 doc_values: json_optional_bool(v, "doc_values")?,
             })
@@ -554,8 +561,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "float" => {
             let v = option_object(value, kind)?;
             Opt::Float(v1::FloatOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
                 doc_values: json_optional_bool(v, "doc_values")?,
             })
@@ -563,8 +570,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "boolean" => {
             let v = option_object(value, kind)?;
             Opt::Boolean(v1::BooleanOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
                 doc_values: json_optional_bool(v, "doc_values")?,
             })
@@ -572,8 +579,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "date_time" => {
             let v = option_object(value, kind)?;
             Opt::DateTime(v1::DateTimeOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
                 doc_values: json_optional_bool(v, "doc_values")?,
             })
@@ -581,8 +588,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "geo" => {
             let v = option_object(value, kind)?;
             Opt::Geo(v1::GeoOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
                 doc_values: json_optional_bool(v, "doc_values")?,
             })
@@ -590,8 +597,8 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "geo3d" => {
             let v = option_object(value, kind)?;
             Opt::Geo3d(v1::Geo3dOption {
-                indexed: json_optional_bool(v, "indexed")?.unwrap_or(false),
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                indexed: json_optional_bool(v, "indexed")?,
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
                 doc_values: json_optional_bool(v, "doc_values")?,
             })
@@ -599,7 +606,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
         "bytes" => {
             let v = option_object(value, kind)?;
             Opt::Bytes(v1::BytesOption {
-                stored: json_optional_bool(v, "stored")?.unwrap_or(false),
+                stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
             })
         }
@@ -645,27 +652,45 @@ fn option_object<'a>(value: &'a Value, kind: &str) -> Result<&'a Map<String, Val
         .ok_or_else(|| format!("{kind} option must be an object"))
 }
 
+/// The JSON of the flags a lexical option shares.
+///
+/// `multi_valued` is a plain proto bool, so it is always written: Integer
+/// and Float used to leave it out, so `GET .../schema` could not tell a
+/// multi-valued field from a single-valued one (#1174). `indexed`,
+/// `stored` (Issue #1709) and `doc_values` (#1047) are written only when
+/// set: an unset one means the engine's default, as on input, rather than a
+/// `null` standing in for `false`. The server always sets them in a schema
+/// it returns.
+fn lexical_flags_to_json(
+    indexed: Option<bool>,
+    stored: Option<bool>,
+    multi_valued: bool,
+    doc_values: Option<bool>,
+) -> Value {
+    let mut obj = json!({ "multi_valued": multi_valued });
+    for (key, value) in [
+        ("indexed", indexed),
+        ("stored", stored),
+        ("doc_values", doc_values),
+    ] {
+        if let Some(value) = value {
+            obj[key] = json!(value);
+        }
+    }
+    obj
+}
+
 fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
     use v1::field_option::Option as Opt;
+    let flags = lexical_flags_to_json;
     match &opt.option {
         Some(Opt::Text(v)) => {
-            // `multi_valued` is always surfaced, like on every other option
-            // that carries it (#1175; see the comment on the BKD-backed arms
-            // below).
-            let mut text_obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            // Surfaced only when explicitly set (#1083): an absent
-            // `term_vectors` means "use the engine's default", same as
-            // `analyzer` below, rather than a `null` standing in for `false`.
+            let mut text_obj = flags(v.indexed, v.stored, v.multi_valued, v.doc_values);
+            // Surfaced only when explicitly set (#1083), as the flags above:
+            // an absent `term_vectors` means "use the engine's default", same
+            // as `analyzer` below.
             if let Some(term_vectors) = v.term_vectors {
                 text_obj["term_vectors"] = json!(term_vectors);
-            }
-            // Same tri-state treatment for the same reason (#1047).
-            if let Some(doc_values) = v.doc_values {
-                text_obj["doc_values"] = json!(doc_values);
             }
             // Same tri-state treatment again (#1175): `None` is the engine
             // default, and `0` is a deliberate, meaningful setting.
@@ -677,84 +702,26 @@ fn proto_field_option_to_json(opt: &v1::FieldOption) -> Value {
             }
             json!({ "text": text_obj })
         }
-        // `multi_valued` is a plain (non-optional) proto bool on every option
-        // that carries it (the BKD-backed Integer/Float/Geo/Geo3d/DateTime
-        // and, since #1180, the term-only Boolean), so it is always surfaced,
-        // like `indexed` and `stored`. Integer/Float used to omit it, so
-        // `GET .../schema` could not tell a multi-valued field from a
-        // single-valued one (#1174).
         Some(Opt::Integer(v)) => {
-            let mut obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            if let Some(doc_values) = v.doc_values {
-                obj["doc_values"] = json!(doc_values);
-            }
-            json!({ "integer": obj })
+            json!({ "integer": flags(v.indexed, v.stored, v.multi_valued, v.doc_values) })
         }
         Some(Opt::Float(v)) => {
-            let mut obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            if let Some(doc_values) = v.doc_values {
-                obj["doc_values"] = json!(doc_values);
-            }
-            json!({ "float": obj })
+            json!({ "float": flags(v.indexed, v.stored, v.multi_valued, v.doc_values) })
         }
         Some(Opt::Boolean(v)) => {
-            let mut obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            if let Some(doc_values) = v.doc_values {
-                obj["doc_values"] = json!(doc_values);
-            }
-            json!({ "boolean": obj })
+            json!({ "boolean": flags(v.indexed, v.stored, v.multi_valued, v.doc_values) })
         }
         Some(Opt::DateTime(v)) => {
-            let mut obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            if let Some(doc_values) = v.doc_values {
-                obj["doc_values"] = json!(doc_values);
-            }
-            json!({ "date_time": obj })
+            json!({ "date_time": flags(v.indexed, v.stored, v.multi_valued, v.doc_values) })
         }
         Some(Opt::Geo(v)) => {
-            let mut obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            if let Some(doc_values) = v.doc_values {
-                obj["doc_values"] = json!(doc_values);
-            }
-            json!({ "geo": obj })
+            json!({ "geo": flags(v.indexed, v.stored, v.multi_valued, v.doc_values) })
         }
         Some(Opt::Geo3d(v)) => {
-            let mut obj = json!({
-                "indexed": v.indexed,
-                "stored": v.stored,
-                "multi_valued": v.multi_valued,
-            });
-            if let Some(doc_values) = v.doc_values {
-                obj["doc_values"] = json!(doc_values);
-            }
-            json!({ "geo3d": obj })
+            json!({ "geo3d": flags(v.indexed, v.stored, v.multi_valued, v.doc_values) })
         }
-        // `multi_valued` is always surfaced, like on every other option
-        // that carries it (#1176; see the comment on the BKD-backed arms
-        // above). `BytesOption` has no `indexed` / `doc_values` flags.
-        Some(Opt::Bytes(v)) => json!({
-            "bytes": { "stored": v.stored, "multi_valued": v.multi_valued }
-        }),
+        // `BytesOption` has no `indexed` / `doc_values` flags (#1176).
+        Some(Opt::Bytes(v)) => json!({ "bytes": flags(None, v.stored, v.multi_valued, None) }),
         Some(Opt::Hnsw(v)) => json!({ "hnsw": hnsw_option_to_json(v) }),
         Some(Opt::Flat(v)) => json!({ "flat": flat_option_to_json(v) }),
         Some(Opt::Ivf(v)) => json!({ "ivf": ivf_option_to_json(v) }),
@@ -2103,6 +2070,53 @@ mod tests {
         let proto = json_to_proto_field_option(&json).unwrap();
         let back = proto_field_option_to_json(&proto);
         assert_eq!(back["bytes"]["multi_valued"], json!(false));
+    }
+
+    /// Issue #1709: an omitted or `null` `indexed` or `stored` stays unset in
+    /// the proto option, for the server to read as the engine's default, and
+    /// an unset one is not written back as `null`. An explicit value goes
+    /// both ways as it is. The gateway used to read an omitted one as
+    /// `false`.
+    #[test]
+    fn test_lexical_indexed_and_stored_stay_unset_when_omitted() {
+        let mut wrong = Vec::new();
+        for kind in [
+            "text",
+            "integer",
+            "float",
+            "boolean",
+            "date_time",
+            "geo",
+            "geo3d",
+            "bytes",
+        ] {
+            let keys: &[&str] = if kind == "bytes" {
+                &["stored"]
+            } else {
+                &["indexed", "stored"]
+            };
+            let with = |value: Value| -> Value {
+                keys.iter()
+                    .map(|key| (key.to_string(), value.clone()))
+                    .collect()
+            };
+            for (label, option, want) in [
+                ("omitted", json!({}), None),
+                ("null", with(Value::Null), None),
+                ("false", with(json!(false)), Some(json!(false))),
+                ("true", with(json!(true)), Some(json!(true))),
+            ] {
+                let proto = json_to_proto_field_option(&json!({ kind: option })).unwrap();
+                let back = proto_field_option_to_json(&proto);
+                for key in keys {
+                    let got = back[kind].get(*key).cloned();
+                    if got != want {
+                        wrong.push(format!("{kind}.{key} {label}: {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// #1177: the `multi_vector` field option round-trips its dimension and

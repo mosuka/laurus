@@ -125,8 +125,16 @@ message FieldOption {
 // Lexical field options.
 
 message TextOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Whether the field is indexed (searchable), and whether its value is
+  // stored (returned with a hit). Unset means "use the engine's default"
+  // (currently `true`), as an omitted key in `schema.toml` does, for the
+  // same reason as `term_vectors` below. These were plain `bool`s before
+  // Issue #1709, which read an omitted value as `false`; a client generated
+  // from that proto puts nothing on the wire for an explicit `false`, so it
+  // reads as unset here, and such a client has to be regenerated to turn
+  // either off.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // Whether to store term positions for this field ("term vectors").
   // Unset means "use the engine's default" (currently `true`) rather than
   // explicitly `false` — a plain `bool` cannot distinguish the two, which
@@ -190,8 +198,10 @@ message JapaneseAnalyzerSpec {
 }
 
 message IntegerOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // When true, the field accepts arrays of integers and range queries
   // match a document if any value satisfies the predicate (Lucene-style).
   bool multi_valued = 3;
@@ -202,8 +212,10 @@ message IntegerOption {
 }
 
 message FloatOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // When true, the field accepts arrays of floats and range queries
   // match a document if any value satisfies the predicate (Lucene-style).
   bool multi_valued = 3;
@@ -214,8 +226,10 @@ message FloatOption {
 }
 
 message BooleanOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // Whether this field's value is also copied into DocValues. Unset
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
@@ -227,8 +241,10 @@ message BooleanOption {
 }
 
 message DateTimeOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // Whether this field's value is also copied into DocValues. Unset
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
@@ -240,8 +256,10 @@ message DateTimeOption {
 }
 
 message GeoOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // Whether this field's value is also copied into DocValues. Unset
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
@@ -257,8 +275,10 @@ message GeoOption {
 // Indexed values are stored in a 3D BKD tree and queryable via the
 // `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` DSL forms.
 message Geo3dOption {
-  bool indexed = 1;
-  bool stored = 2;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool indexed = 1;
+  optional bool stored = 2;
   // Whether this field's value is also copied into DocValues. Unset
   // means "use the engine's default" (currently `true`); see
   // `TextOption.doc_values`.
@@ -270,7 +290,9 @@ message Geo3dOption {
 }
 
 message BytesOption {
-  bool stored = 1;
+  // Unset means "use the engine's default" (currently `true`); see
+  // `TextOption.indexed`.
+  optional bool stored = 1;
   // When true, the field accepts `BytesArrayValue` (arrays of byte
   // strings); a single value is auto-wrapped into a one-element array.
   // Bytes fields are never indexed, so unlike the other multi-valued types
