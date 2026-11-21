@@ -68,6 +68,12 @@ impl SynonymGraphFilter {
     /// This allows you to adjust the weight of synonym matches relative to original terms.
     /// For example, a boost of 0.8 means synonyms will have 80% of the weight of exact matches.
     ///
+    /// The boost is set on the output tokens, but search does not apply a
+    /// weight that differs between the alternatives at one position yet:
+    /// the query parser puts the position's largest token boost on its
+    /// `SynonymQuery` as a whole (Issue #1701), so a synonym scores like the
+    /// original term.
+    ///
     /// # Arguments
     /// * `boost` - Boost multiplier for synonyms (typically 0.5-1.0)
     ///

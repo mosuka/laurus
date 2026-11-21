@@ -54,6 +54,10 @@ impl SynonymGraphBuilder {
 
     /// Set the boost multiplier for synonym tokens.
     ///
+    /// Search does not apply this weight yet: the query parser puts a
+    /// position's largest token boost on its `SynonymQuery` as a whole
+    /// (Issue #1701), so a synonym scores like the term it expands.
+    ///
     /// # Arguments
     /// * `boost` - Boost multiplier (e.g., 0.8 to reduce synonym weight to 80%)
     ///

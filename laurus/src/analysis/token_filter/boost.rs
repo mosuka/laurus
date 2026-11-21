@@ -30,6 +30,13 @@ use crate::error::Result;
 /// allowing you to increase or decrease the scoring importance of tokens
 /// from a particular field or analysis stage.
 ///
+/// The boost takes effect when a query is analyzed: the query parser
+/// multiplies a query term's boost by its tokens' boost (Issue #1701), as
+/// Lucene's `QueryBuilder` applies a token's `BoostAttribute`. Indexing does
+/// not use a token's boost. In a schema, the factor of a `boost` token
+/// filter must be finite and at least 0
+/// ([`validate_analyzer_definition`](crate::analysis::analyzer::registry::validate_analyzer_definition)).
+///
 /// # Use Cases
 ///
 /// - Boosting title field tokens vs body field tokens

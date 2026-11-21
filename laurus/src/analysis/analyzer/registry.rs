@@ -93,6 +93,49 @@ pub fn validate_analyzer_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Returns `true` if `boost` is a valid factor for a `boost` token filter:
+/// finite and at least 0, the range of a query's boost (Issue #1550).
+///
+/// # Arguments
+///
+/// * `boost` - The factor of a [`TokenFilterConfig::Boost`].
+pub fn is_valid_token_filter_boost(boost: f32) -> bool {
+    boost.is_finite() && boost >= 0.0
+}
+
+/// Validates the parameters of a custom analyzer definition that only a
+/// new index must satisfy: a `boost` token filter's factor must be finite
+/// and at least 0 (Issue #1701). The query parser multiplies a query term's
+/// boost by it, so a NaN, infinite or negative factor would make the
+/// field's scores unusable.
+///
+/// An index created before this check may hold such a factor;
+/// [`create_analyzer_from_definition`] leaves that filter out when the
+/// index is opened.
+///
+/// # Arguments
+///
+/// * `name` - The name of the custom analyzer definition.
+/// * `definition` - The definition to check.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::invalid_argument`] naming the analyzer and the
+/// filter, such as
+/// `Analyzer 'a': token_filters[0]: boost must be finite and at least 0, got NaN`.
+pub fn validate_analyzer_definition(name: &str, definition: &AnalyzerDefinition) -> Result<()> {
+    for (i, filter) in definition.token_filters.iter().enumerate() {
+        if let TokenFilterConfig::Boost { boost } = filter
+            && !is_valid_token_filter_boost(*boost)
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "Analyzer '{name}': token_filters[{i}]: boost must be finite and at least 0, got {boost}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Create an analyzer instance by its well-known name.
 ///
 /// Built-in analyzers that take no parameters are resolved by name.
@@ -206,6 +249,12 @@ pub fn create_analyzer_from_spec(
 /// char filters, and token filters according to the given
 /// [`AnalyzerDefinition`].
 ///
+/// A `boost` token filter whose factor is not finite or is negative is left
+/// out, with a warning in the log. A new index cannot have one
+/// ([`validate_analyzer_definition`]); an index created before that check
+/// (Issue #1701) still opens, with the results it had, since a token's
+/// boost reached no score before then.
+///
 /// # Arguments
 ///
 /// * `name` - The name to assign to the resulting analyzer.
@@ -280,7 +329,7 @@ pub fn create_analyzer_from_definition(
     }
 
     // 4. Add token filters.
-    for tf_config in &definition.token_filters {
+    for (i, tf_config) in definition.token_filters.iter().enumerate() {
         let tf: Arc<dyn Filter> = match tf_config {
             TokenFilterConfig::Lowercase => Arc::new(LowercaseFilter::new()),
             TokenFilterConfig::Stop { words } => {
@@ -305,6 +354,17 @@ pub fn create_analyzer_from_definition(
                         )));
                     }
                 }
+            }
+            TokenFilterConfig::Boost { boost } if !is_valid_token_filter_boost(*boost) => {
+                // Only an index created before Issue #1701 can hold such a
+                // factor: `Schema::validate_for_create` rejects it. A
+                // token's boost reached no score then, so leaving the filter
+                // out keeps that index's results as they were.
+                log::warn!(
+                    "Analyzer '{name}': token_filters[{i}]: leaving out a boost filter \
+                     whose factor {boost} is not finite or is negative"
+                );
+                continue;
             }
             TokenFilterConfig::Boost { boost } => Arc::new(BoostFilter::new(*boost)),
             TokenFilterConfig::Limit { limit } => Arc::new(LimitFilter::new(*limit)),
@@ -529,5 +589,31 @@ mod tests {
         let tokens: Vec<_> = analyzer.analyze("Hello World").unwrap().collect();
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].text, "Hello World");
+    }
+
+    /// Issue #1701: a `boost` token filter whose factor is out of range,
+    /// which only an index created before `validate_for_create` checked it
+    /// can hold, is left out, so the tokens keep a boost of 1.0; one in
+    /// range is applied.
+    #[test]
+    fn test_create_from_definition_leaves_out_an_out_of_range_boost() {
+        let boosts = |boost: f32| {
+            let def = AnalyzerDefinition {
+                char_filters: vec![],
+                tokenizer: TokenizerConfig::Whitespace,
+                token_filters: vec![TokenFilterConfig::Boost { boost }],
+            };
+            let analyzer = create_analyzer_from_definition("boosted", &def).unwrap();
+            analyzer
+                .analyze("rust lang")
+                .unwrap()
+                .map(|token| token.boost)
+                .collect::<Vec<_>>()
+        };
+        for boost in [f32::NAN, f32::INFINITY, -2.0] {
+            assert_eq!(boosts(boost), [1.0, 1.0], "{boost}");
+        }
+        assert_eq!(boosts(2.0), [2.0, 2.0]);
+        assert_eq!(boosts(0.0), [0.0, 0.0]);
     }
 }
