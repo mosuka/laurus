@@ -72,8 +72,8 @@ fn schema(analyzers: HashMap<String, v1::AnalyzerDefinition>) -> v1::Schema {
             "body".to_string(),
             v1::FieldOption {
                 option: Some(Opt::Text(v1::TextOption {
-                    indexed: true,
-                    stored: true,
+                    indexed: Some(true),
+                    stored: Some(true),
                     ..Default::default()
                 })),
             },

@@ -144,9 +144,11 @@ pub fn field_change_kind_to_proto(kind: FieldChangeKind) -> v1::FieldChangeKind 
 pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
     use v1::field_option::Option as Opt;
     let option = match fo {
+        // `indexed` and `stored` are always set, so an explicit `false`
+        // reaches the wire (Issue #1709).
         FieldOption::Text(o) => Some(Opt::Text(v1::TextOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             term_vectors: Some(o.term_vectors),
             analyzer: o.analyzer.as_ref().map(analyzer_spec_to_proto),
             doc_values: Some(o.doc_values),
@@ -154,43 +156,43 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
             position_increment_gap: Some(o.position_increment_gap),
         })),
         FieldOption::Integer(o) => Some(Opt::Integer(v1::IntegerOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Float(o) => Some(Opt::Float(v1::FloatOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Boolean(o) => Some(Opt::Boolean(v1::BooleanOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::DateTime(o) => Some(Opt::DateTime(v1::DateTimeOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Geo(o) => Some(Opt::Geo(v1::GeoOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Geo3d(o) => Some(Opt::Geo3d(v1::Geo3dOption {
-            indexed: o.indexed,
-            stored: o.stored,
+            indexed: Some(o.indexed),
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
             doc_values: Some(o.doc_values),
         })),
         FieldOption::Bytes(o) => Some(Opt::Bytes(v1::BytesOption {
-            stored: o.stored,
+            stored: Some(o.stored),
             multi_valued: o.multi_valued,
         })),
         FieldOption::Hnsw(o) => Some(Opt::Hnsw(v1::HnswOption {
@@ -236,6 +238,10 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
 
 /// Convert a proto `FieldOption` into a laurus `FieldOption`.
 ///
+/// An unset optional value of a lexical option, such as `indexed` or
+/// `stored` (Issue #1709), gets the value of the core option's `Default`,
+/// so a key a client leaves out means what it means in `schema.toml`.
+///
 /// # Arguments
 ///
 /// * `fo` - The proto field option to convert.
@@ -250,64 +256,86 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
 pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, String> {
     use v1::field_option::Option as Opt;
     let option = match &fo.option {
-        Some(Opt::Text(o)) => FieldOption::Text(TextOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            // Same tri-state treatment as `term_vectors` below (#1175): an
-            // omitted gap is the engine default, not 0.
-            position_increment_gap: o
-                .position_increment_gap
-                .unwrap_or(laurus::lexical::core::field::DEFAULT_POSITION_INCREMENT_GAP),
-            // Unset means "use the engine's default", matching
-            // `TextOption::default()` (#1083).
-            term_vectors: o.term_vectors.unwrap_or(true),
-            // Same tri-state treatment for the same reason (#1047).
-            doc_values: o.doc_values.unwrap_or(true),
-            analyzer: o.analyzer.as_ref().and_then(analyzer_spec_from_proto),
-        }),
-        Some(Opt::Integer(o)) => FieldOption::Integer(IntegerOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            doc_values: o.doc_values.unwrap_or(true),
-        }),
-        Some(Opt::Float(o)) => FieldOption::Float(FloatOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            doc_values: o.doc_values.unwrap_or(true),
-        }),
-        Some(Opt::Boolean(o)) => FieldOption::Boolean(BooleanOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            doc_values: o.doc_values.unwrap_or(true),
-        }),
-        Some(Opt::DateTime(o)) => FieldOption::DateTime(DateTimeOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            doc_values: o.doc_values.unwrap_or(true),
-        }),
-        Some(Opt::Geo(o)) => FieldOption::Geo(GeoOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            doc_values: o.doc_values.unwrap_or(true),
-        }),
-        Some(Opt::Geo3d(o)) => FieldOption::Geo3d(Geo3dOption {
-            indexed: o.indexed,
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-            // Same tri-state treatment as every other lexical option; this
-            // arm used to hardcode `true` and drop an explicit `false`.
-            doc_values: o.doc_values.unwrap_or(true),
-        }),
-        Some(Opt::Bytes(o)) => FieldOption::Bytes(BytesOption {
-            stored: o.stored,
-            multi_valued: o.multi_valued,
-        }),
+        // An unset optional value of a lexical option is the core option's
+        // default, as an omitted key in `schema.toml` is: `indexed` and
+        // `stored` (Issue #1709), `term_vectors` (#1083), `doc_values`
+        // (#1047) and `position_increment_gap` (#1175). Each arm is a struct
+        // literal, so a field added to an option has to be handled here.
+        Some(Opt::Text(o)) => {
+            let default = TextOption::default();
+            FieldOption::Text(TextOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                position_increment_gap: o
+                    .position_increment_gap
+                    .unwrap_or(default.position_increment_gap),
+                term_vectors: o.term_vectors.unwrap_or(default.term_vectors),
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+                analyzer: o.analyzer.as_ref().and_then(analyzer_spec_from_proto),
+            })
+        }
+        Some(Opt::Integer(o)) => {
+            let default = IntegerOption::default();
+            FieldOption::Integer(IntegerOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+            })
+        }
+        Some(Opt::Float(o)) => {
+            let default = FloatOption::default();
+            FieldOption::Float(FloatOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+            })
+        }
+        Some(Opt::Boolean(o)) => {
+            let default = BooleanOption::default();
+            FieldOption::Boolean(BooleanOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+            })
+        }
+        Some(Opt::DateTime(o)) => {
+            let default = DateTimeOption::default();
+            FieldOption::DateTime(DateTimeOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+            })
+        }
+        Some(Opt::Geo(o)) => {
+            let default = GeoOption::default();
+            FieldOption::Geo(GeoOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+            })
+        }
+        Some(Opt::Geo3d(o)) => {
+            let default = Geo3dOption::default();
+            FieldOption::Geo3d(Geo3dOption {
+                indexed: o.indexed.unwrap_or(default.indexed),
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+                doc_values: o.doc_values.unwrap_or(default.doc_values),
+            })
+        }
+        Some(Opt::Bytes(o)) => {
+            let default = BytesOption::default();
+            FieldOption::Bytes(BytesOption {
+                stored: o.stored.unwrap_or(default.stored),
+                multi_valued: o.multi_valued,
+            })
+        }
         Some(Opt::Hnsw(o)) => FieldOption::Hnsw(HnswOption {
             dimension: o.dimension as usize,
             distance: distance_from_proto(o.distance)?,
@@ -1791,8 +1819,8 @@ mod tests {
         // A client that predates #1175 omits the gap entirely.
         let proto = v1::FieldOption {
             option: Some(v1::field_option::Option::Text(v1::TextOption {
-                indexed: true,
-                stored: true,
+                indexed: Some(true),
+                stored: Some(true),
                 term_vectors: None,
                 analyzer: None,
                 doc_values: None,
@@ -2368,5 +2396,185 @@ mod tests {
                 assert!(err.starts_with(prefix), "{err}");
             }
         }
+    }
+
+    /// `indexed` (`None` for `BytesOption`, which has none) and `stored` of
+    /// a lexical option.
+    fn indexed_and_stored(option: &FieldOption) -> (Option<bool>, bool) {
+        match option {
+            FieldOption::Text(o) => (Some(o.indexed), o.stored),
+            FieldOption::Integer(o) => (Some(o.indexed), o.stored),
+            FieldOption::Float(o) => (Some(o.indexed), o.stored),
+            FieldOption::Boolean(o) => (Some(o.indexed), o.stored),
+            FieldOption::DateTime(o) => (Some(o.indexed), o.stored),
+            FieldOption::Geo(o) => (Some(o.indexed), o.stored),
+            FieldOption::Geo3d(o) => (Some(o.indexed), o.stored),
+            FieldOption::Bytes(o) => (None, o.stored),
+            other => panic!("not a lexical option: {other:?}"),
+        }
+    }
+
+    /// Issue #1709: a lexical option whose `indexed` and `stored` a gRPC
+    /// client leaves out gets the core option's defaults (`true`), as an
+    /// omitted key in `schema.toml` does. Both used to be `false`, so the
+    /// field was neither searchable nor returned.
+    #[test]
+    fn unset_indexed_and_stored_get_the_core_defaults() {
+        use v1::field_option::Option as Opt;
+
+        let cases = [
+            (
+                "text",
+                Opt::Text(v1::TextOption::default()),
+                FieldOption::Text(TextOption::default()),
+            ),
+            (
+                "integer",
+                Opt::Integer(v1::IntegerOption::default()),
+                FieldOption::Integer(IntegerOption::default()),
+            ),
+            (
+                "float",
+                Opt::Float(v1::FloatOption::default()),
+                FieldOption::Float(FloatOption::default()),
+            ),
+            (
+                "boolean",
+                Opt::Boolean(v1::BooleanOption::default()),
+                FieldOption::Boolean(BooleanOption::default()),
+            ),
+            (
+                "date_time",
+                Opt::DateTime(v1::DateTimeOption::default()),
+                FieldOption::DateTime(DateTimeOption::default()),
+            ),
+            (
+                "geo",
+                Opt::Geo(v1::GeoOption::default()),
+                FieldOption::Geo(GeoOption::default()),
+            ),
+            (
+                "geo3d",
+                Opt::Geo3d(v1::Geo3dOption::default()),
+                FieldOption::Geo3d(Geo3dOption::default()),
+            ),
+            (
+                "bytes",
+                Opt::Bytes(v1::BytesOption::default()),
+                FieldOption::Bytes(BytesOption::default()),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (kind, proto, default) in cases {
+            let (want_indexed, want_stored) = indexed_and_stored(&default);
+            // The test can only tell the defaults from `false` while they
+            // are `true`.
+            assert!(want_stored && want_indexed != Some(false), "{kind}");
+            let converted = field_option_from_proto(&v1::FieldOption {
+                option: Some(proto),
+            })
+            .unwrap();
+            let (indexed, stored) = indexed_and_stored(&converted);
+            if indexed != want_indexed {
+                wrong.push(format!("{kind}.indexed: {indexed:?}"));
+            }
+            if stored != want_stored {
+                wrong.push(format!("{kind}.stored: {stored}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1709: an explicit `indexed` and `stored`, `false` included,
+    /// survive the path MCP takes: a core option converted to proto, sent
+    /// over the wire, and converted back. A plain proto `bool` put nothing on
+    /// the wire for `false`; an unset `optional bool` would now read as
+    /// `true`.
+    #[test]
+    fn explicit_indexed_and_stored_survive_the_wire() {
+        use prost::Message as _;
+
+        let options = |indexed: bool, stored: bool| {
+            [
+                (
+                    "text",
+                    FieldOption::Text(TextOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "integer",
+                    FieldOption::Integer(IntegerOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "float",
+                    FieldOption::Float(FloatOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "boolean",
+                    FieldOption::Boolean(BooleanOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "date_time",
+                    FieldOption::DateTime(DateTimeOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "geo",
+                    FieldOption::Geo(GeoOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "geo3d",
+                    FieldOption::Geo3d(Geo3dOption {
+                        indexed,
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+                (
+                    "bytes",
+                    FieldOption::Bytes(BytesOption {
+                        stored,
+                        ..Default::default()
+                    }),
+                ),
+            ]
+        };
+        let mut wrong = Vec::new();
+        for indexed in [true, false] {
+            for stored in [true, false] {
+                for (kind, option) in options(indexed, stored) {
+                    let bytes = field_option_to_proto(&option).encode_to_vec();
+                    let decoded = v1::FieldOption::decode(bytes.as_slice()).unwrap();
+                    let back = field_option_from_proto(&decoded).unwrap();
+                    let got = indexed_and_stored(&back);
+                    if got != indexed_and_stored(&option) {
+                        wrong.push(format!("{kind} indexed={indexed} stored={stored}: {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
