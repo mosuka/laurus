@@ -111,11 +111,11 @@ parameter as a string, with a mapping's entries at the top level of the
 component.
 
 The rest of a schema in the body (an analyzer's `char_filters`, `tokenizer`
-and `token_filters` keys, the field options, the embedders and the schema's
-top level) is read by the gateway itself, which still drops a key it does
-not know, such as `"indexd"` in a `text` field option, without an error
-(Issue #1706). `schema.toml`, the CLI, MCP and the language
-bindings reject such a key.
+and `token_filters` keys, the field options and the schema's top level) is
+read by the gateway itself, which rejects a key it does not take there too,
+such as `"indexd"` in a `text` field option (see
+[Request/Response Format](#requestresponse-format); Issue #1706). An
+embedder's parameters are not checked yet (Issue #1702).
 
 If the data directory has a `store/` but no `schema.toml`, the request is
 rejected with 412 and nothing is written or removed, since the `store/` may
@@ -782,3 +782,12 @@ See [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic
 All request and response bodies use JSON. The JSON structure mirrors the gRPC protobuf messages. See [gRPC API Reference](grpc_api.md) for the full message definitions.
 
 Each key takes the JSON types the sections above describe (most take one; `highlight`, for example, takes an array or an object), and for a key that may be omitted, `null` is the same as omitting it. A value of another type is rejected with `400 Bad Request` whose message names the key, and nothing is written or searched: the string `"true"` or the number `1` for a boolean (Issue #1511), and the string `"2"` for a number, the number `1` for a string, or a string or an array for an object (Issue #1524). A server older than these fixes read such a value as omitted, or dropped it. The server checks the parameters of an analyzer's char filters, tokenizer and token filters instead (Issue #1478): its message names the analyzer and the component and then gives serde's description of the problem, which names a missing key but, for a value of the wrong type, only the type expected (see [Create an Index](#create-an-index)). In `POST /v1/search/batch`, the message starts with the position of the query that failed, such as `queries[1]: query must be a string`, and none of the queries is run.
+
+Each object of a body takes only the keys the sections above describe. Any other key, such as a misspelled `"indexd"` in a `text` option, `"dry_rn"` in a field change or `"limt"` in a search, is rejected with `400 Bad Request` whose message names the key and the object, and nothing is written or searched (Issue #1706). As for every key, `null` is the same as omitting it, so an unknown key set to `null` is not reported. The keys of a schema's `fields`, `analyzers` and `embedders`, of `field_boosts` and of a document's `fields` are names you choose, and are not checked; the server checks the keys of an analyzer component (see above), and an embedder's parameters are not checked yet (Issue #1702). A server older than this fix dropped such a key: `"dry_rn": true` applied the change instead of trying it, and `"limt"` searched with the default limit. For example:
+
+```bash
+curl -X PATCH http://localhost:8080/v1/schema/fields/body \
+  -H 'Content-Type: application/json' \
+  -d '{"field_option": {"text": {"stored": false}}, "dry_rn": true}'
+# => {"error":{"code":400,"message":"unknown key \"dry_rn\" in the request body (expected \"field_option\", \"reindex\", or \"dry_run\")"}}
+```

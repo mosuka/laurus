@@ -12,7 +12,6 @@ use tokio_stream::StreamExt;
 use super::GatewayState;
 use super::convert;
 use super::error::{BadRequest, GatewayError};
-use crate::proto::laurus::v1::SearchBatchRequest;
 
 /// `POST /v1/search` — Executes a search and returns all results at once.
 pub async fn search(
@@ -89,26 +88,12 @@ pub async fn search_batch(
     State(mut state): State<GatewayState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    let queries_value = body
-        .get("queries")
-        .ok_or_else(|| BadRequest("missing `queries` field".to_string()).into_response())?;
-    let queries_array = queries_value
-        .as_array()
-        .ok_or_else(|| BadRequest("`queries` must be an array".to_string()).into_response())?;
-
-    let queries = queries_array
-        .iter()
-        .enumerate()
-        .map(|(index, query)| {
-            convert::json_to_proto_search_request(query)
-                .map_err(|e| format!("queries[{index}]: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()
+    let request = convert::json_to_proto_search_batch_request(&body)
         .map_err(|e| BadRequest(e).into_response())?;
 
     let response = state
         .search_client
-        .search_batch(SearchBatchRequest { queries })
+        .search_batch(request)
         .await
         .map_err(|s| GatewayError(s).into_response())?;
 

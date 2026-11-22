@@ -18,6 +18,7 @@ use crate::convert::document;
 use crate::convert::json::{
     json_optional_bool, json_optional_f64, json_optional_object, json_optional_str,
     json_optional_string_array, json_optional_u32, json_optional_u64, json_to_string_array,
+    reject_unknown_keys,
 };
 use crate::proto::laurus::v1;
 
@@ -190,11 +191,13 @@ fn group_by_from_proto(params: &v1::GroupByParams) -> GroupBy {
 ///
 /// # Errors
 ///
-/// Returns a message describing the first malformed part.
+/// Returns a message describing the first malformed part, a key other than
+/// `field` and `group_size` included (Issue #1706).
 pub fn group_by_params_from_json(json: &serde_json::Value) -> Result<v1::GroupByParams, String> {
     use serde_json::Value;
 
     let obj = json.as_object().ok_or("group_by must be an object")?;
+    reject_unknown_keys(obj, "group_by", &["field", "group_size"])?;
     let field = obj
         .get("field")
         .and_then(Value::as_str)
@@ -359,11 +362,13 @@ fn rescore_from_proto(params: &v1::RescoreParams) -> Result<RescoreOptions, toni
 ///
 /// # Errors
 ///
-/// Returns a message describing the first malformed part.
+/// Returns a message describing the first malformed part, a key that
+/// `rescore` or `late_interaction` does not take included (Issue #1706).
 pub fn rescore_params_from_json(json: &serde_json::Value) -> Result<v1::RescoreParams, String> {
     use serde_json::Value;
 
     let obj = json.as_object().ok_or("rescore must be an object")?;
+    reject_unknown_keys(obj, "rescore", &["window_size", "late_interaction"])?;
     let window_size = match obj.get("window_size") {
         None | Some(Value::Null) => None,
         Some(value) => Some(
@@ -378,6 +383,11 @@ pub fn rescore_params_from_json(json: &serde_json::Value) -> Result<v1::RescoreP
         .ok_or("rescore.late_interaction is required")?
         .as_object()
         .ok_or("rescore.late_interaction must be an object")?;
+    reject_unknown_keys(
+        late,
+        "rescore.late_interaction",
+        &["field", "vectors", "text"],
+    )?;
     let field = late
         .get("field")
         .and_then(Value::as_str)
@@ -464,21 +474,29 @@ fn token_vectors_from_json(json: &serde_json::Value) -> Result<v1::VectorArrayVa
 /// or no `fusion`), and `rrf` won over `weighted_sum` (Issue #1524).
 /// `"rrf": null` is the same as omitting `rrf`. A number of the right type
 /// but out of range, such as a negative `k`, is rejected by the engine
-/// (Issue #1540).
+/// (Issue #1540). A key that `fusion`, `rrf` or `weighted_sum` does not
+/// take is an error too (Issue #1706).
 pub fn fusion_algorithm_from_json(json: &serde_json::Value) -> Result<v1::FusionAlgorithm, String> {
     use v1::fusion_algorithm::Algorithm;
     let obj = json.as_object().ok_or("fusion must be an object")?;
+    reject_unknown_keys(obj, "fusion", &["rrf", "weighted_sum"])?;
     let error = |message: String| format!("fusion: {message}");
     let rrf = json_optional_object(obj, "rrf").map_err(error)?;
     let weighted_sum = json_optional_object(obj, "weighted_sum").map_err(error)?;
     let algorithm = match (rrf, weighted_sum) {
         (Some(rrf), None) => {
+            reject_unknown_keys(rrf, "fusion.rrf", &["k"])?;
             let k = json_optional_f64(rrf, "k")
                 .map_err(|e| error(format!("rrf: {e}")))?
                 .unwrap_or(FusionAlgorithm::DEFAULT_RRF_K);
             Algorithm::Rrf(v1::Rrf { k: Some(k) })
         }
         (None, Some(ws)) => {
+            reject_unknown_keys(
+                ws,
+                "fusion.weighted_sum",
+                &["lexical_weight", "vector_weight"],
+            )?;
             let weight = |key: &str| {
                 json_optional_f64(ws, key)
                     .map(|w| Some(w.map_or(DEFAULT_WEIGHTED_SUM_WEIGHT, |w| w as f32)))
@@ -544,7 +562,8 @@ pub fn field_boosts_from_json(json: &serde_json::Value) -> Result<HashMap<String
 /// wrapping (Issue #1490), or when `require_field_match` or
 /// `return_entire_field_if_no_highlight` is present and not `null` but not
 /// `true` or `false`, instead of using the default (Issue #1511). Every key
-/// is checked even when the field list is empty.
+/// is checked even when the field list is empty, and a key the object does
+/// not take is an error (Issue #1706).
 pub fn highlight_params_from_json(
     json: &serde_json::Value,
 ) -> Result<Option<v1::HighlightParams>, String> {
@@ -563,6 +582,20 @@ pub fn highlight_params_from_json(
         Value::Object(obj) => obj,
         _ => return Err(SHAPE.to_string()),
     };
+    reject_unknown_keys(
+        obj,
+        "highlight",
+        &[
+            "fields",
+            "max_fragments",
+            "fragment_size",
+            "tag",
+            "css_class",
+            "max_analyzed_chars",
+            "require_field_match",
+            "return_entire_field_if_no_highlight",
+        ],
+    )?;
     let error = |message: String| format!("highlight: {message}");
     let fields = json_optional_string_array(obj, "fields")
         .map_err(error)?
