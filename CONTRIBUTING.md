@@ -177,7 +177,7 @@ The types a schema is read into (`Schema`, the field options, the analyzer and e
 
 ### Server Config Types
 
-The types the server's config file is read into (`laurus-server/src/config.rs`) set `#[serde(deny_unknown_fields)]` too, so a misspelled key stops the server from starting, with an error that names the file and the key, instead of leaving the setting at its default (Issue #1708). Removing or renaming a key keeps the old one readable (`#[serde(alias = "...")]`, or a field that is still read); otherwise a config file that has it no longer starts the server.
+The types the server's config file is read into (`laurus-server/src/config.rs`) set `#[serde(deny_unknown_fields)]` too, so a misspelled key stops the server from starting, with an error that names the file and the key, instead of leaving the setting at its default (Issue #1708). Removing or renaming a key keeps the old one readable (`#[serde(alias = "...")]`, or a field that is still read); otherwise a config file that has it no longer starts the server. A key that never took effect may instead be rejected with an error that says what to use, as `[index] data_dir` is, which `laurus serve` always overrode with `--index-dir` (Issue #1718).
 
 ## Module Organization
 

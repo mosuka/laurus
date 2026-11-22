@@ -10,6 +10,8 @@ Server and index settings are resolved in the following order (highest priority 
 CLI arguments > Environment variables > Config file > Defaults
 ```
 
+The index directory is not part of this order: as for every `laurus` command, only the global `--index-dir` option or the `LAURUS_INDEX_DIR` environment variable sets it (default `./laurus_index`), and the config file has no key for it (Issue #1718).
+
 Log verbosity is controlled exclusively by the `RUST_LOG` environment variable (default: `info`).
 
 For example:
@@ -38,9 +40,6 @@ host = "0.0.0.0"
 port = 50051
 http_port = 8080  # Optional: enables HTTP Gateway
 max_result_window = 10000  # Optional; largest offset + limit per search
-
-[index]
-data_dir = "./laurus_data"
 
 [index.wal]
 sync_policy = "group"          # "per_record" (default) | "group"
@@ -85,9 +84,19 @@ Caused by:
 
 #### `[index]` Section
 
-| Field | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `data_dir` | String | `"./laurus_data"` | Path to the index data directory |
+The `[index]` table only holds the `[index.wal]` and `[index.commit]` tables below. It does not set the index directory, which comes from `--index-dir` or `LAURUS_INDEX_DIR` (see [CLI Arguments](#cli-arguments)): a `data_dir` key is an error, and the server does not start (Issue #1718). Before, the key was accepted and ignored, and the server used `./laurus_index`, the default of `--index-dir`. For example, with `data_dir = "/var/lib/laurus/data"` under `[index]`:
+
+```text
+$ laurus serve --config config.toml
+Error: Failed to parse config file: config.toml
+
+Caused by:
+    TOML parse error at line 2, column 12
+      |
+    2 | data_dir = "/var/lib/laurus/data"
+      |            ^^^^^^^^^^^^^^^^^^^^^^
+    the index directory is not read from the config file: `laurus serve` takes it from `--index-dir` or `LAURUS_INDEX_DIR` (default `./laurus_index`)
+```
 
 #### `[index.wal]` Section
 
@@ -141,7 +150,7 @@ WAL flush.
 | `LAURUS_PORT` | `server.port` | gRPC listen port |
 | `LAURUS_HTTP_PORT` | `server.http_port` | HTTP Gateway port |
 | `LAURUS_MAX_RESULT_WINDOW` | `server.max_result_window` | Largest `offset + limit` per search |
-| `LAURUS_INDEX_DIR` | `index.data_dir` | Index data directory |
+| `LAURUS_INDEX_DIR` | `--index-dir` (global option) | Index data directory |
 | `RUST_LOG` | -- | Log filter directive (e.g. `info`, `debug`, `laurus=debug,tonic=warn`) |
 | `LAURUS_CONFIG` | -- | Path to TOML config file |
 
@@ -164,13 +173,10 @@ WAL flush.
 [server]
 host = "127.0.0.1"
 port = 50051
-
-[index]
-data_dir = "./dev_data"
 ```
 
 ```bash
-RUST_LOG=debug laurus serve --config config.toml
+RUST_LOG=debug laurus --index-dir ./dev_data serve --config config.toml
 ```
 
 ### Production (gRPC + HTTP Gateway)
@@ -180,9 +186,10 @@ RUST_LOG=debug laurus serve --config config.toml
 host = "0.0.0.0"
 port = 50051
 http_port = 8080
+```
 
-[index]
-data_dir = "/var/lib/laurus/data"
+```bash
+laurus --index-dir /var/lib/laurus/data serve --config config.toml
 ```
 
 ### Minimal (environment variables only)

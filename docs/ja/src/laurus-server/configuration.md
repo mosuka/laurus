@@ -10,6 +10,8 @@ laurus-server は CLI 引数、環境変数、TOML 設定ファイルで設定�
 CLI 引数 > 環境変数 > 設定ファイル > デフォルト値
 ```
 
+インデックスのディレクトリは、この順序に入りません。どの `laurus` のコマンドとも同じく、グローバルオプション `--index-dir` か環境変数 `LAURUS_INDEX_DIR` だけで決まり（デフォルト: `./laurus_index`）、設定ファイルにはそのキーがありません（Issue #1718）。
+
 ログの詳細度は `RUST_LOG` 環境変数でのみ制御します（デフォルト: `info`）。
 
 例:
@@ -38,9 +40,6 @@ host = "0.0.0.0"
 port = 50051
 http_port = 8080  # オプション: HTTP ゲートウェイを有効化
 max_result_window = 10000  # オプション: 1 回の検索の offset + limit の上限
-
-[index]
-data_dir = "./laurus_data"
 
 [index.wal]
 sync_policy = "group"          # "per_record"（デフォルト） | "group"
@@ -85,9 +84,19 @@ Caused by:
 
 #### `[index]` セクション
 
-| フィールド | 型 | デフォルト | 説明 |
-| :--- | :--- | :--- | :--- |
-| `data_dir` | String | `"./laurus_data"` | インデックスデータディレクトリのパス |
+`[index]` テーブルは、下の `[index.wal]` と `[index.commit]` のテーブルをまとめるだけです。インデックスのディレクトリはここでは指定せず、`--index-dir` か `LAURUS_INDEX_DIR` で決まります（[CLI 引数](#cli-引数) を参照）。`data_dir` キーはエラーになり、サーバーは起動しません（Issue #1718）。以前はこのキーを受け付けたうえで無視し、`--index-dir` のデフォルトの `./laurus_index` を使っていました。たとえば `[index]` の下に `data_dir = "/var/lib/laurus/data"` と書くと、次のようになります。
+
+```text
+$ laurus serve --config config.toml
+Error: Failed to parse config file: config.toml
+
+Caused by:
+    TOML parse error at line 2, column 12
+      |
+    2 | data_dir = "/var/lib/laurus/data"
+      |            ^^^^^^^^^^^^^^^^^^^^^^
+    the index directory is not read from the config file: `laurus serve` takes it from `--index-dir` or `LAURUS_INDEX_DIR` (default `./laurus_index`)
+```
 
 #### `[index.wal]` セクション
 
@@ -140,7 +149,7 @@ WebAssembly では background thread がないため no-op になります。
 | `LAURUS_PORT` | `server.port` | gRPC リッスンポート |
 | `LAURUS_HTTP_PORT` | `server.http_port` | HTTP ゲートウェイポート |
 | `LAURUS_MAX_RESULT_WINDOW` | `server.max_result_window` | 1 回の検索の `offset + limit` の上限 |
-| `LAURUS_INDEX_DIR` | `index.data_dir` | インデックスデータディレクトリ |
+| `LAURUS_INDEX_DIR` | `--index-dir`（グローバルオプション） | インデックスデータディレクトリ |
 | `RUST_LOG` | -- | ログフィルタディレクティブ（例: `info`, `debug`, `laurus=debug,tonic=warn`） |
 | `LAURUS_CONFIG` | -- | TOML 設定ファイルのパス |
 
@@ -163,13 +172,10 @@ WebAssembly では background thread がないため no-op になります。
 [server]
 host = "127.0.0.1"
 port = 50051
-
-[index]
-data_dir = "./dev_data"
 ```
 
 ```bash
-RUST_LOG=debug laurus serve --config config.toml
+RUST_LOG=debug laurus --index-dir ./dev_data serve --config config.toml
 ```
 
 ### 本番環境（gRPC + HTTP ゲートウェイ）
@@ -179,9 +185,10 @@ RUST_LOG=debug laurus serve --config config.toml
 host = "0.0.0.0"
 port = 50051
 http_port = 8080
+```
 
-[index]
-data_dir = "/var/lib/laurus/data"
+```bash
+laurus --index-dir /var/lib/laurus/data serve --config config.toml
 ```
 
 ### 最小構成（環境変数のみ）

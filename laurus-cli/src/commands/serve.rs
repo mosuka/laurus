@@ -14,8 +14,9 @@ use crate::cli::ServeCommand;
 ///
 /// Loads a base configuration from the TOML file specified in `cmd.config`
 /// (or uses defaults), applies any overrides from CLI flags / environment
-/// variables, sets the index index directory, and delegates to the
-/// `laurus-server` runtime.
+/// variables, sets the index directory from the global `--index-dir`
+/// (`LAURUS_INDEX_DIR`), which the config file does not set (Issue #1718),
+/// and delegates to the `laurus-server` runtime.
 ///
 /// # Arguments
 ///
