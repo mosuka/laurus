@@ -97,8 +97,12 @@ Before Issue #1478, a component was `type` and `params`, a map of strings: a sto
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `type` | `string` | Embedder type name (e.g. `"precomputed"`, `"candle_bert"`, `"candle_colbert"`, `"openai"`) |
-| `params` | `map<string, string>` | Type-specific parameters (e.g. `"model"` → `"sentence-transformers/all-MiniLM-L6-v2"`). `"candle_colbert"` (Issue #1349) also takes the optional `"revision"`, `"query_maxlen"` and `"doc_maxlen"`; the lengths are decimal strings such as `"32"`, and anything else is rejected |
+| `config` | `google.protobuf.Struct` | The embedder in the shape `schema.toml` uses: its `type` and its parameters, such as `{"type": "precomputed"}` or `{"type": "candle_colbert", "model": "colbert-ir/colbertv2.0", "query_maxlen": 32}`. See [Schema Format → Embedders](../laurus-cli/schema_format.md#embedders) for the keys of each type |
+| `type`, `params` | `string`, `map<string, string>` | Deprecated; must be empty (see below) |
+
+`config` is read by the rules `schema.toml` is read by, as a component's is (Issue #1702): a missing required key, an unknown `type`, a key the type does not take (such as `"model"` on a `precomputed` embedder) or a value of the wrong type (the string `"32"` for `query_maxlen`) is rejected with `INVALID_ARGUMENT`, and the message names the embedder, such as ``Embedder 'e': unknown field `model`, there are no fields``. A whole number such as `32.0` also fills `query_maxlen` or `doc_maxlen`, and a top-level `null` is the same as omitting the key. `GetSchema` returns each embedder in the same shape, with an unset optional parameter left out.
+
+Before Issue #1702, an embedder was `type` and `params`, a map of strings read key by key: `query_maxlen` and `doc_maxlen` were decimal strings, and a parameter the type does not take was dropped. A server since then rejects an embedder that sets `type` or `params` with `INVALID_ARGUMENT`, and a client since then (such as `laurus-mcp`) rejects one in a `GetSchema` response; a server from before then rejects an embedder with an empty `type` as an unknown type. So a server and a client on either side of that change fail instead of creating a different embedder.
 
 Each `FieldOption` is a `oneof` with one of the following field types:
 

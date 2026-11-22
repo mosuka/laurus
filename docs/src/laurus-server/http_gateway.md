@@ -110,12 +110,33 @@ misspelled boolean such as `"False"` as its default, and returned every
 parameter as a string, with a mapping's entries at the top level of the
 component.
 
+An embedder in `embedders` takes the shape of
+[Schema Format → Embedders](../laurus-cli/schema_format.md#embedders), such
+as `{"type": "candle_colbert", "model": "colbert-ir/colbertv2.0", "query_maxlen": 32}`,
+and the server reads it by the rules `schema.toml` is read by (Issue #1702).
+It must be an object nested at most 8 levels deep. A missing `model`, an
+unknown `type`, a key the type does not take (such as a misspelled
+`"doc_max_len"`, or `"model"` on a `precomputed` embedder) or a value of the
+wrong type (such as `"query_maxlen": "32"` or `"model": true`) is rejected
+with 400 and no index is created; the message names the embedder. A whole
+number such as `32.0` also fills `query_maxlen` or `doc_maxlen`, and `null`
+is the same as omitting a key. `GET /v1/schema` returns each embedder in the
+same shape, so the response can be posted back. A server older than this
+fix stored `"32"` as the number 32 and `123` or `true` as a string, and
+dropped a key the type does not take, with a 200. For example:
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"body": {"text": {}}}, "embedders": {"colbert": {"type": "candle_colbert", "model": "colbert-ir/colbertv2.0", "doc_max_len": 300}}}}'
+# => {"error":{"code":400,"message":"Embedder 'colbert': unknown field `doc_max_len`, expected one of `model`, `revision`, `query_maxlen`, `doc_maxlen`"}}
+```
+
 The rest of a schema in the body (an analyzer's `char_filters`, `tokenizer`
 and `token_filters` keys, the field options and the schema's top level) is
 read by the gateway itself, which rejects a key it does not take there too,
 such as `"indexd"` in a `text` field option (see
-[Request/Response Format](#requestresponse-format); Issue #1706). An
-embedder's parameters are not checked yet (Issue #1702).
+[Request/Response Format](#requestresponse-format); Issue #1706).
 
 If the data directory has a `store/` but no `schema.toml`, the request is
 rejected with 412 and nothing is written or removed, since the `store/` may
@@ -142,7 +163,7 @@ A field option has exactly one type key, such as `"text"` or `"hnsw"`, and its v
 
 A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` (`distance` is `"cosine"` or `"dot_product"`, defaulting to `"cosine"`). Its value in a document is an array of equal-length numeric arrays, one per token vector (`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`). The field holds token vectors for late-interaction rescoring: it is not a vector-search target and is not returned with documents.
 
-A multi-vector field may also name a token-level embedder (Issue #1349), declared in the schema's `embedders` with its numeric options as JSON numbers: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` and `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`. A document can then give the field text (`"body_colbert": "how lifetimes work in rust"`), which is embedded into token vectors. Embedder parameters that are numbers or booleans are passed on as strings, and arrays or objects are rejected.
+A multi-vector field may also name a token-level embedder (Issue #1349), declared in the schema's `embedders` with its numeric options as JSON numbers: `"embedders": {"colbert": {"type": "candle_colbert", "model": "answerdotai/answerai-colbert-small-v1", "revision": "934fa8bb4ce2284f4c2baa232d81aca4d076fa5e", "doc_maxlen": 300}}` and `"body_colbert": {"multi_vector": {"dimension": 96, "embedder": "colbert"}}`. A document can then give the field text (`"body_colbert": "how lifetimes work in rust"`), which is embedded into token vectors. The embedder is read by the rules `schema.toml` is read by (see [Create an Index](#create-an-index)).
 
 A multi-vector field may also set `storage` (Issue #1346) to pick the on-disk element kind of its token vectors: `"f32"` (default, exact), `"f16"` (2x smaller than `"f32"`, ~2⁻¹¹ relative error per element), `"int8"` (~4x smaller than `"f32"` at typical dimensions, using a per-vector scale), or `"binary"` (32x smaller, 1 bit per element; requires `"distance": "cosine"`). It may also set `pool_factor`, an integer: each document keeps about `1 / pool_factor` of its token vectors (`1`, the default, keeps them all; `0` is rejected by the engine, and a value that is not a non-negative integer is a 400). The key is omitted from the response when it is `1`. The value is a lowercase string, accepted case-insensitively on input, e.g. `"body_colbert": {"multi_vector": {"dimension": 128, "storage": "int8"}}`; an unrecognized value, or one that is not a string, is rejected with 400 (Issue #1473), and `null` is the same as omitting the key. The key is omitted from the response when `storage` is `"f32"`, the default.
 
@@ -781,9 +802,9 @@ See [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic
 
 All request and response bodies use JSON. The JSON structure mirrors the gRPC protobuf messages. See [gRPC API Reference](grpc_api.md) for the full message definitions.
 
-Each key takes the JSON types the sections above describe (most take one; `highlight`, for example, takes an array or an object), and for a key that may be omitted, `null` is the same as omitting it. A value of another type is rejected with `400 Bad Request` whose message names the key, and nothing is written or searched: the string `"true"` or the number `1` for a boolean (Issue #1511), and the string `"2"` for a number, the number `1` for a string, or a string or an array for an object (Issue #1524). A server older than these fixes read such a value as omitted, or dropped it. The server checks the parameters of an analyzer's char filters, tokenizer and token filters instead (Issue #1478): its message names the analyzer and the component and then gives serde's description of the problem, which names a missing key but, for a value of the wrong type, only the type expected (see [Create an Index](#create-an-index)). In `POST /v1/search/batch`, the message starts with the position of the query that failed, such as `queries[1]: query must be a string`, and none of the queries is run.
+Each key takes the JSON types the sections above describe (most take one; `highlight`, for example, takes an array or an object), and for a key that may be omitted, `null` is the same as omitting it. A value of another type is rejected with `400 Bad Request` whose message names the key, and nothing is written or searched: the string `"true"` or the number `1` for a boolean (Issue #1511), and the string `"2"` for a number, the number `1` for a string, or a string or an array for an object (Issue #1524). A server older than these fixes read such a value as omitted, or dropped it. The server checks the parameters of an analyzer's char filters, tokenizer and token filters (Issue #1478) and of an embedder (Issue #1702) instead: its message names the analyzer and the component, or the embedder, and then gives serde's description of the problem, which names a missing key but, for a value of the wrong type, only the type expected (see [Create an Index](#create-an-index)). In `POST /v1/search/batch`, the message starts with the position of the query that failed, such as `queries[1]: query must be a string`, and none of the queries is run.
 
-Each object of a body takes only the keys the sections above describe. Any other key, such as a misspelled `"indexd"` in a `text` option, `"dry_rn"` in a field change or `"limt"` in a search, is rejected with `400 Bad Request` whose message names the key and the object, and nothing is written or searched (Issue #1706). As for every key, `null` is the same as omitting it, so an unknown key set to `null` is not reported. The keys of a schema's `fields`, `analyzers` and `embedders`, of `field_boosts` and of a document's `fields` are names you choose, and are not checked; the server checks the keys of an analyzer component (see above), and an embedder's parameters are not checked yet (Issue #1702). A server older than this fix dropped such a key: `"dry_rn": true` applied the change instead of trying it, and `"limt"` searched with the default limit. For example:
+Each object of a body takes only the keys the sections above describe. Any other key, such as a misspelled `"indexd"` in a `text` option, `"dry_rn"` in a field change or `"limt"` in a search, is rejected with `400 Bad Request` whose message names the key and the object, and nothing is written or searched (Issue #1706). As for every key, `null` is the same as omitting it, so an unknown key set to `null` is not reported. The keys of a schema's `fields`, `analyzers` and `embedders`, of `field_boosts` and of a document's `fields` are names you choose, and are not checked; the server checks the keys of an analyzer component and of an embedder (see above). A server older than this fix dropped such a key: `"dry_rn": true` applied the change instead of trying it, and `"limt"` searched with the default limit. For example:
 
 ```bash
 curl -X PATCH http://localhost:8080/v1/schema/fields/body \

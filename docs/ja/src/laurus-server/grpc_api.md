@@ -97,8 +97,12 @@ Issue #1478 より前のコンポーネントは、`type` と、文字列のマ�
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `type` | `string` | エンベッダータイプ名（例: `"precomputed"`, `"candle_bert"`, `"candle_colbert"`, `"openai"`） |
-| `params` | `map<string, string>` | タイプ固有のパラメータ（例: `"model"` → `"sentence-transformers/all-MiniLM-L6-v2"`）。`"candle_colbert"`（Issue #1349）は、任意で `"revision"`、`"query_maxlen"`、`"doc_maxlen"` も受け付けます。長さは `"32"` のような 10 進の文字列で、それ以外は拒否されます |
+| `config` | `google.protobuf.Struct` | `schema.toml` と同じ形のエンベッダー。`type` とパラメータを持ちます（例: `{"type": "precomputed"}`、`{"type": "candle_colbert", "model": "colbert-ir/colbertv2.0", "query_maxlen": 32}`）。各タイプのキーは [スキーマフォーマット → エンベダー](../laurus-cli/schema_format.md#エンベダー) を参照 |
+| `type`, `params` | `string`, `map<string, string>` | 非推奨。空でなければなりません（下記） |
+
+`config` は、コンポーネントと同じく `schema.toml` と同じ規則で読みます（Issue #1702）。必須のキーがない、`type` が未知、タイプが取らないキーがある（`precomputed` のエンベッダーの `"model"` など）、値の型が違う（`query_maxlen` に文字列の `"32"`）、といった場合は `INVALID_ARGUMENT` で拒否され、メッセージはエンベッダーを名指しします（例: ``Embedder 'e': unknown field `model`, there are no fields``）。`32.0` のような整数値も `query_maxlen` と `doc_maxlen` に使え、一番上の階層の `null` はキーの省略と同じです。`GetSchema` は、同じ形で各エンベッダーを返し、設定されていない任意のパラメータは含めません。
+
+Issue #1702 より前のエンベッダーは、`type` と、キーごとに読む文字列のマップの `params` でした。`query_maxlen` と `doc_maxlen` は 10 進の文字列で、タイプが取らないパラメータは捨てられていました。それ以降のサーバーは、`type` か `params` を設定したエンベッダーを `INVALID_ARGUMENT` で拒否し、それ以降のクライアント（`laurus-mcp` など）は、`GetSchema` の応答に含まれるそうしたエンベッダーを拒否します。それより前のサーバーは、`type` が空のエンベッダーを未知のタイプとして拒否します。そのため、この変更の前後の版のサーバーとクライアントを組み合わせると、別のエンベッダーを作らずに失敗します。
 
 各 `FieldOption` は以下のフィールドタイプのいずれかを持つ `oneof` です。
 

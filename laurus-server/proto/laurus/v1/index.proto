@@ -487,14 +487,27 @@ message MultiVectorOption {
 }
 
 // An embedder configuration.
+//
+// Before Issue #1702 an embedder was `type` and `params`, which carried every
+// parameter as a string and dropped a parameter the type does not take. A
+// server since then rejects an embedder that sets either of them, and a
+// client since then rejects such an embedder in a response, so that a server
+// and a client of different versions fail instead of creating a different
+// embedder.
 message EmbedderConfig {
-  // Embedder type name (e.g. "precomputed", "candle_bert", "candle_colbert",
-  // "openai").
-  string type = 1;
-  // Type-specific parameters (e.g. "model" -> "sentence-transformers/all-MiniLM-L6-v2").
-  // "candle_colbert" also takes the optional "revision", "query_maxlen" and
-  // "doc_maxlen" (numbers written as decimal strings).
-  map<string, string> params = 2;
+  // The embedder's type before Issue #1702. Must be empty; see `config`.
+  string type = 1 [deprecated = true];
+  // The embedder's parameters before Issue #1702. Must be empty; see
+  // `config`.
+  map<string, string> params = 2 [deprecated = true];
+  // The embedder in the shape `schema.toml` and the HTTP API use: its `type`
+  // and its parameters, for example `{"type": "precomputed"}` or
+  // `{"type": "candle_colbert", "model": "colbert-ir/colbertv2.0",
+  // "query_maxlen": 32}`. The keys a type takes and requires are the ones
+  // `schema.toml` does. Numbers travel as doubles, so a whole number such as
+  // `32.0` also fills an integer parameter. A top-level `null` is the same as
+  // omitting the key.
+  google.protobuf.Struct config = 3;
 }
 
 // ---- RPC messages ----
