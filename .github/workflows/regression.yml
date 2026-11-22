@@ -50,86 +50,70 @@ jobs:
         id: filter
         if: github.event_name == 'pull_request'
         with:
+          # The filters follow the crates' dependencies: a crate's filter
+          # names, through its anchor, the filter of each workspace crate it
+          # depends on, and every filter includes `shared`, what every job
+          # reads. An anchor has to come before its aliases. The CI Filters
+          # job (scripts/check-ci-filters.py) checks them against
+          # `cargo metadata` (Issue #1714).
           filters: |
+            # shared: the workspace manifest and lock, the cargo config, the
+            # composite actions and this workflow (an anchor; no job reads
+            # this output)
+            shared: &shared
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - '.github/actions/**'
+              - '.github/workflows/regression.yml'
             # code: triggers format + clippy
             code:
+              - *shared
               - '**/*.rs'
               - '**/Cargo.toml'
-              - 'Cargo.lock'
               - 'laurus-server/proto/**'
-              - '.github/workflows/regression.yml'
             # laurus: core library
-            laurus:
+            laurus: &laurus
+              - *shared
               - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
-            # cli: laurus-cli depends on laurus, laurus-mcp
-            cli:
-              - 'laurus-cli/**'
-              - 'laurus/**'
-              - 'laurus-mcp/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
             # server: laurus-server depends on laurus and has proto files
-            server:
+            server: &server
+              - *laurus
               - 'laurus-server/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
-            # mcp: laurus-mcp depends on laurus
-            mcp:
+            # mcp: laurus-mcp depends on laurus-server
+            mcp: &mcp
+              - *server
               - 'laurus-mcp/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
+            # cli: laurus-cli depends on laurus-mcp and laurus-server
+            cli: &cli
+              - *mcp
+              - 'laurus-cli/**'
             # python: laurus-python depends on laurus
             python:
+              - *laurus
               - 'laurus-python/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
             # nodejs: laurus-nodejs depends on laurus
             nodejs:
+              - *laurus
               - 'laurus-nodejs/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
             # ruby: laurus-ruby depends on laurus
             ruby:
+              - *laurus
               - 'laurus-ruby/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
             # php: laurus-php depends on laurus
             php:
+              - *laurus
               - 'laurus-php/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
             # wasm: laurus-wasm depends on laurus
             wasm:
+              - *laurus
               - 'laurus-wasm/**'
-              - 'laurus/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/workflows/regression.yml'
-            # interop: cross-platform index interop check (Issue #947)
+            # interop: cross-platform index interop check (Issue #947), which
+            # builds laurus-cli
             interop:
-              - 'laurus/**'
-              - 'laurus-cli/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
+              - *cli
               - '.github/interop/**'
               - '.github/workflows/index-interop.yml'
-              - '.github/workflows/regression.yml'
             # snippets: binding README / docs / example calls checked against
             # the current positional signatures (Issue #1188)
             snippets:
@@ -193,6 +177,26 @@ jobs:
 
       - name: Check binding snippet argument positions
         run: python3 scripts/check-binding-snippets.py
+
+  # ============================================================
+  # CI filter guard (Issue #1714): each filter of Detect Changes must
+  # match the crates its job builds, those crates' workspace dependencies,
+  # and what every job reads. Runs on every event, and Test All needs it,
+  # so a filter left behind by a new dependency fails the pull request
+  # instead of skipping a job.
+  # ============================================================
+  ci-filters:
+    name: CI Filters
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v7
+
+      - name: Check the change filters against the crate dependencies
+        run: python3 scripts/check-ci-filters.py
+
+      - name: Test the filter check
+        run: python3 scripts/test_check_ci_filters.py
 
   # ============================================================
   # Format code with rustfmt
@@ -799,6 +803,7 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       [
+        ci-filters,
         format,
         clippy,
         test-laurus,
