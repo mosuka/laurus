@@ -1,9 +1,12 @@
 //! Server configuration types deserialized from a TOML file.
 //!
-//! The top-level [`Config`] struct contains sections for the gRPC/HTTP server,
-//! index storage, and logging. All sections have sensible defaults so that
-//! a minimal (or even empty) TOML file produces a working configuration.
+//! The top-level [`Config`] struct contains sections for the gRPC/HTTP server
+//! and for index storage, with its WAL and auto-commit settings. All sections
+//! have sensible defaults so that a minimal (or even empty) TOML file produces
+//! a working configuration. Every section accepts only the keys its type
+//! declares: an unknown key is an error, not dropped (Issue #1708).
 
+use anyhow::Context;
 use laurus::{CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, WalSyncPolicy};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
@@ -16,6 +19,7 @@ pub const DEFAULT_MAX_RESULT_WINDOW: NonZeroUsize = NonZeroUsize::new(10_000).un
 
 /// Top-level configuration loaded from a TOML file.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Network settings for the gRPC server and the optional HTTP gateway.
     #[serde(default)]
@@ -27,6 +31,7 @@ pub struct Config {
 
 /// Server network configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Listen address for the gRPC server.
     #[serde(default = "default_host")]
@@ -57,6 +62,7 @@ impl Default for ServerConfig {
 
 /// Index storage settings.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexConfig {
     /// Filesystem path where the index data (schema and store) is persisted.
     /// Defaults to `"./laurus_data"`.
@@ -104,6 +110,7 @@ pub enum SyncPolicyKind {
 /// unset thresholds fall back to [`laurus::DEFAULT_GROUP_MAX_RECORDS`] /
 /// [`laurus::DEFAULT_GROUP_MAX_BYTES`].
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WalConfig {
     /// Which durability policy to use. Defaults to `per_record`.
     #[serde(default)]
@@ -176,6 +183,7 @@ pub enum CommitPolicyKind {
 /// background auto-commit interval in milliseconds; an unset (or `0`)
 /// interval disables the timer, matching [`CommitPolicy::Interval`]`(0)`.
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CommitConfig {
     /// Which auto-commit policy to use. Defaults to `manual`.
     #[serde(default)]
@@ -231,6 +239,11 @@ fn default_data_dir() -> PathBuf {
 impl Config {
     /// Load configuration from a TOML file.
     ///
+    /// Every table accepts only the keys its type declares, so a misspelled
+    /// key (`prot` under `[server]`) or a table the config does not have
+    /// (`[log]`) is an error instead of leaving the setting at its default
+    /// (Issue #1708).
+    ///
     /// # Arguments
     ///
     /// * `path` - Filesystem path to the TOML configuration file.
@@ -242,12 +255,15 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or if the TOML content
-    /// cannot be deserialized into a [`Config`].
+    /// Returns an error naming `path` if the file cannot be read, or if its
+    /// content is not a valid configuration: invalid TOML, a value of the
+    /// wrong type, or an unknown key. The source of the error is the I/O
+    /// error, or the TOML error, which gives the line and the key.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 }
 
@@ -396,5 +412,109 @@ mod tests {
     fn max_result_window_rejects_zero() {
         let err = toml::from_str::<Config>("[server]\nmax_result_window = 0").unwrap_err();
         assert!(err.to_string().contains("max_result_window"), "{err}");
+    }
+
+    /// Issue #1708: every table rejects a key its type does not declare, and
+    /// the error names the key. Every case is checked before the assert, so
+    /// a failure lists each table that accepted its key.
+    #[test]
+    fn every_table_rejects_an_unknown_key() {
+        let cases = [
+            // A `[server]` key written without its table.
+            ("top level", "port = 50999", "port"),
+            // The logging table, removed before the first release.
+            ("top level", "[log]\nlevel = \"debug\"", "log"),
+            ("[server]", "[server]\nprot = 50999", "prot"),
+            ("[index]", "[index]\ndata_dirr = \"./data\"", "data_dirr"),
+            (
+                "[index.wal]",
+                "[index.wal]\nsync_polcy = \"group\"",
+                "sync_polcy",
+            ),
+            (
+                "[index.commit]",
+                "[index.commit]\npolicy = \"every_docs\"\nevery_doc = 1000",
+                "every_doc",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (table, toml, key) in cases {
+            match toml::from_str::<Config>(toml) {
+                Ok(_) => wrong.push(format!("{table}: accepted `{key}`")),
+                Err(err) => {
+                    let message = err.to_string();
+                    if !message.contains(&format!("unknown field `{key}`")) {
+                        wrong.push(format!(
+                            "{table}: the error does not name `{key}`: {message}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Issue #1708: every TOML example in the configuration docs (en/ja) is a
+    /// valid config, so the docs never show a key the server rejects.
+    #[test]
+    fn documented_examples_parse() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the workspace root is one level up from laurus-server/");
+        let mut wrong = Vec::new();
+        for doc in [
+            "docs/src/laurus-server/configuration.md",
+            "docs/ja/src/laurus-server/configuration.md",
+        ] {
+            let text = std::fs::read_to_string(root.join(doc))
+                .unwrap_or_else(|e| panic!("cannot read {doc}: {e}"));
+            let mut lines = text.lines().enumerate();
+            let mut examples = 0;
+            while let Some((start, line)) = lines.next() {
+                if line != "```toml" {
+                    continue;
+                }
+                let example: Vec<&str> = lines
+                    .by_ref()
+                    .map(|(_, line)| line)
+                    .take_while(|line| *line != "```")
+                    .collect();
+                examples += 1;
+                if let Err(err) = toml::from_str::<Config>(&example.join("\n")) {
+                    wrong.push(format!("{doc}:{}: {err}", start + 1));
+                }
+            }
+            assert!(examples > 0, "no TOML example found in {doc}");
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Issue #1708: the error of `from_file` names the file, and its source
+    /// names the key, so `laurus serve --config` says what to fix and where.
+    #[test]
+    fn from_file_names_the_file_and_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[server]\nprot = 50999\n").unwrap();
+
+        let message = format!("{:#}", Config::from_file(&path).unwrap_err());
+        assert!(
+            message.contains(&format!("Failed to parse config file: {}", path.display())),
+            "{message}"
+        );
+        assert!(message.contains("unknown field `prot`"), "{message}");
+    }
+
+    /// Issue #1708: a config file that cannot be read is named in the error.
+    #[test]
+    fn from_file_names_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.toml");
+
+        let message = format!("{:#}", Config::from_file(&path).unwrap_err());
+        assert!(
+            message.contains(&format!("Failed to read config file: {}", path.display())),
+            "{message}"
+        );
     }
 }

@@ -56,6 +56,22 @@ interval_ms = 1000             # "interval" only; commit at least every N ms (0/
 
 Log verbosity is controlled by the `RUST_LOG` environment variable (default: `info`), not through the config file.
 
+### Unknown Keys
+
+Every table accepts only the keys the [Field Reference](#field-reference) lists for it, and the file has no other tables. Any other key, such as a misspelled `prot` under `[server]` or a `port` written outside `[server]`, is not left at its default: the server does not start, and the error names the file and the key (Issue #1708). For example, with `prot = 50051` under `[server]`:
+
+```text
+$ laurus serve --config config.toml
+Error: Failed to parse config file: config.toml
+
+Caused by:
+    TOML parse error at line 3, column 1
+      |
+    3 | prot = 50051
+      | ^^^^
+    unknown field `prot`, expected one of `host`, `port`, `http_port`, `max_result_window`
+```
+
 ### Field Reference
 
 #### `[server]` Section
