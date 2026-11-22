@@ -370,7 +370,8 @@ pub struct McpCommand {
 /// Use the `RUST_LOG` environment variable to control log verbosity.
 #[derive(Parser)]
 pub struct ServeCommand {
-    /// Path to the configuration file (TOML).
+    /// Path to the configuration file (TOML). It does not set the index
+    /// directory, which is the global `--index-dir` (Issue #1718).
     #[arg(short = 'c', long = "config", env = "LAURUS_CONFIG")]
     pub config: Option<PathBuf>,
 

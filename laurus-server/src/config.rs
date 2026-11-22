@@ -4,7 +4,10 @@
 //! and for index storage, with its WAL and auto-commit settings. All sections
 //! have sensible defaults so that a minimal (or even empty) TOML file produces
 //! a working configuration. Every section accepts only the keys its type
-//! declares: an unknown key is an error, not dropped (Issue #1708).
+//! declares: an unknown key is an error, not dropped (Issue #1708). The file
+//! does not set the index directory: `laurus serve` sets
+//! [`IndexConfig::data_dir`] from its `--index-dir` option, and a `data_dir`
+//! key in the file is an error (Issue #1718).
 
 use anyhow::Context;
 use laurus::{CommitPolicy, DEFAULT_GROUP_MAX_BYTES, DEFAULT_GROUP_MAX_RECORDS, WalSyncPolicy};
@@ -24,7 +27,8 @@ pub struct Config {
     /// Network settings for the gRPC server and the optional HTTP gateway.
     #[serde(default)]
     pub server: ServerConfig,
-    /// Index storage settings (e.g. data directory path).
+    /// Index settings: WAL durability and auto-commit, and the data directory,
+    /// which the file does not set.
     #[serde(default)]
     pub index: IndexConfig,
 }
@@ -66,7 +70,14 @@ impl Default for ServerConfig {
 pub struct IndexConfig {
     /// Filesystem path where the index data (schema and store) is persisted.
     /// Defaults to `"./laurus_data"`.
-    #[serde(default = "default_data_dir")]
+    ///
+    /// The config file does not set it: `laurus serve` fills it from its
+    /// `--index-dir` option (`LAURUS_INDEX_DIR`, default `./laurus_index`), as
+    /// every `laurus` command names its index, and a library caller sets it
+    /// before [`crate::server::run`]. A `data_dir` key in the file is an
+    /// error that says so (Issue #1718); `laurus serve` used to accept the key
+    /// and ignore it.
+    #[serde(default = "default_data_dir", deserialize_with = "reject_data_dir")]
     pub data_dir: PathBuf,
     /// Write-ahead log durability settings. Defaults to per-record fsync.
     #[serde(default)]
@@ -236,13 +247,27 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./laurus_data")
 }
 
+/// Reads [`IndexConfig::data_dir`] from the config file, where the key is
+/// an error: the file does not set the index directory, and the message says
+/// what does (Issue #1718). Without the key, the field's default applies.
+fn reject_data_dir<'de, D>(_deserializer: D) -> Result<PathBuf, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Err(serde::de::Error::custom(
+        "the index directory is not read from the config file: `laurus serve` takes it from \
+         `--index-dir` or `LAURUS_INDEX_DIR` (default `./laurus_index`)",
+    ))
+}
+
 impl Config {
     /// Load configuration from a TOML file.
     ///
     /// Every table accepts only the keys its type declares, so a misspelled
     /// key (`prot` under `[server]`) or a table the config does not have
     /// (`[log]`) is an error instead of leaving the setting at its default
-    /// (Issue #1708).
+    /// (Issue #1708). A `data_dir` key under `[index]` is an error too: the
+    /// file does not set the index directory (Issue #1718).
     ///
     /// # Arguments
     ///
@@ -516,5 +541,33 @@ mod tests {
             message.contains(&format!("Failed to read config file: {}", path.display())),
             "{message}"
         );
+    }
+
+    /// Issue #1718: the config file does not set the index directory, so a
+    /// `data_dir` key is an error that names the key and says what to use,
+    /// instead of being accepted and ignored. Without the key, the field keeps
+    /// its default.
+    #[test]
+    fn data_dir_in_the_file_is_an_error_that_points_to_index_dir() {
+        let toml = "[index]\ndata_dir = \"/var/lib/laurus/data\"\n";
+        let message = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        for part in ["data_dir", "--index-dir", "LAURUS_INDEX_DIR"] {
+            assert!(message.contains(part), "missing {part:?}: {message}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        let message = format!("{:#}", Config::from_file(&path).unwrap_err());
+        for part in [
+            format!("Failed to parse config file: {}", path.display()),
+            "data_dir".to_string(),
+            "--index-dir".to_string(),
+        ] {
+            assert!(message.contains(&part), "missing {part:?}: {message}");
+        }
+
+        let config: Config = toml::from_str("[index.wal]\nsync_policy = \"group\"").unwrap();
+        assert_eq!(config.index.data_dir, PathBuf::from("./laurus_data"));
     }
 }
