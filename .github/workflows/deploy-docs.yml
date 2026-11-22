@@ -10,6 +10,9 @@ on:
       - 'laurus-wasm/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # The cargo config holds the WASM rustflags the demo build uses
+      # (Issue #1714).
+      - '.cargo/**'
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
 
