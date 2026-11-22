@@ -794,16 +794,21 @@ jobs:
   # ============================================================
   test-all:
     name: Test All
-    # DAG jobs above depend only on `changes`, so a lint failure no longer
-    # skips them transitively -- format/clippy must be listed explicitly to
-    # keep gating on lint. `!cancelled()` (rather than `!failure() &&
+    # Test All needs every other job of this workflow: Detect Changes, CI
+    # Filters, Binding Snippets, Format, Clippy, every test job and Index
+    # Interop (Issue #1716). A job it does not need can fail without failing
+    # it, and a failed Detect Changes skips every job that needs it, so a new
+    # job goes into `needs` too. A job skipped because its filter did not
+    # match counts as passing. `!cancelled()` (rather than `!failure() &&
     # !cancelled()`) lets this step run even when a need was cancelled, so
     # the explicit result check below can tell "cancelled" apart from
     # "succeeded" instead of both silently passing.
     if: ${{ !cancelled() }}
     needs:
       [
+        changes,
         ci-filters,
+        snippets,
         format,
         clippy,
         test-laurus,
