@@ -57,8 +57,9 @@ pub fn to_proto(schema: &Schema) -> v1::Schema {
 /// [`field_option_from_proto`]; the message names the field), if an
 /// analyzer definition is invalid (the message names the analyzer and the
 /// component, such as `Analyzer 'a': token_filters[0]: ...`, Issue #1478),
-/// if an embedder definition is invalid, or if `dynamic_field_policy` is a
-/// value this server does not know (Issue #1473).
+/// if an embedder definition is invalid (the message names the embedder,
+/// such as ``Embedder 'e': missing field `model` ``, Issue #1702), or if
+/// `dynamic_field_policy` is a value this server does not know (Issue #1473).
 pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
     let mut fields = BTreeMap::new();
     for (name, fo) in &proto.fields {
@@ -73,7 +74,9 @@ pub fn from_proto(proto: &v1::Schema) -> Result<Schema, String> {
     }
     let mut embedders = BTreeMap::new();
     for (name, ed) in &proto.embedders {
-        embedders.insert(name.clone(), embedder_definition_from_proto(ed)?);
+        let definition =
+            embedder_definition_from_proto(ed).map_err(|e| format!("Embedder '{name}': {e}"))?;
+        embedders.insert(name.clone(), definition);
     }
     Ok(Schema {
         analyzers,
@@ -691,43 +694,25 @@ const LEGACY_COMPONENT_ERROR: &str = "the component sets `type` or `params`, the
 
 /// Convert a core analyzer component ([`laurus::TokenizerConfig`],
 /// [`laurus::CharFilterConfig`] or [`laurus::TokenFilterConfig`]) to its proto
-/// form, whose `config` holds the component's serde form: the shape
-/// `schema.toml` stores and the HTTP API takes (Issue #1478).
-///
-/// The value goes through JSON text, so that an `f32` such as a boost of 0.1
-/// is written as 0.1; `serde_json::to_value` would widen it to
-/// 0.10000000149011612 first. An unset optional parameter, which serializes as
-/// `null`, is left out, while an empty list or table (`words: []`,
-/// `mapping: {}`) is kept, since it is not the same as an omitted key. The
-/// fields of the form before Issue #1478 stay empty, so that a server from
-/// before then rejects the component as an unknown type instead of building it
-/// with its defaults.
+/// form, whose `config` holds the component's serde form (see
+/// [`serde_to_struct`], Issue #1478). The fields of the form before Issue
+/// #1478 stay empty, so that a server from before then rejects the component
+/// as an unknown type instead of building it with its defaults.
 fn component_to_proto<T: Serialize>(component: &T) -> v1::ComponentConfig {
-    let text = serde_json::to_string(component).expect("an analyzer component serializes to JSON");
-    let serde_json::Value::Object(mut obj) =
-        serde_json::from_str(&text).expect("serialized JSON parses")
-    else {
-        unreachable!("an analyzer component serializes to a JSON object");
-    };
-    obj.retain(|_, value| !value.is_null());
     v1::ComponentConfig {
-        config: Some(proto_struct::json_object_to_proto_struct(&obj)),
+        config: Some(serde_to_struct(component)),
         ..Default::default()
     }
 }
 
-/// Convert a proto analyzer component to a core one with serde, so that it is
-/// read by the rules `schema.toml` is read by: the same types, required keys
-/// and defaults (Issue #1478). A top-level `null` is the same as omitting the
-/// key, as everywhere in the HTTP API.
+/// Convert a proto analyzer component to a core one with serde (see
+/// [`struct_to_serde`], Issue #1478).
 ///
 /// # Errors
 ///
 /// Returns an error for a component that sets a field of the form before
-/// Issue #1478 (`type`, `params`) or has no `config`; that holds a number that
-/// is not finite or a value with no kind (see
-/// [`proto_struct::proto_struct_to_json`]); or that does not deserialize: an
-/// unknown `type`, a missing required key, or a value of the wrong type.
+/// Issue #1478 (`type`, `params`) or has no `config`, or whose `config` does
+/// not convert (see [`struct_to_serde`]).
 fn component_from_proto<T: DeserializeOwned>(proto: &v1::ComponentConfig) -> Result<T, String> {
     #[allow(deprecated)]
     let legacy = !proto.r#type.is_empty() || !proto.params.is_empty();
@@ -738,112 +723,90 @@ fn component_from_proto<T: DeserializeOwned>(proto: &v1::ComponentConfig) -> Res
         .config
         .as_ref()
         .ok_or("the component has no `config`")?;
-    let mut obj = proto_struct::proto_struct_to_json(config)?;
-    obj.retain(|_, value| !value.is_null());
-    serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| e.to_string())
+    struct_to_serde(config)
 }
 
 // ---- Embedder definition conversion ----
 
+/// The error for an embedder in the form before Issue #1702, from a server or
+/// a client on the other side of that change.
+const LEGACY_EMBEDDER_ERROR: &str = "the embedder sets `type` or `params`, the form \
+     before Issue #1702, which is no longer read; send it as `config` (a server and a \
+     client from before and after that change do not work together)";
+
+/// Convert a core embedder definition to its proto form, whose `config` holds
+/// the definition's serde form (see [`serde_to_struct`], Issue #1702). The
+/// fields of the form before Issue #1702 stay empty, so that a server from
+/// before then rejects the embedder as an unknown type instead of reading
+/// something else.
 fn embedder_definition_to_proto(def: &EmbedderDefinition) -> v1::EmbedderConfig {
-    let (type_name, params) = match def {
-        EmbedderDefinition::Precomputed => ("precomputed", HashMap::new()),
-        EmbedderDefinition::CandleBert { model } => {
-            let mut p = HashMap::new();
-            p.insert("model".into(), model.clone());
-            ("candle_bert", p)
-        }
-        EmbedderDefinition::CandleClip { model } => {
-            let mut p = HashMap::new();
-            p.insert("model".into(), model.clone());
-            ("candle_clip", p)
-        }
-        EmbedderDefinition::Openai { model } => {
-            let mut p = HashMap::new();
-            p.insert("model".into(), model.clone());
-            ("openai", p)
-        }
-        EmbedderDefinition::CandleColbert {
-            model,
-            revision,
-            query_maxlen,
-            doc_maxlen,
-        } => {
-            let mut p = HashMap::new();
-            p.insert("model".into(), model.clone());
-            if let Some(revision) = revision {
-                p.insert("revision".into(), revision.clone());
-            }
-            if let Some(n) = query_maxlen {
-                p.insert("query_maxlen".into(), n.to_string());
-            }
-            if let Some(n) = doc_maxlen {
-                p.insert("doc_maxlen".into(), n.to_string());
-            }
-            ("candle_colbert", p)
-        }
-    };
     v1::EmbedderConfig {
-        r#type: type_name.into(),
-        params,
+        config: Some(serde_to_struct(def)),
+        ..Default::default()
     }
 }
 
-/// Parse the optional count parameter `key` of a `kind` embedder.
-fn optional_count(
-    proto: &v1::EmbedderConfig,
-    kind: &str,
-    key: &str,
-) -> Result<Option<usize>, String> {
-    proto
-        .params
-        .get(key)
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| format!("{kind}: {key} must be a non-negative integer, got '{value}'"))
-        })
-        .transpose()
-}
-
+/// Convert a proto embedder definition to a core one with serde (see
+/// [`struct_to_serde`], Issue #1702), so that a parameter is kept with its
+/// type and a key the type does not take is rejected, as in `schema.toml`.
+///
+/// # Errors
+///
+/// Returns an error for an embedder that sets a field of the form before
+/// Issue #1702 (`type`, `params`) or has no `config`, or whose `config` does
+/// not convert (see [`struct_to_serde`]).
 fn embedder_definition_from_proto(
     proto: &v1::EmbedderConfig,
 ) -> Result<EmbedderDefinition, String> {
-    match proto.r#type.as_str() {
-        "precomputed" => Ok(EmbedderDefinition::Precomputed),
-        "candle_bert" => Ok(EmbedderDefinition::CandleBert {
-            model: proto
-                .params
-                .get("model")
-                .cloned()
-                .ok_or("candle_bert: missing model")?,
-        }),
-        "candle_clip" => Ok(EmbedderDefinition::CandleClip {
-            model: proto
-                .params
-                .get("model")
-                .cloned()
-                .ok_or("candle_clip: missing model")?,
-        }),
-        "openai" => Ok(EmbedderDefinition::Openai {
-            model: proto
-                .params
-                .get("model")
-                .cloned()
-                .ok_or("openai: missing model")?,
-        }),
-        "candle_colbert" => Ok(EmbedderDefinition::CandleColbert {
-            model: proto
-                .params
-                .get("model")
-                .cloned()
-                .ok_or("candle_colbert: missing model")?,
-            revision: proto.params.get("revision").cloned(),
-            query_maxlen: optional_count(proto, "candle_colbert", "query_maxlen")?,
-            doc_maxlen: optional_count(proto, "candle_colbert", "doc_maxlen")?,
-        }),
-        other => Err(format!("Unknown embedder type: {other}")),
+    #[allow(deprecated)]
+    let legacy = !proto.r#type.is_empty() || !proto.params.is_empty();
+    if legacy {
+        return Err(LEGACY_EMBEDDER_ERROR.to_string());
     }
+    let config = proto
+        .config
+        .as_ref()
+        .ok_or("the embedder has no `config`")?;
+    struct_to_serde(config)
+}
+
+// ---- Serde forms in a `Struct` ----
+
+/// Convert a value of a core schema type (an analyzer component or an
+/// embedder definition) to a `Struct` holding its serde form: the shape
+/// `schema.toml` stores and the HTTP API takes (Issues #1478, #1702).
+///
+/// The value goes through JSON text, so that an `f32` such as a boost of 0.1
+/// is written as 0.1; `serde_json::to_value` would widen it to
+/// 0.10000000149011612 first. An unset optional parameter, which serializes as
+/// `null`, is left out, while an empty list or table (`words: []`,
+/// `mapping: {}`) is kept, since it is not the same as an omitted key.
+fn serde_to_struct<T: Serialize>(value: &T) -> prost_types::Struct {
+    let text = serde_json::to_string(value).expect("a schema type serializes to JSON");
+    let serde_json::Value::Object(mut obj) =
+        serde_json::from_str(&text).expect("serialized JSON parses")
+    else {
+        unreachable!("a schema type serializes to a JSON object");
+    };
+    obj.retain(|_, value| !value.is_null());
+    proto_struct::json_object_to_proto_struct(&obj)
+}
+
+/// Convert a `Struct` a client sent to a core schema type with serde, so that
+/// it is read by the rules `schema.toml` is read by: the same types, required
+/// keys and defaults (Issues #1478, #1702). A top-level `null` is the same as
+/// omitting the key, as everywhere in the HTTP API.
+///
+/// # Errors
+///
+/// Returns an error for a `Struct` that holds a number that is not finite or
+/// a value with no kind (see [`proto_struct::proto_struct_to_json`]), or that
+/// does not deserialize: an unknown `type`, a missing required key, a key the
+/// type does not take, or a value of the wrong type.
+fn struct_to_serde<T: DeserializeOwned>(config: &prost_types::Struct) -> Result<T, String> {
+    let mut obj = proto_struct::proto_struct_to_json(config)?;
+    obj.retain(|_, value| !value.is_null());
+    serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1729,65 +1692,281 @@ mod tests {
         );
     }
 
-    /// #1349: a `candle_colbert` embedder definition and the multi-vector
-    /// field naming it round-trip, with and without the optional params.
-    #[test]
-    fn candle_colbert_embedder_round_trips_through_proto() {
-        let full = EmbedderDefinition::CandleColbert {
-            model: "colbert-ir/colbertv2.0".to_string(),
-            revision: Some("c1e84128".to_string()),
-            query_maxlen: Some(32),
-            doc_maxlen: Some(180),
-        };
-        let bare = EmbedderDefinition::CandleColbert {
-            model: "answerdotai/answerai-colbert-small-v1".to_string(),
-            revision: None,
-            query_maxlen: None,
-            doc_maxlen: None,
-        };
-        let schema = Schema::builder()
-            .add_embedder("colbert", full)
-            .add_embedder("small", bare)
-            .add_multi_vector_field("tokens", MultiVectorOption::new(128).embedder("colbert"))
-            .build();
-        let proto = to_proto(&schema);
-        assert_eq!(proto.embedders["colbert"].params["query_maxlen"], "32");
-        assert!(!proto.embedders["small"].params.contains_key("revision"));
+    /// Issue #1702: embedders travel in `EmbedderConfig.config` as their
+    /// serde form and are read back with serde, as analyzer components are
+    /// (Issue #1478).
+    mod embedder_definitions {
+        use prost::Message;
+        use serde_json::{Value, json};
 
-        let back = from_proto(&proto).expect("from_proto must succeed");
-        assert!(matches!(
-            &back.embedders["colbert"],
+        use super::super::*;
+
+        /// An embedder whose `config` is `json`, which must be an object.
+        fn embedder(json: Value) -> v1::EmbedderConfig {
+            v1::EmbedderConfig {
+                config: Some(proto_struct::json_object_to_proto_struct(
+                    json.as_object().expect("an embedder is an object"),
+                )),
+                ..Default::default()
+            }
+        }
+
+        /// A schema whose only embedder is `proto`, named `e`.
+        fn schema_with(proto: v1::EmbedderConfig) -> v1::Schema {
+            v1::Schema {
+                embedders: HashMap::from([("e".to_string(), proto)]),
+                ..Default::default()
+            }
+        }
+
+        /// A `candle_colbert` embedder with all of its optional parameters.
+        fn full_colbert() -> EmbedderDefinition {
             EmbedderDefinition::CandleColbert {
-                revision: Some(r),
+                model: "colbert-ir/colbertv2.0".into(),
+                revision: Some("c1e84128".into()),
                 query_maxlen: Some(32),
                 doc_maxlen: Some(180),
-                ..
-            } if r == "c1e84128"
-        ));
-        assert!(matches!(
-            &back.embedders["small"],
-            EmbedderDefinition::CandleColbert {
-                revision: None,
-                query_maxlen: None,
-                doc_maxlen: None,
-                ..
             }
-        ));
-        assert_eq!(back.fields["tokens"].embedder_name(), Some("colbert"));
-    }
+        }
 
-    /// #1349: a non-numeric `candle_colbert` length is rejected.
-    #[test]
-    fn candle_colbert_rejects_a_non_numeric_length() {
-        let proto = v1::EmbedderConfig {
-            r#type: "candle_colbert".to_string(),
-            params: HashMap::from([
-                ("model".to_string(), "colbert-ir/colbertv2.0".to_string()),
-                ("doc_maxlen".to_string(), "long".to_string()),
-            ]),
-        };
-        let err = embedder_definition_from_proto(&proto).unwrap_err();
-        assert!(err.contains("doc_maxlen"), "{err}");
+        /// Every embedder type, `candle_colbert` with all of its optional
+        /// parameters and with none.
+        fn every_embedder() -> Vec<EmbedderDefinition> {
+            let all = vec![
+                EmbedderDefinition::Precomputed,
+                EmbedderDefinition::CandleBert {
+                    model: "sentence-transformers/all-MiniLM-L6-v2".into(),
+                },
+                EmbedderDefinition::CandleClip {
+                    model: "openai/clip-vit-base-patch32".into(),
+                },
+                EmbedderDefinition::Openai {
+                    model: "text-embedding-3-small".into(),
+                },
+                full_colbert(),
+                EmbedderDefinition::CandleColbert {
+                    model: "answerdotai/answerai-colbert-small-v1".into(),
+                    revision: None,
+                    query_maxlen: None,
+                    doc_maxlen: None,
+                },
+            ];
+            // No wildcard: a new embedder type does not compile here until
+            // it is added above.
+            for definition in &all {
+                match definition {
+                    EmbedderDefinition::Precomputed
+                    | EmbedderDefinition::CandleBert { .. }
+                    | EmbedderDefinition::CandleClip { .. }
+                    | EmbedderDefinition::Openai { .. }
+                    | EmbedderDefinition::CandleColbert { .. } => {}
+                }
+            }
+            all
+        }
+
+        /// Every type goes to proto with its serde form in `config` and
+        /// nothing in the fields of the form before Issue #1702, through the
+        /// protobuf encoding, and back unchanged. The core type does not
+        /// implement `PartialEq`, so it is compared as serde JSON.
+        #[test]
+        fn every_embedder_type_round_trips() {
+            for definition in every_embedder() {
+                let serde_form = serde_json::to_value(&definition).unwrap();
+                let proto = embedder_definition_to_proto(&definition);
+                let config = proto_struct::proto_struct_to_json(
+                    proto.config.as_ref().expect("config is set"),
+                )
+                .unwrap();
+                assert_eq!(Value::Object(config), serde_form);
+                #[allow(deprecated)]
+                let legacy_is_empty = proto.r#type.is_empty() && proto.params.is_empty();
+                assert!(legacy_is_empty, "{definition:?}");
+
+                let decoded = v1::EmbedderConfig::decode(proto.encode_to_vec().as_slice())
+                    .expect("the message decodes");
+                let back = embedder_definition_from_proto(&decoded)
+                    .unwrap_or_else(|e| panic!("{definition:?} does not come back: {e}"));
+                assert_eq!(serde_json::to_value(&back).unwrap(), serde_form);
+            }
+
+            // And through the whole schema, beside the field that names it.
+            let schema = Schema::builder()
+                .add_embedder("colbert", full_colbert())
+                .add_multi_vector_field("tokens", MultiVectorOption::new(128).embedder("colbert"))
+                .build();
+            let back = from_proto(&to_proto(&schema)).expect("from_proto must succeed");
+            assert_eq!(
+                serde_json::to_value(&back.embedders["colbert"]).unwrap(),
+                serde_json::to_value(full_colbert()).unwrap()
+            );
+            assert_eq!(back.fields["tokens"].embedder_name(), Some("colbert"));
+        }
+
+        #[test]
+        fn the_form_before_issue_1702_is_rejected() {
+            let precomputed = embedder(json!({"type": "precomputed"}));
+            #[allow(deprecated)]
+            let cases = [
+                // `type` set as well as `config`.
+                v1::EmbedderConfig {
+                    r#type: "precomputed".into(),
+                    ..precomputed.clone()
+                },
+                // `params` set as well as `config`.
+                v1::EmbedderConfig {
+                    params: HashMap::from([("model".to_string(), "m".to_string())]),
+                    ..embedder(json!({"type": "candle_bert", "model": "m"}))
+                },
+                // The old form of an embedder with no parameters.
+                v1::EmbedderConfig {
+                    r#type: "precomputed".into(),
+                    ..Default::default()
+                },
+                // The old form with parameters.
+                v1::EmbedderConfig {
+                    r#type: "candle_bert".into(),
+                    params: HashMap::from([("model".to_string(), "m".to_string())]),
+                    config: None,
+                },
+            ];
+            for proto in &cases {
+                let err = embedder_definition_from_proto(proto).unwrap_err();
+                assert_eq!(err, LEGACY_EMBEDDER_ERROR, "{proto:?}");
+            }
+
+            let err = embedder_definition_from_proto(&v1::EmbedderConfig::default()).unwrap_err();
+            assert_eq!(err, "the embedder has no `config`");
+            assert!(embedder_definition_from_proto(&precomputed).is_ok());
+        }
+
+        /// The embedders of the reproduction in Issue #1702, which the server
+        /// used to store with another type or without a key, and others that
+        /// `schema.toml` rejects too.
+        #[test]
+        fn keys_and_types_are_the_ones_schema_toml_takes() {
+            let cases: [(Value, &str); 8] = [
+                (
+                    json!({"type": "candle_colbert", "model": "m", "query_maxlen": "32"}),
+                    "invalid type: string \"32\", expected usize",
+                ),
+                (
+                    json!({"type": "candle_colbert", "model": "m", "revision": 123}),
+                    "invalid type: integer `123`, expected a string",
+                ),
+                (
+                    json!({"type": "candle_bert", "model": true}),
+                    "invalid type: boolean `true`, expected a string",
+                ),
+                (
+                    json!({"type": "candle_colbert", "model": "m", "doc_max_len": 300}),
+                    "unknown field `doc_max_len`",
+                ),
+                (
+                    json!({"type": "precomputed", "model": "x"}),
+                    "unknown field `model`",
+                ),
+                (json!({"type": "candle_bert"}), "missing field `model`"),
+                (json!({"model": "m"}), "missing field `type`"),
+                (json!({"type": "nope"}), "unknown variant `nope`"),
+            ];
+            for (json, expected) in cases {
+                let err = embedder_definition_from_proto(&embedder(json.clone())).unwrap_err();
+                assert!(err.contains(expected), "{json}: {err}");
+                // schema.toml rejects the same embedder.
+                let toml_value: toml::Value = serde_json::from_value(json.clone()).unwrap();
+                let toml_text = toml::to_string(&toml_value).unwrap();
+                assert!(
+                    toml::from_str::<EmbedderDefinition>(&toml_text).is_err(),
+                    "schema.toml takes {json}"
+                );
+            }
+        }
+
+        #[test]
+        fn whole_doubles_fill_lengths_and_others_are_rejected() {
+            let colbert = embedder_definition_from_proto(&embedder(json!({
+                "type": "candle_colbert",
+                "model": "m",
+                "query_maxlen": 32.0,
+                "doc_maxlen": 180.0
+            })))
+            .unwrap();
+            assert!(matches!(
+                colbert,
+                EmbedderDefinition::CandleColbert {
+                    query_maxlen: Some(32),
+                    doc_maxlen: Some(180),
+                    ..
+                }
+            ));
+            for n in [32.5, -1.0, 1e20] {
+                let result = embedder_definition_from_proto(&embedder(
+                    json!({"type": "candle_colbert", "model": "m", "query_maxlen": n}),
+                ));
+                assert!(
+                    result.is_err(),
+                    "query_maxlen {n} must be rejected: {result:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_top_level_null_is_the_same_as_omitting_the_key() {
+            let colbert = embedder_definition_from_proto(&embedder(json!({
+                "type": "candle_colbert",
+                "model": "m",
+                "revision": null,
+                "query_maxlen": null
+            })))
+            .unwrap();
+            assert!(matches!(
+                colbert,
+                EmbedderDefinition::CandleColbert {
+                    revision: None,
+                    query_maxlen: None,
+                    doc_maxlen: None,
+                    ..
+                }
+            ));
+            // So a key the type does not take is not reported when it is
+            // `null`: it sets nothing.
+            let precomputed = embedder_definition_from_proto(&embedder(
+                json!({"type": "precomputed", "model": null}),
+            ));
+            assert!(
+                matches!(precomputed, Ok(EmbedderDefinition::Precomputed)),
+                "{precomputed:?}"
+            );
+        }
+
+        #[test]
+        fn errors_name_the_embedder() {
+            #[allow(deprecated)]
+            let legacy = v1::EmbedderConfig {
+                r#type: "precomputed".into(),
+                ..Default::default()
+            };
+            let cases = [
+                (
+                    embedder(json!({"type": "candle_bert"})),
+                    "Embedder 'e': missing field `model`".to_string(),
+                ),
+                (
+                    embedder(json!({"type": "precomputed", "model": "x"})),
+                    "Embedder 'e': unknown field `model`".to_string(),
+                ),
+                (legacy, format!("Embedder 'e': {LEGACY_EMBEDDER_ERROR}")),
+                (
+                    v1::EmbedderConfig::default(),
+                    "Embedder 'e': the embedder has no `config`".to_string(),
+                ),
+            ];
+            for (proto, prefix) in cases {
+                let err = from_proto(&schema_with(proto)).unwrap_err();
+                assert!(err.starts_with(&prefix), "{err}");
+            }
+        }
     }
 
     /// #1175: `TextOption.multi_valued` (proto field 6) and

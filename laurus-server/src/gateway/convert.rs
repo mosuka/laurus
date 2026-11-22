@@ -1857,10 +1857,11 @@ fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinit
     })
 }
 
-/// The deepest a component may nest objects and arrays, itself included.
-/// The deepest a component needs is 2 (a `mapping` table, or the `words`
-/// list); the limit keeps a request away from prost's recursion limit,
-/// which makes the server answer `INTERNAL` (500) instead of 400.
+/// The deepest an analyzer component or an embedder definition may nest
+/// objects and arrays, itself included. The deepest a component needs is 2
+/// (a `mapping` table, or the `words` list), and an embedder needs 1; the
+/// limit keeps a request away from prost's recursion limit, which makes the
+/// server answer `INTERNAL` (500) instead of 400.
 const MAX_COMPONENT_DEPTH: usize = 8;
 
 /// How deeply `json` nests objects and arrays: 0 for a scalar, 1 for an
@@ -1883,18 +1884,40 @@ fn json_depth(json: &Value) -> usize {
 /// Returns an error when `json` is not an object or nests deeper than
 /// [`MAX_COMPONENT_DEPTH`].
 fn json_to_proto_component(json: &Value) -> Result<v1::ComponentConfig, String> {
-    let obj = json
-        .as_object()
-        .ok_or_else(|| "component config must be an object".to_string())?;
-    if json_depth(json) > MAX_COMPONENT_DEPTH {
-        return Err(format!(
-            "component config must not nest more than {MAX_COMPONENT_DEPTH} levels deep"
-        ));
-    }
     Ok(v1::ComponentConfig {
-        config: Some(proto_struct::json_object_to_proto_struct(obj)),
+        config: Some(json_to_proto_serde_form(json, "component config")?),
         ..Default::default()
     })
+}
+
+/// Converts a JSON object the server reads with a core type's serde (an
+/// analyzer component or an embedder definition) to a `Struct`, as it is.
+///
+/// # Errors
+///
+/// Returns an error, naming the object as `what`, when `json` is not an
+/// object or nests deeper than [`MAX_COMPONENT_DEPTH`].
+fn json_to_proto_serde_form(json: &Value, what: &str) -> Result<prost_types::Struct, String> {
+    let obj = json
+        .as_object()
+        .ok_or_else(|| format!("{what} must be an object"))?;
+    if json_depth(json) > MAX_COMPONENT_DEPTH {
+        return Err(format!(
+            "{what} must not nest more than {MAX_COMPONENT_DEPTH} levels deep"
+        ));
+    }
+    Ok(proto_struct::json_object_to_proto_struct(obj))
+}
+
+/// Converts a `Struct` the server wrote with a core type's serde back to
+/// JSON, in the shape a request uses, with whole numbers as integers; an
+/// unset `Struct` is an empty object.
+fn proto_serde_form_to_json(config: Option<&prost_types::Struct>) -> Value {
+    Value::Object(
+        config
+            .map(proto_struct::proto_struct_to_json_lenient)
+            .unwrap_or_default(),
+    )
 }
 
 fn proto_analyzer_definition_to_json(def: &v1::AnalyzerDefinition) -> Value {
@@ -1925,68 +1948,35 @@ fn proto_analyzer_definition_to_json(def: &v1::AnalyzerDefinition) -> Value {
 /// request uses, with whole numbers as integers (Issue #1478). The fields of
 /// the form before Issue #1478 are not read; the server never sets them.
 fn proto_component_to_json(comp: &v1::ComponentConfig) -> Value {
-    Value::Object(
-        comp.config
-            .as_ref()
-            .map(proto_struct::proto_struct_to_json_lenient)
-            .unwrap_or_default(),
-    )
+    proto_serde_form_to_json(comp.config.as_ref())
 }
 
 // ---------------------------------------------------------------------------
 // Embedder definition conversion
 // ---------------------------------------------------------------------------
 
+/// Converts a JSON embedder definition to the proto message, as it is: the
+/// object, `type` included, becomes `config` (Issue #1702). The server
+/// deserializes it into [`laurus::EmbedderDefinition`], so it checks the
+/// type, the required keys, the keys the type takes and the types of their
+/// values by the rules `schema.toml` is read by.
+///
+/// # Errors
+///
+/// Returns an error when `json` is not an object or nests deeper than
+/// [`MAX_COMPONENT_DEPTH`].
 fn json_to_proto_embedder_definition(json: &Value) -> Result<v1::EmbedderConfig, String> {
-    let obj = json
-        .as_object()
-        .ok_or_else(|| "embedder definition must be an object".to_string())?;
-
-    let type_name = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or("embedder definition missing 'type'")?
-        .to_string();
-
-    // The proto carries every parameter as a string, so scalars are written
-    // in their JSON form (`32` -> "32"); only nested values are rejected.
-    let mut params = HashMap::new();
-    for (k, v) in obj {
-        if k == "type" {
-            continue;
-        }
-        let value = match v {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            Value::Bool(b) => b.to_string(),
-            Value::Null => continue,
-            Value::Array(_) | Value::Object(_) => {
-                return Err(format!(
-                    "embedder parameter '{k}' must be a string, number or boolean"
-                ));
-            }
-        };
-        params.insert(k.clone(), value);
-    }
-
     Ok(v1::EmbedderConfig {
-        r#type: type_name,
-        params,
+        config: Some(json_to_proto_serde_form(json, "embedder definition")?),
+        ..Default::default()
     })
 }
 
-/// Embedder parameters rendered as JSON numbers rather than strings.
-const NUMERIC_EMBEDDER_PARAMS: [&str; 2] = ["query_maxlen", "doc_maxlen"];
-
+/// Converts a proto embedder definition to JSON: its `config`, in the shape a
+/// request uses, with whole numbers as integers (Issue #1702). The fields of
+/// the form before Issue #1702 are not read; the server never sets them.
 fn proto_embedder_definition_to_json(def: &v1::EmbedderConfig) -> Value {
-    let mut obj = json!({"type": def.r#type});
-    for (k, v) in &def.params {
-        obj[k] = match v.parse::<u64>() {
-            Ok(n) if NUMERIC_EMBEDDER_PARAMS.contains(&k.as_str()) => json!(n),
-            _ => json!(v),
-        };
-    }
-    obj
+    proto_serde_form_to_json(def.config.as_ref())
 }
 
 #[cfg(test)]
@@ -2762,31 +2752,6 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:?}");
-    }
-
-    /// #1349: numeric and boolean embedder parameters reach the proto as
-    /// strings instead of being dropped, the ColBERT lengths render back as
-    /// numbers, and nested values are rejected.
-    #[test]
-    fn test_embedder_definition_scalar_params_round_trip() {
-        let json = json!({
-            "type": "candle_colbert",
-            "model": "colbert-ir/colbertv2.0",
-            "revision": "c1e84128",
-            "query_maxlen": 32,
-            "doc_maxlen": 180,
-        });
-        let proto = json_to_proto_embedder_definition(&json).unwrap();
-        assert_eq!(proto.params["query_maxlen"], "32");
-        assert_eq!(proto.params["doc_maxlen"], "180");
-        assert_eq!(proto_embedder_definition_to_json(&proto), json);
-
-        let proto = json_to_proto_embedder_definition(&json!({"type": "x", "flag": true})).unwrap();
-        assert_eq!(proto.params["flag"], "true");
-
-        let err =
-            json_to_proto_embedder_definition(&json!({"type": "x", "bad": [1, 2]})).unwrap_err();
-        assert!(err.contains("'bad'"), "{err}");
     }
 
     /// #1177: nested numeric arrays in a document become a packed
@@ -4606,6 +4571,100 @@ mod tests {
         let json = proto_component_to_json(&component);
         assert_eq!(json, json!({"type": "limit", "limit": 5, "x": 2.5}));
         assert!(json["limit"].is_u64());
+    }
+
+    /// Issue #1702: an embedder goes into `config` as it is, `type`
+    /// included, and comes back in the same shape. This used to write a
+    /// number or a boolean as a string, and to turn only `query_maxlen` and
+    /// `doc_maxlen` back into numbers.
+    #[test]
+    fn embedder_definitions_pass_through_as_sent() {
+        let colbert = json!({
+            "type": "candle_colbert",
+            "model": "colbert-ir/colbertv2.0",
+            "revision": "c1e84128",
+            "query_maxlen": 32,
+            "doc_maxlen": 180
+        });
+        let proto = json_to_proto_embedder_definition(&colbert).unwrap();
+        #[allow(deprecated)]
+        let legacy_is_empty = proto.r#type.is_empty() && proto.params.is_empty();
+        assert!(legacy_is_empty);
+        let config = proto.config.as_ref().unwrap();
+        assert_eq!(
+            config.fields["query_maxlen"].kind,
+            Some(prost_types::value::Kind::NumberValue(32.0))
+        );
+        let back = proto_embedder_definition_to_json(&proto);
+        assert_eq!(back, colbert);
+        assert!(back["doc_maxlen"].is_u64());
+
+        // The gateway does not read the parameters: a value of the wrong type
+        // and a key the type does not take reach the server as they are, and
+        // the server rejects them.
+        let wrong = json!({"type": "candle_bert", "model": true, "pooling": "mean"});
+        let proto = json_to_proto_embedder_definition(&wrong).unwrap();
+        assert_eq!(proto_embedder_definition_to_json(&proto), wrong);
+    }
+
+    #[test]
+    fn an_embedder_definition_must_be_an_object_and_not_too_deep() {
+        let error = |embedder: Value| {
+            json_to_proto_schema(&json!({"fields": {}, "embedders": {"e": embedder}})).unwrap_err()
+        };
+        assert_eq!(
+            error(json!("precomputed")),
+            "embedder \"e\": embedder definition must be an object"
+        );
+
+        // 8 levels (the definition and 7 nested objects) is the limit.
+        let nested = |levels: usize| {
+            let mut value = json!("x");
+            for _ in 0..levels {
+                value = json!({"k": value});
+            }
+            value
+        };
+        let at_limit = json!({"type": "precomputed", "x": nested(MAX_COMPONENT_DEPTH - 1)});
+        assert_eq!(json_depth(&at_limit), MAX_COMPONENT_DEPTH);
+        assert!(json_to_proto_embedder_definition(&at_limit).is_ok());
+        let too_deep = json!({"type": "precomputed", "x": nested(MAX_COMPONENT_DEPTH)});
+        assert_eq!(
+            error(too_deep),
+            "embedder \"e\": embedder definition must not nest more than 8 levels deep"
+        );
+    }
+
+    /// A whole number in an embedder's `config` is written as a JSON
+    /// integer, since `query_maxlen` rejects a float; the fields of the form
+    /// before Issue #1702 are not read.
+    #[test]
+    fn an_embedder_in_a_response_writes_whole_numbers_as_integers() {
+        let config = prost_types::Struct {
+            fields: [
+                (
+                    "type",
+                    prost_types::value::Kind::StringValue("candle_colbert".into()),
+                ),
+                ("model", prost_types::value::Kind::StringValue("m".into())),
+                ("query_maxlen", prost_types::value::Kind::NumberValue(32.0)),
+            ]
+            .into_iter()
+            .map(|(k, kind)| (k.to_string(), prost_types::Value { kind: Some(kind) }))
+            .collect(),
+        };
+        #[allow(deprecated)]
+        let embedder = v1::EmbedderConfig {
+            r#type: "ignored".into(),
+            params: HashMap::from([("query_maxlen".to_string(), "1".to_string())]),
+            config: Some(config),
+        };
+        let json = proto_embedder_definition_to_json(&embedder);
+        assert_eq!(
+            json,
+            json!({"type": "candle_colbert", "model": "m", "query_maxlen": 32})
+        );
+        assert!(json["query_maxlen"].is_u64());
     }
 
     // -- Unknown keys (Issue #1706) -------------------------------------
