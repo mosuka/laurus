@@ -2,7 +2,7 @@
 
 laurus MCP サーバーは以下のツールを公開しています。
 
-ツールが取らない引数（`dry_run` を書き間違えた `"dryrun"` など）は、その引数を名指しするツールのエラーになり（例: ``failed to deserialize parameters: unknown field `dryrun` ...``）、ツールは何もしません（Issue #1707）。引数を取らないツールは、どの引数も拒否します。`fusion`・`field_boosts`・`highlight`・`rescore`・`group_by` の中の JSON は、HTTP の gateway が要求の本文を読むのと同じ読み方をするので、知らないキーを今も捨てます（Issue #1706）。
+ツールが取らない引数（`dry_run` を書き間違えた `"dryrun"` など）は、その引数を名指しするツールのエラーになり（例: ``failed to deserialize parameters: unknown field `dryrun` ...``）、ツールは何もしません（Issue #1707）。引数を取らないツールは、どの引数も拒否します。`fusion`・`field_boosts`・`highlight`・`rescore`・`group_by` の中の JSON は、HTTP の gateway が要求の本文を読むのと同じ読み方をします。そのため、`fusion`（中の `rrf`・`weighted_sum` も）・`highlight`・`rescore`（中の `late_interaction` も）・`group_by` が取らないキーは、そのキーを名指しするツールのエラーになり（例: ``Invalid highlight JSON: unknown key "tags" in highlight (expected "fields", ...)``）、ツールは何もしません（Issue #1706）。値が `null` のキーは省略と同じなので、報告しません。`field_boosts` のキーはフィールドの名前です。
 
 ## connect
 

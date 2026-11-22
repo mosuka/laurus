@@ -8,6 +8,7 @@ use crate::convert::document::to_proto;
 use crate::convert::json::{
     json_optional_array, json_optional_bool, json_optional_f64, json_optional_object,
     json_optional_str, json_optional_string_array, json_optional_u32, json_optional_u64,
+    reject_unknown_keys,
 };
 use crate::convert::proto_struct;
 use crate::proto::laurus::v1;
@@ -162,6 +163,61 @@ pub fn json_to_proto_document(json: &Value) -> Result<v1::Document, String> {
     Ok(to_proto(&doc))
 }
 
+/// Convert the body of `PUT` or `POST /v1/documents/{id}`, `{"fields":
+/// {...}}`, to a proto `Document`.
+///
+/// # Errors
+///
+/// Returns an error when the body has a key other than `fields` (Issue
+/// #1706; the id comes from the path, so an `"id"` in the body used to be
+/// dropped), and the errors of [`json_to_proto_document`].
+pub fn json_to_proto_document_body(body: &Value) -> Result<v1::Document, String> {
+    if let Some(obj) = body.as_object() {
+        reject_unknown_keys(obj, "the request body", &["fields"])?;
+    }
+    json_to_proto_document(body)
+}
+
+/// Convert the body of `POST /v1/documents:bulk`, `{"documents": [{"id":
+/// "...", "fields": {...}}, ...]}`, to its proto entries.
+///
+/// # Errors
+///
+/// Returns an error when the body has no `documents` array or a key other
+/// than `documents`, or when an entry has no string `id`, a key other than
+/// `id` and `fields`, or a document [`json_to_proto_document`] rejects. An
+/// entry's error starts with its position (`documents[1]: ...`). The unknown
+/// keys are Issue #1706: a misspelled `"fileds"` used to be dropped.
+pub fn json_to_proto_document_entries(body: &Value) -> Result<Vec<v1::DocumentEntry>, String> {
+    if let Some(obj) = body.as_object() {
+        reject_unknown_keys(obj, "the request body", &["documents"])?;
+    }
+    let entries = body
+        .get("documents")
+        .ok_or_else(|| "missing \"documents\" key".to_string())?
+        .as_array()
+        .ok_or_else(|| "\"documents\" must be an array".to_string())?;
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let at = |e: String| format!("documents[{index}]: {e}");
+            if let Some(obj) = entry.as_object() {
+                reject_unknown_keys(obj, "the document entry", &["id", "fields"]).map_err(at)?;
+            }
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| at("missing string \"id\"".to_string()))?;
+            let document = json_to_proto_document(entry).map_err(at)?;
+            Ok(v1::DocumentEntry {
+                id: id.to_string(),
+                document: Some(document),
+            })
+        })
+        .collect()
+}
+
 /// Converts a proto `Document`'s fields into a JSON fields map: `{field:
 /// value, ...}`, with no `"fields"` wrapper and no `id`.
 ///
@@ -198,11 +254,27 @@ pub fn proto_document_to_json(doc: &v1::Document) -> Value {
 /// when a field option, analyzer or embedder is invalid, or when
 /// `default_fields` is present and not `null` but not an array of strings,
 /// or `analyzers` or `embedders` not an object, instead of reading it as
-/// omitted or dropping an item (Issue #1524).
+/// omitted or dropping an item (Issue #1524). Any other key is an error too
+/// (Issue #1706), except `pending_reindex`, which [`proto_schema_to_json`]
+/// writes and a new schema does not take.
 pub fn json_to_proto_schema(json: &Value) -> Result<v1::Schema, String> {
     let json = json
         .as_object()
         .ok_or_else(|| "schema must be an object".to_string())?;
+    reject_unknown_keys(
+        json,
+        "the schema",
+        &[
+            "fields",
+            "default_fields",
+            "analyzers",
+            "embedders",
+            "dynamic_field_policy",
+            // Written by `GET /v1/schema` after a destructive change, so its
+            // response can be sent back; a new index starts with none.
+            "pending_reindex",
+        ],
+    )?;
     let fields_val = json
         .get("fields")
         .ok_or_else(|| "missing \"fields\" key in schema".to_string())?;
@@ -267,6 +339,88 @@ pub fn json_to_proto_schema(json: &Value) -> Result<v1::Schema, String> {
         // Not user-supplied at schema-creation time: only `UpdateField`
         // populates this (Issue #1079).
         pending_reindex: Vec::new(),
+    })
+}
+
+/// Convert the body of `POST /v1/index`, `{"schema": {...}}`, to a proto
+/// `CreateIndexRequest`.
+///
+/// # Errors
+///
+/// Returns an error when the body has no `schema` or a key other than
+/// `schema` (Issue #1706), and the errors of [`json_to_proto_schema`].
+pub fn json_to_proto_create_index_request(body: &Value) -> Result<v1::CreateIndexRequest, String> {
+    if let Some(obj) = body.as_object() {
+        reject_unknown_keys(obj, "the request body", &["schema"])?;
+    }
+    let schema = body
+        .get("schema")
+        .ok_or_else(|| "missing \"schema\" key".to_string())?;
+    Ok(v1::CreateIndexRequest {
+        schema: Some(json_to_proto_schema(schema)?),
+    })
+}
+
+/// Convert the body of `POST /v1/schema/fields`, `{"name": "...",
+/// "field_option": {...}}`, to a proto `AddFieldRequest`.
+///
+/// # Errors
+///
+/// Returns an error when the body has no string `name`, no `field_option`,
+/// or a key other than those two (Issue #1706), and the errors of
+/// [`json_to_proto_field_option`].
+pub fn json_to_proto_add_field_request(body: &Value) -> Result<v1::AddFieldRequest, String> {
+    if let Some(obj) = body.as_object() {
+        reject_unknown_keys(obj, "the request body", &["name", "field_option"])?;
+    }
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing or invalid \"name\" key".to_string())?
+        .to_string();
+    let field_option = body
+        .get("field_option")
+        .ok_or_else(|| "missing \"field_option\" key".to_string())?;
+    Ok(v1::AddFieldRequest {
+        name,
+        field_option: Some(json_to_proto_field_option(field_option)?),
+    })
+}
+
+/// Convert the body of `PATCH /v1/schema/fields/{name}`, `{"field_option":
+/// {...}, "reindex": false, "dry_run": false}`, to a proto
+/// `UpdateFieldRequest` for the field `name`.
+///
+/// `reindex` and `dry_run` default to `false`, matching
+/// `UpdateFieldOptions::default()`.
+///
+/// # Errors
+///
+/// Returns an error when the body has no `field_option` (a body that is not
+/// an object has none either), when `reindex` or `dry_run` is present and
+/// not `null` but not `true` or `false`, so `"dry_run": "true"` cannot apply
+/// the change (Issue #1511), when the body has another key, so a misspelled
+/// `"dry_rn": true` cannot either (Issue #1706), and the errors of
+/// [`json_to_proto_field_option`].
+pub fn json_to_proto_update_field_request(
+    name: String,
+    body: &Value,
+) -> Result<v1::UpdateFieldRequest, String> {
+    let missing_field_option = || "missing \"field_option\" key".to_string();
+    let body = body.as_object().ok_or_else(missing_field_option)?;
+    reject_unknown_keys(
+        body,
+        "the request body",
+        &["field_option", "reindex", "dry_run"],
+    )?;
+    let field_option =
+        json_to_proto_field_option(body.get("field_option").ok_or_else(missing_field_option)?)?;
+    let flag = |key: &str| json_optional_bool(body, key).map(Option::unwrap_or_default);
+    Ok(v1::UpdateFieldRequest {
+        name,
+        field_option: Some(field_option),
+        reindex: flag("reindex")?,
+        dry_run: flag("dry_run")?,
     })
 }
 
@@ -388,6 +542,11 @@ fn json_to_analyzer_spec(value: &Value) -> Result<v1::AnalyzerSpec, String> {
     let inner = if let Some(name) = value.as_str() {
         Spec::Named(name.to_string())
     } else if let Some(obj) = value.as_object() {
+        reject_unknown_keys(
+            obj,
+            "the analyzer object",
+            &["language", "dict", "mode", "user_dict"],
+        )?;
         let language = obj
             .get("language")
             .and_then(|v| v.as_str())
@@ -482,11 +641,14 @@ fn analyzer_spec_to_json(spec: &v1::AnalyzerSpec) -> Option<Value> {
 /// is present and not `null` but not `true` or `false` (Issue #1511; see
 /// [`json_optional_bool`]), or an integer, `analyzer` or vector option key
 /// that cannot be read. A `null` `analyzer`, or a `null` type next to
-/// another type, is the same as omitting it.
+/// another type, is the same as omitting it. A key other than the type
+/// names, or a key the type's option does not take, is an error (Issue
+/// #1706).
 pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| "field option must be an object".to_string())?;
+    reject_unknown_keys(obj, "the field option", &FIELD_OPTION_TYPES)?;
 
     // The type is the one type key whose value is not `null`: a `null` one
     // is the same as omitting it, as for every other key. Two type keys
@@ -522,7 +684,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
 
     let option = match kind {
         "text" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &TEXT_OPTION_KEYS)?;
             Opt::Text(v1::TextOption {
                 // Unset (omitted by the client, or `null`) is distinct from
                 // an explicit `false`: the server reads it as the engine's
@@ -550,7 +712,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "integer" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &LEXICAL_FLAG_KEYS)?;
             Opt::Integer(v1::IntegerOption {
                 indexed: json_optional_bool(v, "indexed")?,
                 stored: json_optional_bool(v, "stored")?,
@@ -559,7 +721,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "float" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &LEXICAL_FLAG_KEYS)?;
             Opt::Float(v1::FloatOption {
                 indexed: json_optional_bool(v, "indexed")?,
                 stored: json_optional_bool(v, "stored")?,
@@ -568,7 +730,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "boolean" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &LEXICAL_FLAG_KEYS)?;
             Opt::Boolean(v1::BooleanOption {
                 indexed: json_optional_bool(v, "indexed")?,
                 stored: json_optional_bool(v, "stored")?,
@@ -577,7 +739,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "date_time" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &LEXICAL_FLAG_KEYS)?;
             Opt::DateTime(v1::DateTimeOption {
                 indexed: json_optional_bool(v, "indexed")?,
                 stored: json_optional_bool(v, "stored")?,
@@ -586,7 +748,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "geo" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &LEXICAL_FLAG_KEYS)?;
             Opt::Geo(v1::GeoOption {
                 indexed: json_optional_bool(v, "indexed")?,
                 stored: json_optional_bool(v, "stored")?,
@@ -595,7 +757,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "geo3d" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &LEXICAL_FLAG_KEYS)?;
             Opt::Geo3d(v1::Geo3dOption {
                 indexed: json_optional_bool(v, "indexed")?,
                 stored: json_optional_bool(v, "stored")?,
@@ -604,7 +766,7 @@ pub fn json_to_proto_field_option(json: &Value) -> Result<v1::FieldOption, Strin
             })
         }
         "bytes" => {
-            let v = option_object(value, kind)?;
+            let v = option_object(value, kind, &["stored", "multi_valued"])?;
             Opt::Bytes(v1::BytesOption {
                 stored: json_optional_bool(v, "stored")?,
                 multi_valued: json_optional_bool(v, "multi_valued")?.unwrap_or(false),
@@ -639,17 +801,40 @@ const FIELD_OPTION_TYPES: [&str; 12] = [
     "multi_vector",
 ];
 
-/// The value of a field option's type key `kind` as an object.
+/// The keys a `text` option takes.
+const TEXT_OPTION_KEYS: [&str; 7] = [
+    "indexed",
+    "stored",
+    "term_vectors",
+    "doc_values",
+    "analyzer",
+    "multi_valued",
+    "position_increment_gap",
+];
+
+/// The keys an `integer`, `float`, `boolean`, `date_time`, `geo` or `geo3d`
+/// option takes.
+const LEXICAL_FLAG_KEYS: [&str; 4] = ["indexed", "stored", "multi_valued", "doc_values"];
+
+/// The value of a field option's type key `kind` as an object, whose keys
+/// are among `known`, the keys the option of that type takes.
 ///
 /// # Errors
 ///
 /// Returns an error naming `kind` when `value` is not an object, `null`
 /// included, instead of reading it as an option with every key omitted
-/// (Issue #1524).
-fn option_object<'a>(value: &'a Value, kind: &str) -> Result<&'a Map<String, Value>, String> {
-    value
+/// (Issue #1524), and an error naming the key when the object has a key
+/// outside `known` (Issue #1706).
+fn option_object<'a>(
+    value: &'a Value,
+    kind: &str,
+    known: &[&str],
+) -> Result<&'a Map<String, Value>, String> {
+    let obj = value
         .as_object()
-        .ok_or_else(|| format!("{kind} option must be an object"))
+        .ok_or_else(|| format!("{kind} option must be an object"))?;
+    reject_unknown_keys(obj, &format!("the {kind} option"), known)?;
+    Ok(obj)
 }
 
 /// The JSON of the flags a lexical option shares.
@@ -842,6 +1027,7 @@ fn json_to_quantizer(
             ));
         }
     };
+    reject_unknown_keys(obj, "the quantizer", &["method", "subvector_count"])?;
     let method_str = obj.get("method").and_then(|v| v.as_str()).ok_or_else(|| {
         format!("quantizer \"method\" must be a string, one of {QUANTIZER_METHODS}")
     })?;
@@ -937,7 +1123,22 @@ fn rerank_storage_to_json(value: i32) -> Option<&'static str> {
 /// `pq_codebook_path` not a string (Issue #1524), or when `distance`,
 /// `quantizer` or `rerank_storage` is invalid.
 fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
-    let obj = option_object(json, "hnsw")?;
+    let obj = option_object(
+        json,
+        "hnsw",
+        &[
+            "dimension",
+            "distance",
+            "m",
+            "ef_construction",
+            "base_weight",
+            "quantizer",
+            "embedder",
+            "default_ef_search",
+            "rerank_storage",
+            "pq_codebook_path",
+        ],
+    )?;
     Ok(v1::HnswOption {
         dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
         distance: json_to_distance(obj)?,
@@ -974,7 +1175,18 @@ fn json_to_hnsw_option(json: &Value) -> Result<v1::HnswOption, String> {
 /// string (Issue #1524), or when `distance`, `quantizer` or
 /// `rerank_storage` is invalid.
 fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
-    let obj = option_object(json, "flat")?;
+    let obj = option_object(
+        json,
+        "flat",
+        &[
+            "dimension",
+            "distance",
+            "base_weight",
+            "quantizer",
+            "embedder",
+            "rerank_storage",
+        ],
+    )?;
     Ok(v1::FlatOption {
         dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
         distance: json_to_distance(obj)?,
@@ -1005,7 +1217,17 @@ fn json_to_flat_option(json: &Value) -> Result<v1::FlatOption, String> {
 /// and is rejected by the engine. Also returns an error when `json` is not
 /// an object or `embedder` is present and not a string (Issue #1524).
 fn json_to_multi_vector_option(json: &Value) -> Result<v1::MultiVectorOption, String> {
-    let obj = option_object(json, "multi_vector")?;
+    let obj = option_object(
+        json,
+        "multi_vector",
+        &[
+            "storage",
+            "dimension",
+            "distance",
+            "embedder",
+            "pool_factor",
+        ],
+    )?;
     let storage = match obj.get("storage") {
         None | Some(Value::Null) => v1::MultiVectorStorage::F32 as i32,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("f32") => {
@@ -1066,7 +1288,20 @@ fn multi_vector_storage_to_json(value: Option<i32>) -> Option<&'static str> {
 /// number or `embedder` not a string (Issue #1524), or when `distance`,
 /// `quantizer` or `rerank_storage` is invalid.
 fn json_to_ivf_option(json: &Value) -> Result<v1::IvfOption, String> {
-    let obj = option_object(json, "ivf")?;
+    let obj = option_object(
+        json,
+        "ivf",
+        &[
+            "dimension",
+            "distance",
+            "n_clusters",
+            "n_probe",
+            "base_weight",
+            "quantizer",
+            "embedder",
+            "rerank_storage",
+        ],
+    )?;
     Ok(v1::IvfOption {
         dimension: json_optional_u32(obj, "dimension")?.unwrap_or(0),
         distance: json_to_distance(obj)?,
@@ -1186,11 +1421,30 @@ fn ivf_option_to_json(opt: &v1::IvfOption) -> Value {
 /// not an object or a key has the wrong type, instead of reading the value
 /// as omitted or dropping it (Issues #1366, #1367, #1490, #1511, #1524).
 /// `query` used to be `""` when it was not a string, which turned a hybrid
-/// request into a vector-only one.
+/// request into a vector-only one. A key the request does not take, at any
+/// level, is rejected too, naming it (Issue #1706): `"limt"` used to leave
+/// the default limit.
 pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, String> {
     let json = json
         .as_object()
         .ok_or_else(|| "search request must be an object".to_string())?;
+    reject_unknown_keys(
+        json,
+        "the search request",
+        &[
+            "query",
+            "query_vectors",
+            "limit",
+            "offset",
+            "fusion",
+            "lexical_params",
+            "vector_params",
+            "field_boosts",
+            "highlight",
+            "rescore",
+            "group_by",
+        ],
+    )?;
     let query = json_optional_str(json, "query")?.unwrap_or("").to_string();
 
     // A malformed `query_vectors` is rejected (400) rather than dropped,
@@ -1279,6 +1533,33 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
     })
 }
 
+/// Convert the body of `POST /v1/search/batch`, `{"queries": [...]}`, to a
+/// proto `SearchBatchRequest`, each entry read as a `POST /v1/search` body.
+///
+/// # Errors
+///
+/// Returns an error when the body has no `queries` array or a key other
+/// than `queries` (Issue #1706), and the first entry's error from
+/// [`json_to_proto_search_request`], starting with its position
+/// (`queries[1]: ...`).
+pub fn json_to_proto_search_batch_request(body: &Value) -> Result<v1::SearchBatchRequest, String> {
+    if let Some(obj) = body.as_object() {
+        reject_unknown_keys(obj, "the request body", &["queries"])?;
+    }
+    let queries = body
+        .get("queries")
+        .ok_or_else(|| "missing `queries` field".to_string())?
+        .as_array()
+        .ok_or_else(|| "`queries` must be an array".to_string())?
+        .iter()
+        .enumerate()
+        .map(|(index, query)| {
+            json_to_proto_search_request(query).map_err(|e| format!("queries[{index}]: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(v1::SearchBatchRequest { queries })
+}
+
 /// Converts one JSON `query_vectors` entry to a proto `QueryVector`.
 ///
 /// `vector` must be a non-empty array of numbers. `weight` (a number) and
@@ -1292,6 +1573,7 @@ fn json_to_query_vector(json: &Value) -> Result<v1::QueryVector, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| "must be an object".to_string())?;
+    reject_unknown_keys(obj, "the query vector", &["vector", "weight", "fields"])?;
     let get = |key: &str| obj.get(key).filter(|v| !v.is_null());
 
     let vector: Vec<f32> = get("vector")
@@ -1327,6 +1609,11 @@ fn json_to_query_vector(json: &Value) -> Result<v1::QueryVector, String> {
 /// not `null` but not a number, instead of `0.0`, or `sort_by` is invalid
 /// (Issue #1524; see [`json_to_sort_spec`]).
 fn json_to_lexical_params(obj: &Map<String, Value>) -> Result<v1::LexicalParams, String> {
+    reject_unknown_keys(
+        obj,
+        "lexical_params",
+        &["min_score", "timeout_ms", "parallel", "sort_by"],
+    )?;
     let error = |message: String| format!("lexical_params: {message}");
     Ok(v1::LexicalParams {
         min_score: json_optional_f64(obj, "min_score")
@@ -1359,6 +1646,7 @@ fn json_to_lexical_params(obj: &Map<String, Value>) -> Result<v1::LexicalParams,
 /// any other `order`, such as `"DESC"`, sorted ascending (Issues #1476,
 /// #1524).
 fn json_to_sort_spec(obj: &Map<String, Value>) -> Result<v1::SortSpec, String> {
+    reject_unknown_keys(obj, "sort_by", &["field", "order"])?;
     let error = |message: String| format!("sort_by: {message}");
     let field = json_optional_str(obj, "field")
         .map_err(error)?
@@ -1396,6 +1684,18 @@ fn json_to_vector_params(json: &Value) -> Result<v1::VectorParams, String> {
     let obj = json
         .as_object()
         .ok_or_else(|| error("must be an object".to_string()))?;
+    reject_unknown_keys(
+        obj,
+        "vector_params",
+        &[
+            "fields",
+            "score_mode",
+            "overfetch",
+            "min_score",
+            "rerank_factor",
+            "ef_search",
+        ],
+    )?;
     let fields = json_optional_string_array(obj, "fields")
         .map_err(error)?
         .unwrap_or_default();
@@ -1520,6 +1820,14 @@ fn json_to_proto_analyzer_definition(json: &Value) -> Result<v1::AnalyzerDefinit
     let obj = json
         .as_object()
         .ok_or_else(|| "analyzer definition must be an object".to_string())?;
+    // The components themselves go to the server whole and are read there
+    // with the core types, which reject a key they do not take (Issue
+    // #1700); this level is read here (Issue #1706).
+    reject_unknown_keys(
+        obj,
+        "the analyzer definition",
+        &["tokenizer", "char_filters", "token_filters"],
+    )?;
 
     let tokenizer = obj
         .get("tokenizer")
@@ -4298,5 +4606,376 @@ mod tests {
         let json = proto_component_to_json(&component);
         assert_eq!(json, json!({"type": "limit", "limit": 5, "x": 2.5}));
         assert!(json["limit"].is_u64());
+    }
+
+    // -- Unknown keys (Issue #1706) -------------------------------------
+
+    /// The reader of one kind of request body.
+    type BodyReader = fn(&Value) -> Result<(), String>;
+
+    /// One kind of request body, with every level and every key the gateway
+    /// reads, the reader of its route, the objects that are not checked
+    /// (their keys are names the client chooses), and the subtrees the
+    /// gateway does not read key by key (components, embedder definitions,
+    /// a document's field values).
+    struct FullBody {
+        name: &'static str,
+        body: Value,
+        read: BodyReader,
+        names: &'static [&'static str],
+        not_read: &'static [&'static str],
+        objects: usize,
+    }
+
+    fn full_bodies() -> Vec<FullBody> {
+        let lexical =
+            json!({"indexed": true, "stored": true, "multi_valued": false, "doc_values": true});
+        vec![
+            FullBody {
+                name: "create an index",
+                body: json!({"schema": {
+                    "fields": {
+                        "t": {"text": {
+                            "indexed": true, "stored": true, "term_vectors": true, "doc_values": true,
+                            "analyzer": {"language": "japanese", "dict": "embedded://ipadic",
+                                         "mode": "normal", "user_dict": "user.csv"},
+                            "multi_valued": false, "position_increment_gap": 100}},
+                        "i": {"integer": lexical},
+                        "f": {"float": lexical},
+                        "b": {"boolean": lexical},
+                        "d": {"date_time": lexical},
+                        "g": {"geo": lexical},
+                        "g3": {"geo3d": lexical},
+                        "y": {"bytes": {"stored": true, "multi_valued": false}},
+                        "h": {"hnsw": {
+                            "dimension": 8, "distance": "cosine", "m": 16, "ef_construction": 200,
+                            "base_weight": 1.0,
+                            "quantizer": {"method": "product_quantization", "subvector_count": 4},
+                            "embedder": "e", "default_ef_search": 50, "rerank_storage": "F32",
+                            "pq_codebook_path": "h.pqcb"}},
+                        "fl": {"flat": {
+                            "dimension": 8, "distance": "cosine", "base_weight": 1.0,
+                            "quantizer": {"method": "scalar_8bit", "subvector_count": 0},
+                            "embedder": "e", "rerank_storage": "F32"}},
+                        "iv": {"ivf": {
+                            "dimension": 8, "distance": "cosine", "n_clusters": 4, "n_probe": 2,
+                            "base_weight": 1.0, "quantizer": {"method": "float16"},
+                            "embedder": "e", "rerank_storage": "F32"}},
+                        "m": {"multi_vector": {
+                            "storage": "f16", "dimension": 8, "distance": "cosine",
+                            "embedder": "e", "pool_factor": 2}}
+                    },
+                    "default_fields": ["t"],
+                    "analyzers": {"a": {
+                        "tokenizer": {"type": "whitespace"},
+                        "char_filters": [{"type": "unicode_normalization", "form": "nfkc"}],
+                        "token_filters": [{"type": "lowercase"}]}},
+                    "embedders": {"e": {"type": "precomputed"}},
+                    "dynamic_field_policy": "dynamic",
+                    "pending_reindex": ["t"]
+                }}),
+                read: |b| json_to_proto_create_index_request(b).map(drop),
+                names: &["/schema/fields", "/schema/analyzers", "/schema/embedders"],
+                not_read: &[
+                    "/schema/embedders/e",
+                    "/schema/analyzers/a/tokenizer",
+                    "/schema/analyzers/a/char_filters",
+                    "/schema/analyzers/a/token_filters",
+                ],
+                // The body, the schema, 12 field options and their 12
+                // bodies, the analyzer object, 3 quantizers and the
+                // analyzer definition.
+                objects: 31,
+            },
+            FullBody {
+                name: "add a field",
+                body: json!({"name": "n", "field_option": {"integer": lexical}}),
+                read: |b| json_to_proto_add_field_request(b).map(drop),
+                names: &[],
+                not_read: &[],
+                objects: 3,
+            },
+            FullBody {
+                name: "change a field",
+                body: json!({
+                    "field_option": {"text": {"indexed": true, "stored": true, "analyzer": "a"}},
+                    "reindex": false,
+                    "dry_run": true
+                }),
+                read: |b| json_to_proto_update_field_request("t".to_string(), b).map(drop),
+                names: &[],
+                not_read: &[],
+                objects: 3,
+            },
+            FullBody {
+                name: "a document",
+                body: json!({"fields": {"title": "x", "loc": {"lat": 35.0, "lon": 139.0}}}),
+                read: |b| json_to_proto_document_body(b).map(drop),
+                names: &[],
+                not_read: &["/fields"],
+                objects: 1,
+            },
+            FullBody {
+                name: "bulk documents",
+                body: json!({"documents": [{"id": "1", "fields": {"title": "x"}}]}),
+                read: |b| json_to_proto_document_entries(b).map(drop),
+                names: &[],
+                not_read: &["/documents/0/fields"],
+                objects: 2,
+            },
+            FullBody {
+                name: "a search with rrf and a text rescore",
+                body: json!({
+                    "query": "title:x",
+                    "query_vectors": [{"vector": [0.1, 0.2], "weight": 1.0, "fields": ["h"]}],
+                    "limit": 5,
+                    "offset": 0,
+                    "fusion": {"rrf": {"k": 60}},
+                    "lexical_params": {"min_score": 0.0, "timeout_ms": 1000, "parallel": false,
+                                       "sort_by": {"field": "i", "order": "desc"}},
+                    "vector_params": {"fields": ["h"], "score_mode": "weighted_sum",
+                                      "overfetch": 1.0, "min_score": 0.0, "rerank_factor": 1,
+                                      "ef_search": 50},
+                    "field_boosts": {"title": 2.0},
+                    "highlight": {"fields": ["title"], "max_fragments": 1, "fragment_size": 100,
+                                  "tag": "em", "css_class": "hl", "max_analyzed_chars": 1000,
+                                  "require_field_match": true,
+                                  "return_entire_field_if_no_highlight": false},
+                    "rescore": {"window_size": 10,
+                                "late_interaction": {"field": "m", "text": "q"}},
+                    "group_by": {"field": "i", "group_size": 2}
+                }),
+                read: |b| json_to_proto_search_request(b).map(drop),
+                names: &["/field_boosts"],
+                not_read: &[],
+                objects: 11,
+            },
+            FullBody {
+                name: "a search with weighted_sum and a vector rescore",
+                body: json!({
+                    "query": "title:x",
+                    "fusion": {"weighted_sum": {"lexical_weight": 0.5, "vector_weight": 0.5}},
+                    "rescore": {"late_interaction": {"field": "m", "vectors": [[0.1, 0.2]]}}
+                }),
+                read: |b| json_to_proto_search_request(b).map(drop),
+                names: &[],
+                not_read: &[],
+                objects: 5,
+            },
+            FullBody {
+                name: "a batch search",
+                body: json!({"queries": [
+                    {"query": "title:x", "lexical_params": {"sort_by": {"field": "i"}}}
+                ]}),
+                read: |b| json_to_proto_search_batch_request(b).map(drop),
+                names: &[],
+                not_read: &[],
+                objects: 4,
+            },
+        ]
+    }
+
+    /// The JSON pointers of the objects in `value`, outside the subtrees
+    /// under `not_read`.
+    fn object_pointers(value: &Value, at: String, not_read: &[&str], out: &mut Vec<String>) {
+        if not_read.contains(&at.as_str()) {
+            return;
+        }
+        match value {
+            Value::Object(obj) => {
+                for (key, child) in obj {
+                    object_pointers(child, format!("{at}/{key}"), not_read, out);
+                }
+                out.push(at);
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    object_pointers(child, format!("{at}/{i}"), not_read, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Issue #1706: every object of every request body with fixed keys
+    /// rejects a key it does not take, naming it. Each full body passes as
+    /// it is first, so a key a reader reads but does not list fails here too.
+    /// The positions that did not fail are collected and asserted once.
+    #[test]
+    fn every_object_rejects_an_unknown_key() {
+        let mut wrong = Vec::new();
+        for case in full_bodies() {
+            if let Err(e) = (case.read)(&case.body) {
+                wrong.push(format!("{}: the full body fails: {e}", case.name));
+                continue;
+            }
+            let mut pointers = Vec::new();
+            object_pointers(&case.body, String::new(), case.not_read, &mut pointers);
+            pointers.retain(|p| !case.names.contains(&p.as_str()));
+            if pointers.len() != case.objects {
+                wrong.push(format!(
+                    "{}: {} objects, expected {}: {pointers:?}",
+                    case.name,
+                    pointers.len(),
+                    case.objects
+                ));
+            }
+            for pointer in pointers {
+                let mut body = case.body.clone();
+                body.pointer_mut(&pointer)
+                    .and_then(Value::as_object_mut)
+                    .unwrap()
+                    .insert("unknown_key".to_string(), json!(1));
+                match (case.read)(&body) {
+                    Err(e) if e.contains("unknown key \"unknown_key\"") => {}
+                    other => wrong.push(format!("{} at {pointer:?}: {other:?}", case.name)),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Issue #1706: an unknown key set to `null` is the same as one left
+    /// out, so it is not reported.
+    #[test]
+    fn an_unknown_key_set_to_null_passes() {
+        let body = json!({
+            "schema": {"fields": {"t": {"text": {"indexd": null}}}, "defaults": null},
+            "dryrun": null
+        });
+        assert!(json_to_proto_create_index_request(&body).is_ok());
+        let search = json!({"query": "t:x", "limt": null, "lexical_params": {"min_scor": null}});
+        assert!(json_to_proto_search_request(&search).is_ok());
+    }
+
+    /// The method, path and `-d '...'` body of each curl command in
+    /// `markdown` that sends a body, and the rest of the command's code
+    /// block, where an example shows its output (`# => ...`).
+    fn curl_bodies(markdown: &str) -> Vec<(String, String, String, String)> {
+        let mut out = Vec::new();
+        for command in markdown.split("curl ").skip(1) {
+            // A command ends at the end of its code block.
+            let command = command.split("```").next().unwrap_or("");
+            let Some(start) = command.find("-d '") else {
+                continue;
+            };
+            let rest = &command[start + 4..];
+            let Some(end) = rest.find('\'') else {
+                continue;
+            };
+            let body = rest[..end].to_string();
+            let output = rest[end..].to_string();
+            let method = command
+                .split_whitespace()
+                .skip_while(|w| *w != "-X")
+                .nth(1)
+                .unwrap_or("POST")
+                .to_string();
+            let url = command
+                .split_whitespace()
+                .map(|w| w.trim_matches('\''))
+                .find(|w| w.starts_with("http"))
+                .unwrap_or("");
+            let path = url
+                .split_once("localhost:8080")
+                .map_or("", |(_, path)| path)
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            out.push((method, path, body, output));
+        }
+        out
+    }
+
+    /// The reader of the route a documented request goes to.
+    fn reader_for(method: &str, path: &str) -> Option<BodyReader> {
+        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        match (method, segments.as_slice()) {
+            ("POST", ["v1", "index"]) => Some(|b| json_to_proto_create_index_request(b).map(drop)),
+            ("POST", ["v1", "schema", "fields"]) => {
+                Some(|b| json_to_proto_add_field_request(b).map(drop))
+            }
+            ("PATCH", ["v1", "schema", "fields", _]) => {
+                Some(|b| json_to_proto_update_field_request(String::new(), b).map(drop))
+            }
+            ("POST", ["v1", "documents:bulk"]) => {
+                Some(|b| json_to_proto_document_entries(b).map(drop))
+            }
+            ("PUT" | "POST", ["v1", "documents", _]) => {
+                Some(|b| json_to_proto_document_body(b).map(drop))
+            }
+            ("POST", ["v1", "search"] | ["v1", "search", "stream"]) => {
+                Some(|b| json_to_proto_search_request(b).map(drop))
+            }
+            ("POST", ["v1", "search", "batch"]) => {
+                Some(|b| json_to_proto_search_batch_request(b).map(drop))
+            }
+            _ => None,
+        }
+    }
+
+    /// Issue #1706: no curl example in the gateway docs (en/ja) sends a key
+    /// the gateway rejects, unless it shows that error on purpose: then the
+    /// output written after it (`# => ...`) must hold the real message.
+    /// Other errors are not checked: some examples show a value error on
+    /// purpose.
+    #[test]
+    fn documented_request_bodies_have_only_known_keys() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the workspace root is one level up from laurus-server/");
+        let mut wrong = Vec::new();
+        for doc in [
+            "docs/src/laurus-server/http_gateway.md",
+            "docs/ja/src/laurus-server/http_gateway.md",
+            "docs/src/laurus-server/tutorial.md",
+            "docs/ja/src/laurus-server/tutorial.md",
+        ] {
+            let text = std::fs::read_to_string(root.join(doc))
+                .unwrap_or_else(|e| panic!("cannot read {doc}: {e}"));
+            let bodies = curl_bodies(&text);
+            // Every `-d '` is a curl body, so none is skipped.
+            assert!(!bodies.is_empty(), "no curl body found in {doc}");
+            assert_eq!(
+                bodies.len(),
+                text.matches("-d '").count(),
+                "a curl body in {doc} was not read"
+            );
+            for (method, path, body, output) in bodies {
+                let Some(read) = reader_for(&method, &path) else {
+                    wrong.push(format!("{doc}: no reader for {method} {path}"));
+                    continue;
+                };
+                let json: Value = match serde_json::from_str(&body) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        wrong.push(format!("{doc}: {method} {path}: not JSON ({e}): {body}"));
+                        continue;
+                    }
+                };
+                let shown = output.contains("unknown key");
+                match read(&json) {
+                    // The message as the JSON of the response writes it.
+                    Err(e) if shown => {
+                        let quoted = serde_json::to_string(&e).unwrap();
+                        let message = &quoted[1..quoted.len() - 1];
+                        if !output.contains(message) {
+                            wrong.push(format!(
+                                "{doc}: {method} {path}: the example shows another error than {message}"
+                            ));
+                        }
+                    }
+                    Ok(()) if shown => {
+                        wrong.push(format!("{doc}: {method} {path}: shows an error but passes"));
+                    }
+                    Err(e) if e.contains("unknown key") => {
+                        wrong.push(format!("{doc}: {method} {path}: {e}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }

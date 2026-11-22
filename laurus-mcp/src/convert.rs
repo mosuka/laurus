@@ -1046,4 +1046,43 @@ mod tests {
         let json = document_to_json(&doc);
         assert_eq!(json["fields"]["tokens"], json!([[1.0, 0.5], [-1.0, 2.0]]));
     }
+
+    /// Issue #1706: the JSON of `fusion`, `highlight`, `rescore` and
+    /// `group_by` rejects a key it does not take, naming it, as the HTTP
+    /// gateway's search request does. Such a key used to be dropped.
+    #[test]
+    fn nested_search_json_rejects_an_unknown_key() {
+        let cases = [
+            (
+                json_to_fusion_algorithm(r#"{"rrf": {"k": 60}, "rfr": {}}"#).map(drop),
+                "unknown key \"rfr\" in fusion",
+            ),
+            (
+                json_to_fusion_algorithm(
+                    r#"{"weighted_sum": {"lexical_weight": 0.5, "vector": 1}}"#,
+                )
+                .map(drop),
+                "unknown key \"vector\" in fusion.weighted_sum",
+            ),
+            (
+                json_to_highlight_params(r#"{"fields": ["body"], "tags": "em"}"#).map(drop),
+                "unknown key \"tags\" in highlight",
+            ),
+            (
+                json_to_rescore_params(
+                    r#"{"windowsize": 5, "late_interaction": {"field": "m", "text": "q"}}"#,
+                )
+                .map(drop),
+                "unknown key \"windowsize\" in rescore",
+            ),
+            (
+                json_to_group_by_params(r#"{"field": "_id", "size": 3}"#).map(drop),
+                "unknown key \"size\" in group_by",
+            ),
+        ];
+        for (result, expected) in cases {
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(message.contains(expected), "{message}");
+        }
+    }
 }

@@ -2,7 +2,7 @@
 
 The laurus MCP server exposes the following tools.
 
-An argument a tool does not take, such as a misspelled `"dryrun"` for `dry_run`, is a tool error that names it, such as ``failed to deserialize parameters: unknown field `dryrun` ...``, and the tool does nothing (Issue #1707). A tool that takes no arguments rejects any. The JSON inside `fusion`, `field_boosts`, `highlight`, `rescore` and `group_by` is read the way the HTTP gateway reads a request body, and still drops a key it does not know (Issue #1706).
+An argument a tool does not take, such as a misspelled `"dryrun"` for `dry_run`, is a tool error that names it, such as ``failed to deserialize parameters: unknown field `dryrun` ...``, and the tool does nothing (Issue #1707). A tool that takes no arguments rejects any. The JSON inside `fusion`, `field_boosts`, `highlight`, `rescore` and `group_by` is read the way the HTTP gateway reads a request body, so a key that `fusion` (with its `rrf` and `weighted_sum`), `highlight`, `rescore` (with its `late_interaction`) or `group_by` does not take is a tool error that names it, such as ``Invalid highlight JSON: unknown key "tags" in highlight (expected "fields", ...)``, and the tool does nothing (Issue #1706). A key set to `null` is the same as one left out, so it is not reported. The keys of `field_boosts` are field names.
 
 ## connect
 

@@ -20,7 +20,7 @@ pub async fn put_document(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
     let document =
-        convert::json_to_proto_document(&body).map_err(|e| BadRequest(e).into_response())?;
+        convert::json_to_proto_document_body(&body).map_err(|e| BadRequest(e).into_response())?;
 
     state
         .document_client
@@ -44,7 +44,7 @@ pub async fn add_document(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
     let document =
-        convert::json_to_proto_document(&body).map_err(|e| BadRequest(e).into_response())?;
+        convert::json_to_proto_document_body(&body).map_err(|e| BadRequest(e).into_response())?;
 
     state
         .document_client
@@ -82,28 +82,7 @@ pub async fn bulk_documents(
         );
     }
 
-    let entries = body
-        .get("documents")
-        .ok_or_else(|| BadRequest("missing \"documents\" key".to_string()).into_response())?
-        .as_array()
-        .ok_or_else(|| BadRequest("\"documents\" must be an array".to_string()).into_response())?;
-
-    let documents = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let id = entry
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("documents[{index}]: missing string \"id\""))?;
-            let document = convert::json_to_proto_document(entry)
-                .map_err(|e| format!("documents[{index}]: {e}"))?;
-            Ok(v1::DocumentEntry {
-                id: id.to_string(),
-                document: Some(document),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()
+    let documents = convert::json_to_proto_document_entries(&body)
         .map_err(|e| BadRequest(e).into_response())?;
 
     let applied = if mode == "add" {

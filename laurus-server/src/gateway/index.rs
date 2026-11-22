@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use super::GatewayState;
 use super::convert;
 use super::error::{BadRequest, GatewayError};
-use crate::convert::json::json_optional_bool;
 use crate::proto::laurus::v1;
 
 /// `POST /v1/index` — Creates a new index.
@@ -16,18 +15,12 @@ pub async fn create(
     State(mut state): State<GatewayState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    let schema_json = body
-        .get("schema")
-        .ok_or_else(|| BadRequest("missing \"schema\" key".to_string()).into_response())?;
-
-    let schema =
-        convert::json_to_proto_schema(schema_json).map_err(|e| BadRequest(e).into_response())?;
+    let request = convert::json_to_proto_create_index_request(&body)
+        .map_err(|e| BadRequest(e).into_response())?;
 
     state
         .index_client
-        .create_index(v1::CreateIndexRequest {
-            schema: Some(schema),
-        })
+        .create_index(request)
         .await
         .map_err(|s| GatewayError(s).into_response())?;
 
@@ -86,25 +79,12 @@ pub async fn add_field(
     State(mut state): State<GatewayState>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    let name = body
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| BadRequest("missing or invalid \"name\" key".to_string()).into_response())?
-        .to_string();
-
-    let field_option_json = body
-        .get("field_option")
-        .ok_or_else(|| BadRequest("missing \"field_option\" key".to_string()).into_response())?;
-
-    let field_option = convert::json_to_proto_field_option(field_option_json)
+    let request = convert::json_to_proto_add_field_request(&body)
         .map_err(|e| BadRequest(e).into_response())?;
 
     let response = state
         .index_client
-        .add_field(v1::AddFieldRequest {
-            name,
-            field_option: Some(field_option),
-        })
+        .add_field(request)
         .await
         .map_err(|s| GatewayError(s).into_response())?;
 
@@ -146,34 +126,12 @@ pub async fn update_field(
     axum::extract::Path(name): axum::extract::Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Response> {
-    // A body that is not an object has no `field_option` either.
-    let missing_field_option =
-        || BadRequest("missing \"field_option\" key".to_string()).into_response();
-    let body = body.as_object().ok_or_else(missing_field_option)?;
-    let field_option_json = body.get("field_option").ok_or_else(missing_field_option)?;
-
-    let field_option = convert::json_to_proto_field_option(field_option_json)
+    let request = convert::json_to_proto_update_field_request(name, &body)
         .map_err(|e| BadRequest(e).into_response())?;
-
-    // Both default to `false`, matching `UpdateFieldOptions::default()`.
-    // Anything but `true`, `false` or `null` is a 400 rather than `false`,
-    // so `"dry_run": "true"` cannot apply the change (Issue #1511).
-    let flag = |key: &str| {
-        json_optional_bool(body, key)
-            .map(Option::unwrap_or_default)
-            .map_err(|e| BadRequest(e).into_response())
-    };
-    let reindex = flag("reindex")?;
-    let dry_run = flag("dry_run")?;
 
     let response = state
         .index_client
-        .update_field(v1::UpdateFieldRequest {
-            name,
-            field_option: Some(field_option),
-            reindex,
-            dry_run,
-        })
+        .update_field(request)
         .await
         .map_err(|s| GatewayError(s).into_response())?;
 

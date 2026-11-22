@@ -194,3 +194,87 @@ pub(crate) fn json_to_string_array(value: &Value) -> Option<Vec<String>> {
         .map(|item| item.as_str().map(str::to_string))
         .collect()
 }
+
+/// Reject a key of `obj` that is not one of `known`, the keys its reader
+/// reads (Issue #1706).
+///
+/// Each reader of an object with fixed keys calls this first, with the keys
+/// it reads, so a misspelled key such as `"indexd"` or `"dry_rn"` is an
+/// error instead of being dropped, which left the setting at its default.
+/// A key whose value is `null` is not reported, since `null` is the same as
+/// omitting a key for every reader here; it sets nothing.
+///
+/// `what` names the object in the error (`"the text option"`). The keys of
+/// a [`Map`] iterate in name order, so the key reported is the first
+/// unknown one by name.
+///
+/// # Errors
+///
+/// Returns `unknown key "<key>" in <what> (expected <known>)` for the first
+/// unknown key.
+pub(crate) fn reject_unknown_keys(
+    obj: &Map<String, Value>,
+    what: &str,
+    known: &[&str],
+) -> Result<(), String> {
+    match obj
+        .iter()
+        .find(|(key, value)| !value.is_null() && !known.contains(&key.as_str()))
+    {
+        Some((key, _)) => Err(format!(
+            "unknown key \"{key}\" in {what} (expected {})",
+            quoted_choices(known)
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `"a"`, `"a" or "b"`, or `"a", "b", or "c"`, as the gateway's other
+/// errors list the values they expect.
+fn quoted_choices(choices: &[&str]) -> String {
+    let quoted: Vec<String> = choices.iter().map(|c| format!("\"{c}\"")).collect();
+    match quoted.as_slice() {
+        [] => "no keys".to_string(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} or {second}"),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    /// Issue #1706: an unknown key is named, with the keys the reader takes.
+    #[test]
+    fn reject_unknown_keys_names_the_key_and_the_known_ones() {
+        let obj = object(json!({"indexed": true, "indexd": false}));
+        let err = reject_unknown_keys(&obj, "the text option", &["indexed", "stored"]).unwrap_err();
+        assert_eq!(
+            err,
+            "unknown key \"indexd\" in the text option (expected \"indexed\" or \"stored\")"
+        );
+
+        let err =
+            reject_unknown_keys(&object(json!({"x": 1})), "it", &["a", "b", "c"]).unwrap_err();
+        assert_eq!(
+            err,
+            "unknown key \"x\" in it (expected \"a\", \"b\", or \"c\")"
+        );
+    }
+
+    /// Issue #1706: the known keys pass, and so does an unknown key set to
+    /// `null`, which is the same as omitting it.
+    #[test]
+    fn reject_unknown_keys_passes_known_keys_and_null() {
+        let known = ["indexed", "stored"];
+        assert!(reject_unknown_keys(&object(json!({})), "it", &known).is_ok());
+        assert!(reject_unknown_keys(&object(json!({"indexed": true})), "it", &known).is_ok());
+        assert!(reject_unknown_keys(&object(json!({"indexd": null})), "it", &known).is_ok());
+    }
+}
