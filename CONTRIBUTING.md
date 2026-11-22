@@ -175,6 +175,10 @@ The types a schema is read into (`Schema`, the field options, the analyzer and e
 - Removing or renaming a key keeps the old one readable (`#[serde(alias = "...")]` or a migration): a persisted `schema.toml` with it would otherwise no longer open.
 - A new optional key is left out of the serialized schema while it has its default value (`skip_serializing_if`), so that an older laurus can still open an index that does not use the new setting.
 
+### Server Config Types
+
+The types the server's config file is read into (`laurus-server/src/config.rs`) set `#[serde(deny_unknown_fields)]` too, so a misspelled key stops the server from starting, with an error that names the file and the key, instead of leaving the setting at its default (Issue #1708). Removing or renaming a key keeps the old one readable (`#[serde(alias = "...")]`, or a field that is still read); otherwise a config file that has it no longer starts the server.
+
 ## Module Organization
 
 Each major component uses a two-level module pattern:

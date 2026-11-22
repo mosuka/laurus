@@ -56,6 +56,22 @@ interval_ms = 1000             # "interval" のみ; 最低 N ミリ秒ごとに 
 
 ログの詳細度は設定ファイルではなく、`RUST_LOG` 環境変数で制御します（デフォルト: `info`）。
 
+### 知らないキー
+
+どのテーブルも、[フィールドリファレンス](#フィールドリファレンス) がそのテーブルに挙げるキーだけを取り、ファイルにほかのテーブルはありません。挙げていないキー、たとえば `[server]` の下に書き間違えた `prot` や、`[server]` の外に書いた `port` は、黙ってデフォルト値のままにされるのではなく、サーバーが起動しないエラーになります。エラーはファイルとキーを名指しします（Issue #1708）。たとえば `[server]` の下に `prot = 50051` と書くと、次のようになります。
+
+```text
+$ laurus serve --config config.toml
+Error: Failed to parse config file: config.toml
+
+Caused by:
+    TOML parse error at line 3, column 1
+      |
+    3 | prot = 50051
+      | ^^^^
+    unknown field `prot`, expected one of `host`, `port`, `http_port`, `max_result_window`
+```
+
 ### フィールドリファレンス
 
 #### `[server]` セクション
