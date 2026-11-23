@@ -18,25 +18,66 @@ use crate::lexical::query::scorer::Scorer;
 use crate::lexical::reader::{LexicalIndexReader, scan_doc_ids};
 
 /// A 2D geographical bounding box, expressed as the south-west `min` corner
-/// and the north-east `max` corner of an axis-aligned lat/lon rectangle.
+/// and the north-east `max` corner of a rectangle of latitudes and
+/// longitudes.
 ///
-/// Invariant: `min.lat <= max.lat` and `min.lon <= max.lon`. The constructor
-/// validates this and returns `LaurusError::other` for inverted boxes. The
-/// previous `top_left` / `bottom_right` representation was removed in #297;
-/// `min` / `max` matches the convention used by the redesigned BKD AABB,
-/// which makes `GeoBoundingBox` ↔ AABB conversion a direct copy.
+/// The latitudes are the closed interval `[min.lat, max.lat]`; the
+/// constructor returns `LaurusError::other` when `min.lat > max.lat`.
+///
+/// The longitudes run eastward from `min.lon` to `max.lon`. When
+/// `min.lon > max.lon` the box crosses the antimeridian (±180°) and covers
+/// `[min.lon, 180]` and `[-180, max.lon]`, the convention of GeoJSON
+/// ([RFC 7946 section 5.2](https://datatracker.ietf.org/doc/html/rfc7946#section-5.2)),
+/// so a map viewport over the Pacific is one box (Issue #1595). An edge on
+/// exactly ±180° covers that meridian whichever sign a point is stored
+/// with, as a circle in [`GeoDistanceQuery`] does.
+///
+/// The previous `top_left` / `bottom_right` representation was removed in
+/// #297.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeoBoundingBox {
-    /// South-west corner: minimum latitude and minimum longitude.
+    /// South-west corner: minimum latitude and the western edge's longitude.
     pub min: GeoPoint,
-    /// North-east corner: maximum latitude and maximum longitude.
+    /// North-east corner: maximum latitude and the eastern edge's longitude.
     pub max: GeoPoint,
+}
+
+/// The longitudes of a [`GeoBoundingBox`], as one or two disjoint closed
+/// ranges, each within `[-180, 180]`. Returned by
+/// [`GeoBoundingBox::lon_ranges`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LonRanges {
+    /// The `len` ranges, as `(min_lon, max_lon)`.
+    ranges: [(f64, f64); 2],
+    len: usize,
+}
+
+impl LonRanges {
+    fn one(range: (f64, f64)) -> Self {
+        LonRanges {
+            ranges: [range, range],
+            len: 1,
+        }
+    }
+
+    fn two(first: (f64, f64), second: (f64, f64)) -> Self {
+        LonRanges {
+            ranges: [first, second],
+            len: 2,
+        }
+    }
+
+    /// The ranges, the one that starts at the box's western edge first.
+    fn iter(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.ranges[..self.len].iter().copied()
+    }
 }
 
 impl GeoBoundingBox {
     /// Create a new bounding box from its south-west and north-east corners.
     ///
-    /// Errors if `min.lat > max.lat` or `min.lon > max.lon`.
+    /// Errors if `min.lat > max.lat`. `min.lon > max.lon` is a box that
+    /// crosses the antimeridian; see [`GeoBoundingBox`].
     pub fn new(min: GeoPoint, max: GeoPoint) -> Result<Self> {
         if min.lat > max.lat {
             return Err(crate::error::LaurusError::other(format!(
@@ -44,33 +85,62 @@ impl GeoBoundingBox {
                 min.lat, max.lat
             )));
         }
-        if min.lon > max.lon {
-            return Err(crate::error::LaurusError::other(format!(
-                "min longitude {} must be <= max longitude {}",
-                min.lon, max.lon
-            )));
-        }
         Ok(GeoBoundingBox { min, max })
     }
 
-    /// Whether `point` lies inside the closed rectangle `[min, max]`.
+    /// The box's longitudes as closed ranges: `[min.lon, max.lon]`, or
+    /// `[min.lon, 180]` and `[-180, max.lon]` when the box crosses the
+    /// antimeridian. An edge on ±180° also covers the other sign of the
+    /// same meridian (a point can be stored with either), unless the box
+    /// is the whole circle `[-180, 180]`.
+    fn lon_ranges(&self) -> LonRanges {
+        let (min, max) = (self.min.lon, self.max.lon);
+        if min > max {
+            // Holds both signs of ±180 already.
+            LonRanges::two((min, 180.0), (-180.0, max))
+        } else if max >= 180.0 && min > -180.0 {
+            LonRanges::two((min, max), (-180.0, -180.0))
+        } else if min <= -180.0 && max < 180.0 {
+            LonRanges::two((min, max), (180.0, 180.0))
+        } else {
+            LonRanges::one((min, max))
+        }
+    }
+
+    /// Whether `point` lies inside the box, edges included.
     pub fn contains(&self, point: &GeoPoint) -> bool {
-        point.within_bounds(self.min.lat, self.max.lat, self.min.lon, self.max.lon)
+        self.lon_ranges().iter().any(|(min_lon, max_lon)| {
+            point.within_bounds(self.min.lat, self.max.lat, min_lon, max_lon)
+        })
     }
 
     /// Center of the bounding box, clamped to the valid lat/lon ranges as
     /// a defensive measure (a malformed box could in theory carry
-    /// out-of-range corners).
+    /// out-of-range corners). For a box that crosses the antimeridian the
+    /// longitude is half the width east of the south-west corner, past
+    /// ±180° if need be, so the center is inside the box.
     pub fn center(&self) -> GeoPoint {
         let center_lat = ((self.min.lat + self.max.lat) / 2.0).clamp(-90.0, 90.0);
-        let center_lon = ((self.min.lon + self.max.lon) / 2.0).clamp(-180.0, 180.0);
+        let mut center_lon = if self.min.lon > self.max.lon {
+            self.min.lon + self.dimensions().0 / 2.0
+        } else {
+            (self.min.lon + self.max.lon) / 2.0
+        };
+        if center_lon > 180.0 {
+            center_lon -= 360.0;
+        }
         // Clamped to valid ranges, so the infallible constructor is fine.
-        GeoPoint::new(center_lat, center_lon)
+        GeoPoint::new(center_lat, center_lon.clamp(-180.0, 180.0))
     }
 
-    /// Width (lon span) and height (lat span) in degrees.
+    /// Width (lon span) and height (lat span) in degrees. The width of a
+    /// box that crosses the antimeridian is the arc from its western edge
+    /// eastward to its eastern edge.
     pub fn dimensions(&self) -> (f64, f64) {
-        let width = self.max.lon - self.min.lon;
+        let mut width = self.max.lon - self.min.lon;
+        if width < 0.0 {
+            width += 360.0;
+        }
         let height = self.max.lat - self.min.lat;
         (width, height)
     }
@@ -622,7 +692,9 @@ impl Query for GeoDistanceQuery {
 /// A geographical bounding box query.
 ///
 /// This query matches documents with coordinates within a rectangular bounding box
-/// defined by top-left and bottom-right corners.
+/// defined by its south-west and north-east corners, edges included. A box with
+/// `min.lon > max.lon` crosses the antimeridian, and an edge on ±180° also covers
+/// points stored with the other sign; see [`GeoBoundingBox`].
 ///
 /// # Scoring Behavior
 ///
@@ -660,15 +732,17 @@ impl GeoBoundingBoxQuery {
     ///
     /// Validates that each corner falls within the latitude / longitude
     /// bounds (via [`GeoPoint::try_new`]) and that `min_lat <= max_lat`
-    /// / `min_lon <= max_lon` (via [`GeoBoundingBox::new`]).
+    /// (via [`GeoBoundingBox::new`]). `min_lon > max_lon` is a box that
+    /// crosses the antimeridian.
     ///
     /// # Arguments
     ///
     /// * `field` - The field containing geographical coordinates.
     /// * `min_lat` - Minimum (south) latitude.
-    /// * `min_lon` - Minimum (west) longitude.
+    /// * `min_lon` - Western edge: the longitude the box starts at.
     /// * `max_lat` - Maximum (north) latitude.
-    /// * `max_lon` - Maximum (east) longitude.
+    /// * `max_lon` - Eastern edge: the longitude the box ends at, going east
+    ///   from `min_lon`.
     ///
     /// # Example
     ///
@@ -677,6 +751,11 @@ impl GeoBoundingBoxQuery {
     ///
     /// let query = GeoBoundingBoxQuery::within_bounding_box(
     ///     "location", 40.0, -75.0, 41.0, -74.0,
+    /// ).unwrap();
+    ///
+    /// // Over the Pacific, from 175 degrees east to 175 degrees west.
+    /// let across = GeoBoundingBoxQuery::within_bounding_box(
+    ///     "location", -20.0, 175.0, -15.0, -175.0,
     /// ).unwrap();
     /// ```
     pub fn within_bounding_box<F: Into<String>>(
@@ -722,12 +801,15 @@ impl GeoBoundingBoxQuery {
                 let center = self.bounding_box.center();
                 let distance = center.distance_to(&point);
 
-                // Simple scoring based on position within bounding box
-                let relevance_score = if distance == 0.0 {
+                // Simple scoring based on position within bounding box.
+                // Every point of a box with zero size is its center, even
+                // when rounding makes the distance nonzero (±180° stored
+                // with the other sign).
+                let max_distance = self.bounding_box.max_distance_from_center();
+                let relevance_score = if distance == 0.0 || max_distance == 0.0 {
                     1.0
                 } else {
                     // Closer to center gets higher score
-                    let max_distance = self.bounding_box.max_distance_from_center();
                     ((max_distance - distance) / max_distance).max(0.0) as f32
                 };
 
@@ -770,16 +852,18 @@ impl GeoBoundingBoxQuery {
         // Try to use BKD tree for efficient candidate retrieval. The
         // coordinates come straight from the BKD leaves via the visitor
         // — no stored-document probes, so `indexed = true, stored =
-        // false` geo fields work too (#1000).
+        // false` geo fields work too (#1000). One traversal per longitude
+        // range: two when the box crosses the antimeridian or has an edge
+        // on it (#1595).
         if let Some(bkd_tree) = reader.get_bkd_tree(&self.field)? {
-            let mut visitor = GeoBoxPointsVisitor::new(
-                self.bounding_box.min.lat,
-                self.bounding_box.min.lon,
-                self.bounding_box.max.lat,
-                self.bounding_box.max.lon,
-            );
-            bkd_tree.intersect(&mut visitor)?;
-            return Ok(visitor.into_candidates());
+            let (min_lat, max_lat) = (self.bounding_box.min.lat, self.bounding_box.max.lat);
+            for (min_lon, max_lon) in self.bounding_box.lon_ranges().iter() {
+                let mut visitor = GeoBoxPointsVisitor::new(min_lat, min_lon, max_lat, max_lon);
+                bkd_tree.intersect(&mut visitor)?;
+                candidates.extend(visitor.into_candidates());
+            }
+            candidates.sort_by_key(|(doc_id, _)| *doc_id);
+            return Ok(candidates);
         }
 
         // Fallback: scan the stored documents present in this reader
@@ -821,7 +905,12 @@ impl GeoBoundingBoxQuery {
                 let lon_ratio = j as f64 / (grid_size - 1) as f64;
 
                 let lat = self.bounding_box.min.lat + lat_ratio * height;
-                let lon = self.bounding_box.min.lon + lon_ratio * width;
+                // Past +180 a box that crosses the antimeridian continues
+                // from -180.
+                let mut lon = self.bounding_box.min.lon + lon_ratio * width;
+                if lon > 180.0 {
+                    lon -= 360.0;
+                }
 
                 if let Ok(point) = GeoPoint::try_new(lat, lon) {
                     let doc_id = (i * grid_size + j + 2000) as u64;
@@ -972,8 +1061,10 @@ impl Query for GeoBoundingBoxQuery {
     }
 
     fn is_empty(&self, _reader: &dyn LexicalIndexReader) -> Result<bool> {
-        let (width, height) = self.bounding_box.dimensions();
-        Ok(width <= 0.0 || height <= 0.0)
+        // A box the constructor accepts is never empty: one with zero width
+        // or height matches the points on it, as `GeoBoundingBox::contains`
+        // says (#1595). The search skips a query that is empty.
+        Ok(false)
     }
 
     fn cost(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
@@ -1227,6 +1318,91 @@ mod tests {
         let center = bbox.center();
         assert_eq!(center.lat, 40.5);
         assert_eq!(center.lon, -74.5);
+    }
+
+    /// #1595: the longitudes of a box as closed ranges: its own, two for a
+    /// box that crosses the antimeridian, and the other sign of ±180° for an
+    /// edge that lies on it (not for the whole circle).
+    #[test]
+    fn test_geo_bounding_box_lon_ranges() {
+        let ranges = |min_lon: f64, max_lon: f64| {
+            GeoBoundingBox::new(GeoPoint::new(0.0, min_lon), GeoPoint::new(1.0, max_lon))
+                .unwrap()
+                .lon_ranges()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(-75.0, -74.0), [(-75.0, -74.0)]);
+        assert_eq!(ranges(175.0, -175.0), [(175.0, 180.0), (-180.0, -175.0)]);
+        assert_eq!(ranges(175.0, 180.0), [(175.0, 180.0), (-180.0, -180.0)]);
+        assert_eq!(ranges(-180.0, -175.0), [(-180.0, -175.0), (180.0, 180.0)]);
+        assert_eq!(ranges(-180.0, 180.0), [(-180.0, 180.0)]);
+        // Zero width on the antimeridian, and the arc that starts and ends
+        // on it.
+        assert_eq!(ranges(180.0, 180.0), [(180.0, 180.0), (-180.0, -180.0)]);
+        assert_eq!(ranges(-180.0, -180.0), [(-180.0, -180.0), (180.0, 180.0)]);
+        assert_eq!(ranges(180.0, -180.0), [(180.0, 180.0), (-180.0, -180.0)]);
+    }
+
+    /// #1595: the center of a box that crosses the antimeridian is the
+    /// midpoint of its arc, inside the box, and its width is the arc.
+    #[test]
+    fn test_geo_bounding_box_center_and_dimensions_across_the_antimeridian() {
+        for (min_lon, max_lon, width) in [
+            (175.0, -175.0, 10.0),
+            (170.0, -100.0, 90.0),
+            (100.0, -100.0, 160.0),
+            (0.5, -0.5, 359.0),
+            (180.0, -175.0, 5.0),
+            (175.0, -180.0, 5.0),
+            // Boxes that do not cross it keep their values.
+            (-75.0, -74.0, 1.0),
+            (139.0, 139.0, 0.0),
+        ] {
+            let bbox =
+                GeoBoundingBox::new(GeoPoint::new(-20.0, min_lon), GeoPoint::new(-15.0, max_lon))
+                    .unwrap();
+            let (got_width, height) = bbox.dimensions();
+            assert!(
+                (got_width - width).abs() < 1e-9,
+                "width of [{min_lon}, {max_lon}]: {got_width}"
+            );
+            assert_eq!(height, 5.0);
+
+            let center = bbox.center();
+            assert!(
+                bbox.contains(&center),
+                "center {center:?} of [{min_lon}, {max_lon}] must be inside it"
+            );
+            // Half the arc east of the western edge.
+            let east_of_min = (center.lon - min_lon).rem_euclid(360.0);
+            assert!(
+                (east_of_min - width / 2.0).abs() < 1e-9,
+                "center {center:?} of [{min_lon}, {max_lon}]"
+            );
+            let max_distance = bbox.max_distance_from_center();
+            assert!(max_distance > 0.0 && max_distance <= std::f64::consts::PI * 6_371_000.0);
+        }
+    }
+
+    /// #1595: no box the constructor accepts is empty, not even one with
+    /// zero width, which the search used to skip.
+    #[test]
+    fn test_geo_bounding_box_query_is_never_empty() {
+        let reader = BkdBackedReader::new(Vec::new());
+        for (min_lat, min_lon, max_lat, max_lon) in [
+            (40.0, -75.0, 41.0, -74.0),
+            (-20.0, 175.0, -15.0, -175.0),
+            (30.0, 139.0, 40.0, 139.0),
+            (35.0, 130.0, 35.0, 150.0),
+            (35.0, 139.0, 35.0, 139.0),
+        ] {
+            let query = GeoBoundingBoxQuery::within_bounding_box(
+                "location", min_lat, min_lon, max_lat, max_lon,
+            )
+            .unwrap();
+            assert!(!query.is_empty(&reader).unwrap());
+        }
     }
 
     #[test]

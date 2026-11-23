@@ -249,8 +249,13 @@ documents actually present in that segment.
 lat/lon extent of its spherical cap before the haversine test, so a circle
 that crosses the antimeridian (±180° longitude), contains a pole, or is
 large at high latitude still matches every document within the radius.
-`GeoBoundingBoxQuery` is a plain rectangle in `[-90, 90] × [-180, 180]`;
-a box that crosses the antimeridian cannot be expressed yet (#1595).
+`GeoBoundingBoxQuery` is a rectangle of latitudes and longitudes, edges
+included. With `min_lon > max_lon` the box crosses the antimeridian (±180°
+longitude), as in GeoJSON (RFC 7946): `within_bounding_box("location", -20.0,
+175.0, -15.0, -175.0)` covers 175° east to 175° west. An edge on exactly ±180°
+also matches points stored with the other sign, which is the same meridian,
+and a box with zero width or height matches the points on its line or point.
+`min_lat > max_lat` is an error.
 
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 

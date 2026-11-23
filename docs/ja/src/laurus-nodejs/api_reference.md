@@ -454,6 +454,10 @@ GeoBoundingBoxQuery.withinBoundingBox(
 
 地理的バウンディングボックス検索。
 
+`minLon > maxLon` のときは、ボックスが日付変更線（±180°）をまたぎます。`minLon` から東へ、
+±180° を通って `maxLon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
+±180° のときは、もう一方の符号で保存された点にもマッチします。
+
 ### Geo3dDistanceQuery
 
 ```typescript

@@ -387,6 +387,10 @@ Laurus::GeoBoundingBoxQuery.within_bounding_box(
 Geo bounding-box search. Returns documents whose `(lat, lon)` coordinate lies
 inside the axis-aligned `[min_lat, max_lat] × [min_lon, max_lon]` rectangle.
 
+With `min_lon > max_lon` the box crosses the antimeridian (±180°): it runs east
+from `min_lon` through ±180° to `max_lon`, as in GeoJSON (RFC 7946). An edge on
+exactly ±180° also matches points stored with the other sign.
+
 ### Geo3dDistanceQuery
 
 ```ruby

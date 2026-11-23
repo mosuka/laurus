@@ -460,6 +460,10 @@ GeoBoundingBoxQuery.withinBoundingBox(
 
 Geographic bounding-box search.
 
+With `minLon > maxLon` the box crosses the antimeridian (±180°): it runs east
+from `minLon` through ±180° to `maxLon`, as in GeoJSON (RFC 7946). An edge on
+exactly ±180° also matches points stored with the other sign.
+
 ### Geo3dDistanceQuery
 
 ```typescript

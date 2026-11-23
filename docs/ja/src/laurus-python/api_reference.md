@@ -437,6 +437,10 @@ GeoBoundingBoxQuery.within_bounding_box(
 地理的範囲（バウンディングボックス）検索。軸並行 `[min_lat, max_lat] ×
 [min_lon, max_lon]` 内の `(lat, lon)` 座標を持つドキュメントを返します。
 
+`min_lon > max_lon` のときは、ボックスが日付変更線（±180°）をまたぎます。`min_lon` から東へ、
+±180° を通って `max_lon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
+±180° のときは、もう一方の符号で保存された点にもマッチします。
+
 ### Geo3dDistanceQuery
 
 ```python
