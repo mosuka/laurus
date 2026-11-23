@@ -2315,9 +2315,25 @@ mod tests {
     }
 
     #[test]
+    fn test_geo_bbox_crosses_the_antimeridian() {
+        // min_lon > max_lon is a box that crosses the antimeridian (#1595).
+        let parser = create_test_parser().with_default_field("content");
+        let query = parser
+            .parse("location:geo_bbox(-20, 175, -15, -175)")
+            .unwrap();
+        let bbox = query
+            .as_any()
+            .downcast_ref::<GeoBoundingBoxQuery>()
+            .expect("a geo_bbox builds a GeoBoundingBoxQuery")
+            .bounding_box();
+        assert_eq!((bbox.min.lat, bbox.min.lon), (-20.0, 175.0));
+        assert_eq!((bbox.max.lat, bbox.max.lon), (-15.0, -175.0));
+    }
+
+    #[test]
     fn test_geo_bbox_inverted_rejected() {
         // The pest grammar accepts the syntactic form but the
-        // GeoBoundingBox constructor rejects min > max.
+        // GeoBoundingBox constructor rejects min_lat > max_lat.
         let parser = create_test_parser().with_default_field("content");
         let err = parser
             .parse("location:geo_bbox(50.0, 0.0, 40.0, 10.0)")

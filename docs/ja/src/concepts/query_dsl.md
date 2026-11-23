@@ -176,7 +176,7 @@ location:geo_bbox(min_lat, min_lon, max_lat, max_lon)
 | 形式 | 動作 |
 | :--- | :--- |
 | `geo_distance(lat, lon, distance_m)` | 中心 `(lat, lon)` から `distance_m` メートル以内の格納済み座標を返す |
-| `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | 軸並行緯度・経度範囲に含まれる格納済み座標を返す |
+| `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | 緯度・経度の矩形（端を含む）に含まれる格納済み座標を返す。`min_lon > max_lon` のときはボックスが日付変更線（±180°）をまたぐ（GeoJSON と同じ）。端がちょうど ±180° のときは、どちらの符号で保存された点にもマッチする |
 
 例：
 
@@ -186,6 +186,9 @@ location:geo_distance(35.6895, 139.6917, 10000)
 
 # 軸並行緯度・経度範囲
 location:geo_bbox(35.0, 139.0, 36.0, 140.0)
+
+# 日付変更線をまたぐボックス: 東経 175 度から西経 175 度まで
+location:geo_bbox(-20.0, 175.0, -15.0, -175.0)
 ```
 
 > クエリ対象フィールドはスキーマで `Geo` フィールドとして宣言されている必要が

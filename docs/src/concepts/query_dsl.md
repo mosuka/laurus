@@ -191,7 +191,7 @@ location:geo_bbox(min_lat, min_lon, max_lat, max_lon)
 | Form | Behaviour |
 | :--- | :--- |
 | `geo_distance(lat, lon, distance_m)` | All docs whose stored `(lat, lon)` lies within `distance_m` metres of the given centre. |
-| `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | All docs whose stored `(lat, lon)` lies inside the axis-aligned latitude / longitude rectangle. |
+| `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | All docs whose stored `(lat, lon)` lies inside the latitude / longitude rectangle, edges included. With `min_lon > max_lon` the box crosses the antimeridian (±180°), as in GeoJSON; an edge on exactly ±180° matches points stored with either sign. |
 
 Examples:
 
@@ -201,6 +201,9 @@ location:geo_distance(35.6895, 139.6917, 10000)
 
 # Inside an axis-aligned lat/lon bounding box
 location:geo_bbox(35.0, 139.0, 36.0, 140.0)
+
+# Across the antimeridian: 175 degrees east to 175 degrees west
+location:geo_bbox(-20.0, 175.0, -15.0, -175.0)
 ```
 
 > The query field must be declared as a `Geo` field in the schema. Latitudes

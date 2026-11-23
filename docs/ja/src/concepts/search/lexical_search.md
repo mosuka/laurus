@@ -246,9 +246,12 @@ BKD tree があればそれを使用し、座標は tree 自体から直接読�
 `GeoDistanceQuery` は球面上で正確に動作します。haversine による判定の前に、
 円を球冠（spherical cap）の緯度・経度範囲で囲い込むため、日付変更線
 （経度 ±180°）をまたぐ円、極を含む円、高緯度の大きな円でも、半径内の
-ドキュメントをすべてマッチします。`GeoBoundingBoxQuery` は
-`[-90, 90] × [-180, 180]` 内の単純な矩形で、日付変更線をまたぐボックスは
-まだ表現できません（#1595）。
+ドキュメントをすべてマッチします。`GeoBoundingBoxQuery` は、端を含む緯度・経度の
+矩形です。`min_lon > max_lon` のときは、ボックスが日付変更線（経度 ±180°）を
+またぎます（GeoJSON、RFC 7946 と同じ規約）。`within_bounding_box("location", -20.0,
+175.0, -15.0, -175.0)` は、東経 175° から西経 175° までを覆います。端がちょうど
+±180° のときは、もう一方の符号で保存された点（同じ経線）にもマッチし、幅や高さが
+0 のボックスは、その線や点の上の点にマッチします。`min_lat > max_lat` はエラーです。
 
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 
