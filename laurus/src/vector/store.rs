@@ -822,7 +822,8 @@ impl VectorStore {
                     Err(e) => {
                         log::warn!(
                             "vector commit succeeded, but the automatic merge after it failed; \
-                             a merge that published nothing is retried on the next commit: {e}"
+                             a merge that published nothing is retried by the next commit \
+                             with something to commit: {e}"
                         );
                         // A compaction that failed partway may already have
                         // rewritten the index and cleared the deletion

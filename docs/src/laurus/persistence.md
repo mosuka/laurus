@@ -169,7 +169,7 @@ engine.put_documents(one_thousand_docs).await?;
 | :--- | :--- |
 | `Manual` (default) | Never auto-commits; you drive every `commit()`. Identical to the historical behavior. |
 | `EveryDocs(n)` | Runs the commit ladder after every `n` applied documents, across the singular and batch APIs. `EveryDocs(0)` disables auto-commit (same as `Manual`). |
-| `Interval(Duration)` | Runs the commit ladder at least every `Duration` via a background timer, so a trailing partial batch is committed even while ingestion is idle. `Interval(Duration::ZERO)` disables auto-commit (same as `Manual`) and starts no timer. **Native targets only** — a no-op on `wasm32` (no background threads), like a non-zero `WalSyncPolicy::Group` `max_interval`. |
+| `Interval(Duration)` | Runs the commit ladder at least every `Duration` via a background timer, so a trailing partial batch is committed even while ingestion is idle. Once that is committed, a tick finds [nothing to commit](#a-commit-with-nothing-to-commit) and does nothing, so an idle engine does no I/O however short the interval. `Interval(Duration::ZERO)` disables auto-commit (same as `Manual`) and starts no timer. **Native targets only** — a no-op on `wasm32` (no background threads), like a non-zero `WalSyncPolicy::Group` `max_interval`. |
 
 Key semantics:
 
@@ -360,6 +360,25 @@ covers it. A write that never finishes (it failed or panicked, which also
 stops writes) holds the watermark below its record until the index
 is reopened (Issue #1499). When nothing races the commit (the common case), the
 snapshot covers the whole WAL and step 5 empties the file exactly as before.
+
+### A commit with nothing to commit
+
+A commit with nothing to commit does nothing (Issue #1509). When no write
+finished applying since the last successful commit, and the watermark has not
+moved since then, `commit()` returns at once: it does no I/O, and the stores
+keep their cached searchers. Lucene's `IndexWriter.commit` does the same when
+nothing changed since the last commit. Both values matter: a write that
+finishes while a commit takes its snapshot can count as finished while that
+commit keeps its record, and only the moved watermark tells the next commit to
+truncate it.
+
+- `CommitPolicy::Interval`'s ticks while ingestion is idle are such commits, so
+  an idle engine does no I/O however short the interval.
+- Such a commit neither continues an automatic segment merge or compaction nor
+  retries one that failed (Issue #1500). The next commit that has something to
+  commit does.
+- A failed commit does not count as the last one, so the next commit runs even
+  with no write in between.
 
 Recovery replays the WAL on the next `build()`, skipping records at or below each
 store's `last_wal_seq`. Replay is **idempotent** — it re-applies each record

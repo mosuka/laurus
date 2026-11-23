@@ -411,6 +411,13 @@ impl LexicalStore {
         }
     }
 
+    /// Whether a searcher is cached, for the engine's tests that a commit
+    /// with nothing to commit keeps it (Issue #1509).
+    #[cfg(test)]
+    pub(crate) fn has_cached_searcher(&self) -> bool {
+        self.searcher_cache.read().is_some()
+    }
+
     /// The body of [`Self::commit`] and [`Self::commit_through`].
     fn commit_with_checkpoint(&self, wal_seq: Option<u64>) -> Result<()> {
         // Hold the writer-cache lock across the whole ladder (Issue #864): a
@@ -463,7 +470,7 @@ impl LexicalStore {
         if let Err(e) = self.index.maybe_merge() {
             log::warn!(
                 "lexical commit succeeded, but the automatic merge after it failed \
-                 and is retried on the next commit: {e}"
+                 and is retried by the next commit with something to commit: {e}"
             );
         }
         // Sync again afterwards so any merge output is durable/visible.
