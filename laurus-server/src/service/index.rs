@@ -107,11 +107,25 @@ impl IndexServiceTrait for IndexService {
     }
 
     /// Returns the schema definition of the current index.
+    /// Returns the schema of the open index, read from its `schema.toml`.
+    ///
+    /// With no index open it answers `FAILED_PRECONDITION`, as the other
+    /// calls that need an index do, also when another process has since
+    /// written a `schema.toml` into the data directory (Issue #1724). The
+    /// read lock is held while the file is read, so that a `CreateIndex`,
+    /// which takes the write lock, has either not begun or finished; a field
+    /// change replaces the file atomically (Issue #1587). A `schema.toml`
+    /// the open index can no longer read is `INTERNAL`.
     async fn get_schema(
         &self,
         _request: Request<GetSchemaRequest>,
     ) -> Result<Response<GetSchemaResponse>, Status> {
+        let guard = self.engine.read().await;
+        if guard.is_none() {
+            return Err(Status::failed_precondition("No index is open"));
+        }
         let schema = context::read_schema(&self.data_dir).map_err(error::anyhow_to_status)?;
+        drop(guard);
         let proto_schema = schema_convert::to_proto(&schema);
         Ok(Response::new(GetSchemaResponse {
             schema: Some(proto_schema),
@@ -318,6 +332,60 @@ mod tests {
         let status = service.create_index(create_request()).await.unwrap_err();
 
         assert_eq!(status.code(), tonic::Code::AlreadyExists, "{status:?}");
+    }
+
+    /// Issue #1724: with no index open, `GetSchema` answers as the other
+    /// calls that need an index do, also after another process wrote a
+    /// `schema.toml` into the data directory. It used to answer `INTERNAL`
+    /// with the OS error named twice, and then the other process's schema.
+    #[tokio::test]
+    async fn get_schema_with_no_open_index_is_failed_precondition() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let service = service_without_index(&data_dir);
+        let get_schema = || service.get_schema(Request::new(GetSchemaRequest {}));
+
+        let status = get_schema().await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert_eq!(status.message(), "No index is open");
+
+        // Another process creates an index in the data directory.
+        let engine = context::create_index(
+            &data_dir,
+            &Schema::new(),
+            WalSyncPolicy::PerRecord,
+            CommitPolicy::Manual,
+        )
+        .await
+        .unwrap();
+        drop(engine);
+        assert!(data_dir.join("schema.toml").exists());
+        let status = get_schema().await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert_eq!(status.message(), "No index is open");
+    }
+
+    /// Issue #1724: the schema of the open index is read from its
+    /// `schema.toml`; one it can no longer read is `INTERNAL`, naming the
+    /// file and the OS error once.
+    #[tokio::test]
+    async fn get_schema_of_an_open_index_reads_its_schema_toml() {
+        let (dir, service) = service_with_index("[fields.body.Text]\n").await;
+        assert!(schema_of(&service).await.fields.contains_key("body"));
+
+        let schema_path = dir.path().join("data").join("schema.toml");
+        std::fs::remove_file(&schema_path).unwrap();
+        let status = service
+            .get_schema(Request::new(GetSchemaRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+        let message = status.message();
+        assert!(
+            message.contains(&schema_path.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(message.matches("os error").count(), 1, "{message}");
     }
 
     /// The schema `GetSchema` returns, which is read back from disk.

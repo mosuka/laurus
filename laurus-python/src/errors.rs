@@ -113,7 +113,7 @@ pub fn index_dir_err(err: laurus::index_dir::IndexDirError) -> PyErr {
         IndexDirError::AlreadyExists { .. } | IndexDirError::InUse { .. } => {
             PyRuntimeError::new_err(err.to_string())
         }
-        IndexDirError::Io { path, source } => io_err_with_path(&path, source),
+        IndexDirError::Io { path, error } => io_err_with_path(&path, error),
         IndexDirError::Core(e) => laurus_err(e),
     }
 }

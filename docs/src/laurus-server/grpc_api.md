@@ -290,6 +290,8 @@ rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
 | :--- | :--- | :--- |
 | `schema` | `Schema` | The index schema |
 
+With no index open, `GetSchema` answers `FAILED_PRECONDITION` with `No index is open`, as the other calls that need an index do, also when another process has written a `schema.toml` into the data directory since the server started (Issue #1724). A server older than this fix answered `INTERNAL`, naming the OS error of the missing `schema.toml` twice.
+
 ---
 
 ## DocumentService

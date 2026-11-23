@@ -161,13 +161,18 @@ pub enum IndexDirError {
     },
 
     /// A filesystem operation on `path` failed.
-    #[error("{path}: {source}")]
+    ///
+    /// `Display` includes the I/O error, so it is not also the error's
+    /// [`source`](std::error::Error::source): an error printed with its
+    /// chain (`{:#}` or `{:?}` of an `anyhow::Error`, or the CLI's
+    /// `Caused by:`) would name the OS error twice (Issue #1724).
+    #[error("{path}: {error}")]
     Io {
         /// The path the failing operation was on.
         path: PathBuf,
-        /// The underlying I/O error.
-        #[source]
-        source: std::io::Error,
+        /// The underlying I/O error. Not named `source`, which thiserror
+        /// would take as the error's source.
+        error: std::io::Error,
     },
 
     /// `path` has no `schema.toml`, so it isn't a laurus index directory at
@@ -279,16 +284,16 @@ impl IndexDirClaim {
 
     fn acquire(index_dir: &Path, purpose: ClaimPurpose) -> Result<Self, IndexDirError> {
         let lock_path = index_dir.join(LOCK_FILE);
-        let lock_err = |source| IndexDirError::Io {
+        let lock_err = |error| IndexDirError::Io {
             path: lock_path.clone(),
-            source,
+            error,
         };
         for _ in 0..CLAIM_ATTEMPTS {
             let created_dir = match purpose {
                 ClaimPurpose::Create => {
-                    durable::create_dir_all(index_dir).map_err(|source| IndexDirError::Io {
+                    durable::create_dir_all(index_dir).map_err(|error| IndexDirError::Io {
                         path: index_dir.to_path_buf(),
-                        source,
+                        error,
                     })?
                 }
                 ClaimPurpose::Open => {
@@ -375,13 +380,13 @@ impl IndexDirClaim {
     /// does not declare (Issue #1700).
     pub fn read_schema(&self) -> Result<Schema, IndexDirError> {
         let schema_path = self.index_dir.join(SCHEMA_FILE);
-        let content = durable::read_synced(&schema_path).map_err(|source| IndexDirError::Io {
+        let content = durable::read_synced(&schema_path).map_err(|error| IndexDirError::Io {
             path: schema_path.clone(),
-            source,
+            error,
         })?;
-        durable::sync_dir(&self.index_dir).map_err(|source| IndexDirError::Io {
+        durable::sync_dir(&self.index_dir).map_err(|error| IndexDirError::Io {
             path: self.index_dir.clone(),
-            source,
+            error,
         })?;
         parse_schema_file(&schema_path, &content)
     }
@@ -604,9 +609,9 @@ pub fn write_schema(index_dir: &Path, schema: &Schema) -> Result<(), IndexDirErr
         &index_dir.join(SCHEMA_TMP_FILE),
         toml.as_bytes(),
     )
-    .map_err(|source| IndexDirError::Io {
+    .map_err(|error| IndexDirError::Io {
         path: schema_path,
-        source,
+        error,
     })
 }
 
@@ -625,9 +630,9 @@ pub fn write_schema(index_dir: &Path, schema: &Schema) -> Result<(), IndexDirErr
 /// if it is not a valid schema.
 pub fn read_schema(index_dir: &Path) -> Result<Schema, IndexDirError> {
     let schema_path = index_dir.join(SCHEMA_FILE);
-    let content = std::fs::read_to_string(&schema_path).map_err(|source| IndexDirError::Io {
+    let content = std::fs::read_to_string(&schema_path).map_err(|error| IndexDirError::Io {
         path: schema_path.clone(),
-        source,
+        error,
     })?;
     parse_schema_file(&schema_path, &content)
 }
@@ -1314,6 +1319,27 @@ mod tests {
             std::fs::read_to_string(dir.path().join(SCHEMA_FILE)).unwrap(),
             toml
         );
+    }
+
+    /// Issue #1724: an `IndexDirError::Io` names its path and its OS error
+    /// once, alone and printed with its chain, since `Display` includes the
+    /// OS error and the error has no source. It used to return the
+    /// `io::Error` as its source as well, so `{:#}` and the CLI's
+    /// `Caused by:` named the OS error twice.
+    #[test]
+    fn an_io_error_names_its_os_error_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = read_schema(dir.path()).unwrap_err();
+        assert!(matches!(err, IndexDirError::Io { .. }), "got: {err}");
+        assert!(std::error::Error::source(&err).is_none());
+
+        let alone = err.to_string();
+        let path = dir.path().join(SCHEMA_FILE).display().to_string();
+        assert!(alone.starts_with(&format!("{path}: ")), "{alone}");
+        let chained = anyhow::Error::new(err).context("Failed to read schema file");
+        for printed in [alone, format!("{chained:#}"), format!("{chained:?}")] {
+            assert_eq!(printed.matches("os error").count(), 1, "{printed}");
+        }
     }
 
     /// Issue #1587: a write that fails removes its temporary file and leaves

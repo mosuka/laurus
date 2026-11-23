@@ -1173,4 +1173,17 @@ mod tests {
             "each error must name the file and say why: {failures:#?}"
         );
     }
+
+    /// Issue #1724: with no index, `read_schema` (`get schema`) fails naming
+    /// the file and its OS error once, also in the `Caused by:` list the
+    /// CLI prints, which used to name it twice.
+    #[test]
+    fn read_schema_with_no_index_names_the_os_error_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_schema(dir.path()).unwrap_err();
+        let printed = format!("{err:?}");
+        let schema_path = dir.path().join(SCHEMA_FILE).display().to_string();
+        assert!(printed.contains(&schema_path), "{printed}");
+        assert_eq!(printed.matches("os error").count(), 1, "{printed}");
+    }
 }
