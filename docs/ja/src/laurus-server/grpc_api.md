@@ -203,6 +203,8 @@ rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
 | :--- | :--- | :--- |
 | `schema` | `Schema` | インデックスのスキーマ |
 
+インデックスが開いていないとき、`GetSchema` は、インデックスを必要とするほかの呼び出しと同じく `FAILED_PRECONDITION`（`No index is open`）を返します。サーバーの起動の後に、別のプロセスがデータディレクトリに `schema.toml` を書いた場合も同じです（Issue #1724）。この修正より古いサーバーは `INTERNAL` を返し、無い `schema.toml` の OS のエラーを 2 回重ねていました。
+
 ### `AddField`
 
 稼働中のインデックスにフィールドを動的に追加します。
