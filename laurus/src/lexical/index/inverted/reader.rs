@@ -66,7 +66,7 @@ pub struct InvertedIndexReaderConfig {
 
     /// Maximum number of entries in the snapshot-scoped query / filter result
     /// cache (Issue #578). `0` disables the cache. See
-    /// [`QueryFilterCache`](crate::lexical::index::inverted::query_cache::QueryFilterCache).
+    /// [`QueryFilterCache`].
     pub query_filter_cache_capacity: usize,
 
     /// Analyzer for query term analysis.
@@ -494,7 +494,7 @@ pub(crate) struct SegmentCore {
 ///
 /// Describes the segment as of one snapshot: its deletions are read when the
 /// reader opens and fixed for its life. What the segment's files decide lives
-/// in a shared [`SegmentCore`]. An index hands the same segment reader to
+/// in a shared `SegmentCore`. An index hands the same segment reader to
 /// every reader it builds until the segment's deletions change, and then a
 /// new one over the same core (Issue #1423).
 #[derive(Debug)]
@@ -2253,7 +2253,7 @@ impl InvertedIndexReader {
 
     /// Create a new advanced index reader (schema-less mode).
     ///
-    /// Opens every segment anew; see [`Self::with_segment_cache`] for the
+    /// Opens every segment anew; see `Self::with_segment_cache` for the
     /// reader an index builds after a commit.
     pub fn new(
         segments: Vec<SegmentInfo>,
@@ -2501,8 +2501,8 @@ impl InvertedIndexReader {
     /// segment whose dictionary has it decodes a posting list, which comes
     /// back without deleted documents. A term no segment holds costs one
     /// dictionary probe per segment, except an `_id` the index's
-    /// [`CommittedIdFilter`] has never seen, which costs one filter probe in
-    /// all (see [`Self::with_id_filter`]).
+    /// `CommittedIdFilter` has never seen, which costs one filter probe in
+    /// all (see `Self::with_id_filter`).
     ///
     /// # Arguments
     ///
@@ -3139,7 +3139,7 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
     /// `field`, or every segment that does simply lacks a value for this
     /// particular doc — the two cases are indistinguishable from this
     /// return value alone. Callers that also consult
-    /// [`Self::has_doc_values`] to decide whether to read DocValues at
+    /// `Self::has_doc_values` to decide whether to read DocValues at
     /// all must still treat `Ok(None)` from this method as "fall back to
     /// the stored document", not as "the value is absent" (Issue #1047):
     /// segments can disagree on whether they have the column (mixed
@@ -3159,7 +3159,7 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
 
     /// Returns whether ANY segment has a DocValues column for `field` —
     /// an index-wide, not per-document, answer. `true` does not mean
-    /// every document has a value via [`Self::get_doc_value`]: segments
+    /// every document has a value via `Self::get_doc_value`: segments
     /// can disagree (Issue #1047), so a caller must still fall back to
     /// the stored document on an `Ok(None)` miss from `get_doc_value`
     /// rather than treating this method's `true` as a per-doc guarantee.
@@ -3239,7 +3239,7 @@ impl TermDictionaryAccess for InvertedIndexReader {
 ///
 /// Two storage strategies are chosen at construction time (#412):
 ///
-/// - **Linear scan** for small segment counts (≤ [`LINEAR_THRESHOLD`]).
+/// - **Linear scan** for small segment counts (≤ `LINEAR_THRESHOLD`).
 ///   Sub-iterators sit in a `Vec` and the current minimum is found
 ///   with an `O(n)` scan at each `advance`. For typical multi-segment
 ///   reads (`n` between 2 and 8) this beats the heap by 1.5–2× — the

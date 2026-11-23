@@ -6,7 +6,7 @@
 //! manifest are **document** counts, so the merge policy and the compaction
 //! ratio (deleted documents / documents) work in documents.
 //!
-//! Deletions are logical: a document-level bitmap in [`SegmentedCore`],
+//! Deletions are logical: a document-level bitmap in `SegmentedCore`,
 //! consulted at lookup time. A newer segment's copy of a document shadows
 //! older ones. Merges drop deleted documents and stale copies, and copy the
 //! surviving payloads without re-encoding them when they are already
@@ -20,10 +20,10 @@
 //! pooled documents alone.
 //!
 //! A field configured for [`MultiVectorStorage::Binary`] learns its
-//! [`BinaryParams`] once, from the first flush or merge that holds at least
-//! [`BinaryParams::MIN_TRAINING_ROWS`] token vectors, and encodes every
+//! `BinaryParams` once, from the first flush or merge that holds at least
+//! `BinaryParams::MIN_TRAINING_ROWS` token vectors, and encodes every
 //! later segment with them. Segments written before that are stored as
-//! [`INTERIM_KIND`] and converted by a later merge.
+//! `INTERIM_KIND` and converted by a later merge.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;

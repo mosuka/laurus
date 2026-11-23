@@ -383,7 +383,7 @@ impl PhpWildcardQuery {
 
 /// Internal representation of numeric range kind.
 ///
-/// Both kinds hold their bounds as `f64`, as read by [`numeric_bound`];
+/// Both kinds hold their bounds as `f64`, as read by `numeric_bound`;
 /// an integer range is truncated to `i64` when it is built, as
 /// `NumericRangeQuery::i64_range` would (it, too, goes through `f64`).
 #[derive(Clone)]

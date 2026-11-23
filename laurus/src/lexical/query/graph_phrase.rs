@@ -6,7 +6,7 @@
 //! the product of the alternatives at each match, so [`GraphPhraseQuery`]
 //! matches the graph itself instead of one phrase per path: each step of the
 //! phrase matcher depends only on the previous matched position
-//! ([`next_in_window`]), so the positions a path can reach are carried from
+//! (`next_in_window`), so the positions a path can reach are carried from
 //! node to node along the arcs.
 
 use std::borrow::Cow;

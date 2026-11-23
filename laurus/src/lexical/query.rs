@@ -259,7 +259,7 @@ pub trait Query: Send + Sync + Debug {
     ///
     /// The default implementation inserts `self.field()` into `out` if it
     /// returns `Some`. Composite queries that hold child queries (e.g.
-    /// [`BooleanQuery`](crate::lexical::query::BooleanQuery), span queries)
+    /// [`BooleanQuery`], span queries)
     /// override this method to recurse into each child so every leaf field
     /// reference contributes.
     ///
@@ -344,7 +344,7 @@ pub trait Query: Send + Sync + Debug {
     /// [`MultiFieldQuery`](crate::lexical::query::advanced_query::MultiFieldQuery)'s
     /// `tie_breaker` must be in `[0, 1]` (Issue #1570). So does a query
     /// parameter that would otherwise match nothing without an error:
-    /// [`NumericRangeQuery`](crate::lexical::query::NumericRangeQuery)
+    /// [`NumericRangeQuery`]
     /// rejects a `NaN` bound (Issue #1601).
     ///
     /// # Errors

@@ -253,7 +253,7 @@ pub fn field_option_to_proto(fo: &FieldOption) -> v1::FieldOption {
 ///
 /// Returns an error if the proto message has no option variant set, if a
 /// vector option's quantizer is unknown or unsupported by this build (see
-/// [`quantization_from_proto`]), or if a vector option's distance, rerank
+/// `quantization_from_proto`), or if a vector option's distance, rerank
 /// storage or multi-vector storage is a value this server does not know
 /// (Issue #1473).
 pub fn field_option_from_proto(fo: &v1::FieldOption) -> Result<FieldOption, String> {

@@ -31,7 +31,7 @@
 //! rows, so a document can be pooled away from the writer that stores it
 //! (#1429): the writer keeps rows pooled elsewhere only when their
 //! [`TokenPooling`] equals its own. Documents pooled at the same time share
-//! a memory budget ([`POOLING_BUDGET_BYTES`]).
+//! a memory budget (`POOLING_BUDGET_BYTES`).
 
 use std::num::NonZeroUsize;
 use std::ops::Range;

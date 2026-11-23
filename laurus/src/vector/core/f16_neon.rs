@@ -4,7 +4,7 @@
 //! Widens eight stored binary16 values per step with `fcvtl`
 //! (`vcvt_f32_f16`, part of the aarch64 baseline) and accumulates in f32
 //! with fused multiply-adds, two accumulators per sum. The `len % 8` tail
-//! goes to [`crate::vector::core::distance_f16::accumulate_scalar`].
+//! goes to `crate::vector::core::distance_f16::accumulate_scalar`.
 //!
 //! Phase 0 of #623 measured this kernel at 0.84–0.99× the instructions of
 //! the f32 kernel over the same dimension, and 45–49% fewer than decoding

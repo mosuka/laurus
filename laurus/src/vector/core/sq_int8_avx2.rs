@@ -4,9 +4,9 @@
 //! These modernise the three per-pair integer accumulators used by
 //! [`crate::vector::core::distance_quantized`]:
 //!
-//! - [`dot_u8_to_i32_avx2`] — `Σ a[i] * b[i]`
-//! - [`sq_diff_u8_to_i32_avx2`] — `Σ (a[i] - b[i])²`
-//! - [`abs_diff_u8_to_i32_avx2`] — `Σ |a[i] - b[i]|`
+//! - `dot_u8_to_i32_avx2` — `Σ a[i] * b[i]`
+//! - `sq_diff_u8_to_i32_avx2` — `Σ (a[i] - b[i])²`
+//! - `abs_diff_u8_to_i32_avx2` — `Σ |a[i] - b[i]|`
 //!
 //! Each kernel processes **32 bytes per iteration** in a 256-bit
 //! register, versus the portable [`wide::i32x8`] fallback's 8 bytes.

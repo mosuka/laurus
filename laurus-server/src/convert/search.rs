@@ -1,7 +1,8 @@
 //! Conversion between search-related laurus domain types and protobuf types.
 //!
 //! [`from_proto`] builds a [`laurus::SearchRequest`] from the incoming proto
-//! message, mapping the `query` field to [`SearchQuery::Dsl`] so the engine
+//! message, mapping the `query` field to
+//! [`SearchQuery::Dsl`](laurus::SearchQuery::Dsl) so the engine
 //! can parse unified query DSL (including vector clauses) internally.
 //! [`result_to_proto`] converts engine results back to proto.
 

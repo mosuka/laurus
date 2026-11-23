@@ -89,9 +89,9 @@ pub fn is_allowed_reserved_field(name: &str) -> bool {
 /// engine's reserved namespace.
 ///
 /// Field names whose first character is `_` are reserved for the engine
-/// (e.g. [`RESERVED_ID_FIELD`]) and cannot be declared by users. The only
+/// (e.g. `RESERVED_ID_FIELD`) and cannot be declared by users. The only
 /// exception is the allow-listed names returned by
-/// [`is_allowed_reserved_field`].
+/// `is_allowed_reserved_field`.
 ///
 /// # Arguments
 ///

@@ -6,7 +6,7 @@
 //! terms. Autocomplete / popular-query servers pay that cost per call.
 //! [`ParsedQueryCache`] memoises `dsl string -> Arc<dyn Query>` so a repeated
 //! DSL string is parsed once and then reused via
-//! [`Query::clone_box`](crate::lexical::query::Query::clone_box) (a cheap
+//! [`Query::clone_box`] (a cheap
 //! refcount bump for boolean clause subtrees, #413).
 //!
 //! # Lifetime and key

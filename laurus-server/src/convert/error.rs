@@ -56,7 +56,7 @@ fn code_for(err: &LaurusError) -> tonic::Code {
     }
 }
 
-/// Convert the error of [`crate::context::create_index`] into a tonic
+/// Convert the error of `crate::context::create_index` into a tonic
 /// Status: an index that already exists, or that another call is creating
 /// or opening, is `ALREADY_EXISTS`, and a `store/` left without
 /// `schema.toml` is `FAILED_PRECONDITION` (Issue #1560, #1665). Any other

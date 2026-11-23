@@ -2280,7 +2280,7 @@ impl Engine {
     /// store is fully fsync'd (steps 2–4) before the WAL is truncated (step 5),
     /// so the WAL is discarded only once the data it described is durable. A
     /// crash between any two steps therefore leaves enough in the WAL for the
-    /// idempotent replay in [`Self::recover`] to reconstruct a consistent state.
+    /// idempotent replay in `Self::recover` to reconstruct a consistent state.
     ///
     /// This method itself is **not** serialized against concurrent
     /// `put`/`add`/`delete` calls. After a successful commit with no concurrent
@@ -2399,14 +2399,16 @@ impl Engine {
 
     /// Returns the embedder used by the vector store.
     ///
-    /// This is useful for constructing a [`VectorQueryParser`] or
-    /// [`UnifiedQueryParser`] that shares the same embedder configuration
-    /// as the engine.
+    /// This is useful for constructing a
+    /// [`VectorQueryParser`](crate::vector::VectorQueryParser) or
+    /// [`UnifiedQueryParser`](crate::engine::query::UnifiedQueryParser) that
+    /// shares the same embedder configuration as the engine.
     pub fn embedder(&self) -> Arc<dyn Embedder> {
         self.vector.embedder()
     }
 
-    /// Create a [`UnifiedQueryParser`] configured for this engine.
+    /// Create a [`UnifiedQueryParser`](crate::engine::query::UnifiedQueryParser)
+    /// configured for this engine.
     ///
     /// The returned parser uses the engine's analyzer for lexical queries
     /// and the engine's embedder for vector queries. Default fields are
@@ -2834,7 +2836,7 @@ impl Engine {
     ///   `multi_valued: true -> false`) every segment is rebuilt,
     ///   re-deriving this field from its stored value while every other
     ///   field is carried over unchanged — see
-    ///   [`crate::lexical::index::inverted::InvertedIndex::rebuild_field`].
+    ///   `crate::lexical::index::inverted::InvertedIndex::rebuild_field`.
     ///   Each stored value is first converted to the new option, as a put
     ///   to the field converts its value (Issue #1683), so a document
     ///   written before a change of type is indexed as one written after

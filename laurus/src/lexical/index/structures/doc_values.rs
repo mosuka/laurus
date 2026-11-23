@@ -16,14 +16,14 @@
 //! } x num_fields
 //! ```
 //!
-//! [`write_columns`] writes the layout one column at a time, so a writer
+//! `write_columns` writes the layout one column at a time, so a writer
 //! that builds each column on demand holds only one in memory (Issue
 //! #1168).
 //!
 //! [`DocValuesReader::load`] (Issue #1047 Phase 2) reads only the header and
 //! each field's directory entry (name, offset, length); the rkyv payload
 //! itself is skipped over via `seek` and deserialized lazily, on first
-//! access, by [`DocValuesReader::materialize`]. A query that sorts or
+//! access, by `DocValuesReader::materialize`. A query that sorts or
 //! facets on one field no longer pays to deserialize every other stored
 //! field's DocValues column.
 
@@ -156,7 +156,7 @@ struct FieldRecord {
 ///
 /// [`Self::load`] reads only the file's directory (each field's name and
 /// on-disk offset/length); no field's `doc_id -> value` payload is
-/// deserialized until [`Self::get_value`] or [`Self::materialize`] first
+/// deserialized until [`Self::get_value`] or `Self::materialize` first
 /// asks for it, and the result is cached for later calls (Issue #1047
 /// Phase 2). [`Self::has_field`] and [`Self::field_names`] never touch the
 /// payload at all -- they answer straight from the directory.
@@ -181,7 +181,7 @@ impl DocValuesReader {
     /// Load a `.dv` file's directory from storage.
     ///
     /// Only the header and each field's directory entry are read here;
-    /// see [`Self::materialize`] for the lazy payload read. A missing
+    /// see `Self::materialize` for the lazy payload read. A missing
     /// `.dv` file is not an error -- it loads as an empty reader (no
     /// segment has ever needed DocValues), so a miss on this field stays
     /// O(1).

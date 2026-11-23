@@ -119,7 +119,7 @@ impl OpenAIEmbedder {
     ///
     /// # Arguments
     ///
-    /// * `api_key` - OpenAI API key (get from https://platform.openai.com/api-keys)
+    /// * `api_key` - OpenAI API key (get from <https://platform.openai.com/api-keys>)
     /// * `model` - Model name to use
     ///
     /// # Returns

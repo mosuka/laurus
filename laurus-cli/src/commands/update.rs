@@ -14,7 +14,8 @@ use crate::context;
 /// Execute the `update field` command.
 ///
 /// Opens the index at `index_dir`, parses the field option JSON, and calls
-/// [`Engine::update_field`], which persists the updated schema itself (the
+/// [`Engine::update_field`](laurus::Engine::update_field), which persists
+/// the updated schema itself (the
 /// engine returned by [`context::open_index`] is configured with a
 /// schema-persist hook — see Issue #1078). A `Reindex`- or
 /// `Destructive`-classified change (e.g. a text field's `analyzer`, or a

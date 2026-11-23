@@ -39,7 +39,7 @@ DEPS["laurus-cli"] = {"laurus", "laurus-server", "laurus-mcp"}
 def complete_filters() -> dict[str, list[str]]:
     """Filters that match everything the check requires."""
     filters = {"shared": list(SHARED), "snippets": ["**/*.md"]}
-    filters["code"] = SHARED + ["**/*.rs", "**/Cargo.toml"]
+    filters["code"] = SHARED + ["**/*.rs", "**/Cargo.toml"] + ccf.EXTRA_INPUTS.get("code", [])
     for name, crate in ccf.CRATE_FILTERS.items():
         dirs = sorted({crate} | DEPS[crate])
         filters[name] = SHARED + [f"{d}/**" for d in dirs] + ccf.EXTRA_INPUTS.get(name, [])
@@ -266,11 +266,22 @@ class CheckTest(unittest.TestCase):
         filters["code"] = SHARED + ["laurus/**"]
         problems = self.check(filters)
         self.assertIn(
-            "filter `code` (Format and Clippy) does not match laurus-ruby/Cargo.toml:"
-            " a path of laurus-ruby",
+            "filter `code` (Format, Clippy and Rustdoc) does not match"
+            " laurus-ruby/Cargo.toml: a path of laurus-ruby",
             problems,
         )
         self.assertFalse(any("laurus/Cargo.toml" in p for p in problems))
+
+    def test_code_must_match_the_rustdoc_script(self):
+        filters = complete_filters()
+        filters["code"].remove("scripts/check-rustdoc.py")
+        self.assertEqual(
+            self.check(filters),
+            [
+                "filter `code` (Format, Clippy and Rustdoc) does not match"
+                " scripts/check-rustdoc.py: an input of the job"
+            ],
+        )
 
     def test_the_table_has_to_cover_every_crate_and_filter(self):
         filters = complete_filters()

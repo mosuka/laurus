@@ -561,7 +561,7 @@ impl MultiVectorOption {
     /// Returns [`LaurusError::invalid_argument`] when the dimension is zero,
     /// the distance is neither `Cosine` nor `DotProduct`, or the storage is
     /// `Binary` and the distance is not `Cosine` (see
-    /// [`multi_vector_params_error`]).
+    /// `multi_vector_params_error`).
     pub fn validate(&self, field_name: &str) -> Result<()> {
         reject_field(
             field_name,
@@ -776,7 +776,7 @@ impl FlatOption {
     /// Returns [`LaurusError::invalid_argument`] when [`Self::dimension`] is
     /// `0` (Issue #1479), which every non-empty vector would then fail, or
     /// when [`Self::quantizer`] is a product quantizer, which Flat does not
-    /// implement (see [`quantizer_support_error`]).
+    /// implement (see `quantizer_support_error`).
     pub fn validate(&self, field_name: &str) -> Result<()> {
         reject_field(
             field_name,
@@ -961,7 +961,7 @@ impl IvfOption {
     /// [`Self::n_clusters`] is `0`, when [`Self::n_probe`] is `0`, which
     /// would make every search probe no cluster (Issue #1479), or when
     /// [`Self::quantizer`] is a product quantizer, which IVF does not
-    /// implement (see [`quantizer_support_error`]).
+    /// implement (see `quantizer_support_error`).
     pub fn validate(&self, field_name: &str) -> Result<()> {
         reject_field(
             field_name,

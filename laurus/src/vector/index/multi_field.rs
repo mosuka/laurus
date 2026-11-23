@@ -33,7 +33,7 @@
 //!
 //! # No migration from the pre-#948 layout
 //!
-//! [`Self::open_or_create`] does NOT detect or migrate the old
+//! [`MultiFieldVectorIndex::open_or_create`] does NOT detect or migrate the old
 //! single-index layout every prior release used for vector fields (one
 //! [`VectorIndex`] shared by all fields, opened under the fixed name
 //! `"vector_index"`). Opening a collection that has data in that layout
@@ -60,7 +60,8 @@
 //! here. `VectorIndexFactory::open_or_create`'s own internal resolution
 //! attempt (against the field-scoped storage, where the codebook file does
 //! not exist) is a harmless no-op in that case —
-//! [`HnswIndexConfig::resolve_pq_codebook`] only overwrites an already-resolved
+//! [`HnswIndexConfig::resolve_pq_codebook`](crate::vector::index::config::HnswIndexConfig::resolve_pq_codebook)
+//! only overwrites an already-resolved
 //! codebook when it finds a *replacement* file, never clears one to `None`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -248,7 +249,7 @@ impl FieldEntry {
 ///
 /// `fields` is a [`BTreeMap`] (not a `HashMap`): iteration order feeds
 /// directly into deterministic aggregate behavior — e.g. [`Self::stats`]'s
-/// representative `dimension` and [`MultiFieldReaderFacade`]'s
+/// representative `dimension` and `MultiFieldReaderFacade`'s
 /// single-value `dimension()`/`distance_metric()` fall back to the
 /// *first* field in iteration order, which must not depend on hash seed.
 pub struct MultiFieldVectorIndex {
@@ -625,7 +626,7 @@ impl VectorIndex for MultiFieldVectorIndex {
     /// Swap the field's config in its own index, in place (Issue #1494).
     /// Unlike [`Self::rebuild_field`], nothing is reopened or merged: the
     /// field keeps its index object, so no second object ever shares its
-    /// storage namespace. Its [`FieldEntry`] caches only the dimension, the
+    /// storage namespace. Its `FieldEntry` caches only the dimension, the
     /// distance and whether it is multi-vector, which a config update cannot
     /// change.
     fn update_field_config(&self, name: &str, new_config: VectorIndexTypeConfig) -> Result<()> {

@@ -110,7 +110,7 @@ pub async fn create_index_from_schema(index_dir: &Path, schema: Schema) -> Resul
 /// a plain `create index` (without `--schema`) recovers correctly.
 ///
 /// The whole call holds the directory's
-/// [`IndexDirClaim`](laurus::index_dir::IndexDirClaim), from the checks
+/// [`IndexDirClaim`], from the checks
 /// above until the engine is built or what the call wrote is rolled back
 /// (Issue #1665). Another create or open of the same directory, in this
 /// process or another, cannot change it meanwhile: a create that finds the

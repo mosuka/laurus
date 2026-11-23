@@ -801,7 +801,7 @@ impl Query for NumericRangeQuery {
 /// Range query over a `DateTime` field (Issue #1179).
 ///
 /// Bounds are kept as [`DateTime<Utc>`] and encoded with the same
-/// [`datetime_to_point`] the writer uses for the field's one-dimensional
+/// `datetime_to_point` the writer uses for the field's one-dimensional
 /// BKD point, so a bound and a stored value denoting the same instant
 /// compare equal down to the persisted microsecond. Matching and scoring
 /// delegate to [`NumericRangeQuery`] with [`NumericType::Float`]
@@ -942,12 +942,12 @@ impl DateTimeRangeQuery {
         self.upper_inclusive
     }
 
-    /// The lower bound in BKD point space (see [`datetime_to_point`]).
+    /// The lower bound in BKD point space (see `datetime_to_point`).
     pub fn min_point(&self) -> Option<f64> {
         self.lower_bound.as_ref().map(datetime_to_point)
     }
 
-    /// The upper bound in BKD point space (see [`datetime_to_point`]).
+    /// The upper bound in BKD point space (see `datetime_to_point`).
     pub fn max_point(&self) -> Option<f64> {
         self.upper_bound.as_ref().map(datetime_to_point)
     }

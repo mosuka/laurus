@@ -221,7 +221,7 @@ impl QuantizedVectorPool {
     /// Build a heap pool from a sequence of
     /// `(doc_id, field_name, int8_data, meta)` records and the per-segment
     /// quantization params. Used by the rerank sidecar's int8 view; the
-    /// segment readers use [`QuantizedPoolBuilder`].
+    /// segment readers use `QuantizedPoolBuilder`.
     ///
     /// The records may be in any order; the field index is built from
     /// the iteration order, and each int8 payload is written at the

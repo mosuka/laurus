@@ -173,7 +173,7 @@ impl<'a> F16Rows<'a> {
 
 /// One segment's Float16 vectors.
 ///
-/// Built once at reader load by [`F16PoolBuilder`] and shared across
+/// Built once at reader load by `F16PoolBuilder` and shared across
 /// search threads via `Arc`. Mirrors the lookup API of
 /// [`crate::vector::index::quantized_storage::QuantizedVectorPool`].
 #[derive(Debug)]

@@ -17,7 +17,7 @@
 //! adds are invisible until commit, matching the monolithic semantics.
 //!
 //! Deletions are logical: a shared index-level
-//! [`DeletionBitmap`](crate::maintenance::deletion::DeletionBitmap) is marked
+//! `DeletionBitmap` is marked
 //! by [`VectorIndex::soft_delete_document`](crate::vector::index::VectorIndex::soft_delete_document), persisted to `{name}.delmap`
 //! by [`VectorIndex::persist_deletions`](crate::vector::index::VectorIndex::persist_deletions), filtered by every segment reader,
 //! and physically reclaimed by [`VectorIndex::optimize`](crate::vector::index::VectorIndex::optimize) (a force-merge).

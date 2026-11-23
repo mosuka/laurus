@@ -19,8 +19,9 @@ of a crate's test job does not match
   `.github/actions/`);
 * the extra inputs of its job (`EXTRA_INPUTS`).
 
-The `code` filter (Format and Clippy) must match the shared inputs and every
-crate. Which filter tests which crate is the table `CRATE_FILTERS`; every
+The `code` filter (Format, Clippy and Rustdoc) must match the shared inputs,
+every crate and its extra inputs (`EXTRA_INPUTS`, the script of the Rustdoc
+job). Which filter tests which crate is the table `CRATE_FILTERS`; every
 workspace crate must be in it, and every filter of the workflow must be in it
 or in `OTHER_FILTERS`, so a new crate or filter fails until the table says
 what it is.
@@ -93,6 +94,8 @@ SHARED_INPUTS = [
 # Inputs of a job besides its crates and the shared inputs.
 EXTRA_INPUTS = {
     "interop": [".github/workflows/index-interop.yml", ".github/interop/probe"],
+    # The Rustdoc job runs this script (Issue #1675).
+    "code": ["scripts/check-rustdoc.py"],
 }
 
 KEY = re.compile(r"(?P<name>[A-Za-z0-9_-]+):(?:\s+&(?P<anchor>[A-Za-z0-9_-]+))?\s*(?:#.*)?")
@@ -274,10 +277,11 @@ def check(
         required = list(shared)
         for crate in sorted(dirs):
             required += [(p, f"a path of {crate}") for p in crate_paths(dirs[crate])]
+        required += [(p, "an input of the job") for p in EXTRA_INPUTS.get("code", [])]
         for path, why in required:
             if not matches(filters["code"], path):
                 problems.append(
-                    f"filter `code` (Format and Clippy) does not match {path}: {why}"
+                    f"filter `code` (Format, Clippy and Rustdoc) does not match {path}: {why}"
                 )
     return problems
 

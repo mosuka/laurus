@@ -178,7 +178,7 @@ pub fn infer_option_from_data_value(value: &DataValue) -> Result<Option<FieldOpt
 /// | `integer` (fits in i64) | [`DataValue::Int64`] | [`FieldOption::Integer`] |
 /// | `float` / large number | [`DataValue::Float64`] | [`FieldOption::Float`] |
 /// | `bool` | [`DataValue::Bool`] | [`FieldOption::Boolean`] |
-/// | `object` with `lat|latitude` + `lon|lng|longitude` | [`DataValue::Geo`] | [`FieldOption::Geo`] |
+/// | `object` with `lat\|latitude` + `lon\|lng\|longitude` | [`DataValue::Geo`] | [`FieldOption::Geo`] |
 /// | `object` with `x` + `y` + `z` (all numeric) | [`DataValue::GeoEcef`] | [`FieldOption::Geo3d`] |
 /// | `object` with `data` (base64 string) + optional `mime` | [`DataValue::Bytes`] | [`FieldOption::Bytes`] |
 /// | `null` | (none) | (none) — returns [`InferredValue::Skip`] |

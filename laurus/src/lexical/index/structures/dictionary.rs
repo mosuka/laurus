@@ -167,8 +167,8 @@ impl TermInfo {
 ///   orders of magnitude smaller than a flat per-term FST
 /// - a flat BlockSection holding 128-term blocks, each with
 ///   front-coded term bytes, a bit-packed
-///   [`term_info_block::FixedTermInfoBlock`], and a
-///   [`block_max_data::BlockMaxData`] for variable-length per-term
+///   `term_info_block::FixedTermInfoBlock`, and a
+///   `block_max_data::BlockMaxData` for variable-length per-term
 ///   block_max arrays
 ///
 /// Lookup: `fst.range().ge(target).into_stream().next()` identifies the
@@ -591,7 +591,7 @@ impl TermDictionaryBuilder {
     /// Issue [#487](https://github.com/mosuka/laurus/issues/487)).
     ///
     /// Splits the sorted term map into 128-term blocks, encodes each
-    /// block via [`builder::encode_block_into`], and indexes the
+    /// block via `builder::encode_block_into`, and indexes the
     /// blocks' last terms in an FST keyed by block byte offset.
     ///
     /// Returns an empty dictionary (no FST keys, empty BlockSection)

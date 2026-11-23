@@ -116,6 +116,15 @@ cargo doc --open                # Default features
 cargo doc --all-features --open # All features
 ```
 
+Rustdoc must report no warning for any crate. CI documents each crate on
+its own, with its default features and with all its features, and fails on
+any warning:
+
+```bash
+make lint-rustdoc                                 # Check every crate
+python3 scripts/check-rustdoc.py --package laurus # Check some crates only
+```
+
 ## Code Style
 
 ### General
@@ -218,7 +227,10 @@ Pull requests automatically run:
 
 1. **Format** — `cargo fmt --all -- --check`
 2. **Clippy** — `cargo clippy --all-targets --all-features -- -D warnings`
-3. **Test** — `cargo test` on multiple platforms:
+3. **Rustdoc** — `python3 scripts/check-rustdoc.py`: each crate documented
+   on its own, with its default features and with all its features, with
+   rustdoc warnings denied (on x86_64, and `laurus` also on aarch64)
+4. **Test** — `cargo test` on multiple platforms:
    - Linux (x86_64, aarch64)
    - Windows (x86_64)
 

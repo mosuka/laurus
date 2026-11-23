@@ -354,7 +354,7 @@ impl SpellCorrectedSearchEngine {
     ///         self.corrector.learn_from_terms(term_pairs)?;
     ///     }
     /// }
-    /// ```ignore
+    /// ```
     pub fn learn_from_index(&mut self) -> Result<()> {
         // TODO: Implement term enumeration from the index
         // This requires access to LexicalIndexReader.terms() API which returns

@@ -73,7 +73,7 @@ pub struct MergeConfig {
     pub index_analyzer: Option<Arc<dyn Analyzer>>,
 
     /// Soft budget (bytes) for a single output segment's buffered memory
-    /// during [`MergeEngine::perform_merge`] (Issue #1164).
+    /// during `MergeEngine::perform_merge` (Issue #1164).
     ///
     /// Checked only at source-segment boundaries, after each source has
     /// been fully replayed: when the writer's estimated buffered memory
@@ -622,14 +622,14 @@ impl MergeEngine {
 
     /// Rebuild every one of `segments` into a same-count set of NEW
     /// segments, with `target_field` re-derived per
-    /// [`Self::reconstruct_segment_with_field_override`] and every other
+    /// `Self::reconstruct_segment_with_field_override` and every other
     /// field carried over unchanged (Issue #1081: `Engine::update_field`
     /// rebuilding a lexical field's analyzer/indexed setting).
     ///
     /// Unlike [`Self::merge_segments`] (N sources -> 1 output), this is a
     /// 1:1 transform — one new segment per source, each keeping that
     /// source's document set — so the caller
-    /// ([`InvertedIndex::rebuild_field`](crate::lexical::index::inverted::InvertedIndex::rebuild_field))
+    /// (`InvertedIndex::rebuild_field`)
     /// can publish the whole batch as a single atomic manifest swap
     /// without disturbing segment count or merge policy.
     ///
@@ -644,13 +644,13 @@ impl MergeEngine {
     /// segment stores (or omits) `target_field`'s positions according to
     /// the NEW schema, not the old one. Every other field keeps whatever
     /// positions state it already had, detected the same way
-    /// [`Self::perform_merge`] does.
+    /// `Self::perform_merge` does.
     ///
     /// `target_doc_values` is `target_field`'s new `doc_values` setting
     /// (#1047), seeded the same way into the per-field DocValues map for
     /// the same reason. Every other field resolves from
     /// [`MergeConfig::field_doc_values`] first, detection second, exactly
-    /// as [`Self::perform_merge`] does.
+    /// as `Self::perform_merge` does.
     ///
     /// `target_option` is `target_field`'s new option. Each document's
     /// stored value of `target_field` is converted to it, with the put

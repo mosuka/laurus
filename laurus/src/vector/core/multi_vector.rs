@@ -18,10 +18,10 @@
 //!   compounding loss) on every merge.
 //! - [`MultiVectorStorage::Binary`]: 1 bit/element. Every row is the sign
 //!   pattern of the token's offset from a field-level center `c`; see
-//!   [`BinaryParams`] for the encoding and why it is centered and
+//!   `BinaryParams` for the encoding and why it is centered and
 //!   projected.
 //!
-//! [`RowCodec`] pairs a kind with the parameters it needs (only `Binary`
+//! `RowCodec` pairs a kind with the parameters it needs (only `Binary`
 //! has any), so rows of a parameterized kind cannot be encoded or decoded
 //! without them.
 
@@ -661,7 +661,7 @@ fn try_as_f32_slice(bytes: &[u8]) -> Option<&[f32]> {
 /// kind.
 ///
 /// Returned by the multi-vector reader; scored by
-/// [`crate::vector::core::late_interaction::MaxSimQuery`], which decodes
+/// `crate::vector::core::late_interaction::MaxSimQuery`, which decodes
 /// them on demand unless it can score them as stored. `bytes` holds
 /// exactly `row_count() * kind().row_bytes(dimension)` bytes.
 pub struct MultiVectorRows<'a> {

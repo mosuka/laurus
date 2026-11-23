@@ -535,10 +535,10 @@ pub struct VectorSearchParams {
     /// Overfetch factor for better result quality (Issue #675).
     ///
     /// Each per-field index query fetches `ceil(limit * overfetch)` candidates
-    /// (see [`Self::overfetch_top_k`]) so the multi-vector score-mode merge has
+    /// (see `Self::overfetch_top_k`) so the multi-vector score-mode merge has
     /// headroom before the final truncation to [`limit`](Self::limit). A factor
     /// `<= 1.0` (or non-finite) disables overfetch. Defaults to `2.0`
-    /// ([`default_overfetch`]).
+    /// (`default_overfetch`).
     #[serde(default = "default_overfetch")]
     pub overfetch: f32,
     /// Minimum score threshold. Results below this score are filtered out.

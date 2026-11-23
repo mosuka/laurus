@@ -427,7 +427,7 @@ impl BM25Scorer {
     /// Create a new BM25 scorer with the per-block max-impact metadata
     /// (#403 PR-C). `block_max` carries `(last_doc_id, max_factor)`
     /// entries sorted by `last_doc_id`; pass an empty slice to fall
-    /// back to the term-level [`Self::max_score_factor`] (which itself
+    /// back to the term-level `Self::max_score_factor` (which itself
     /// falls back to `k1 + 1` when zero).
     #[allow(clippy::too_many_arguments)]
     pub fn with_block_max(

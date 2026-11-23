@@ -99,7 +99,7 @@ pub const BKD_MAGIC: u32 = 0x54444B42;
 ///
 /// Version 4 (this revision, Issue #1142): within each leaf, points are now
 /// stored in **doc_id-ascending order** (a stable sort — see
-/// [`BKDWriter::write_leaf_block`] for why stability matters), and
+/// `BKDWriter::write_leaf_block` for why stability matters), and
 /// `doc_ids` are packed as **consecutive deltas** (`doc_id[i] - doc_id[i-1]`,
 /// with `doc_id[-1] := doc_id_base`, so the first packed delta is always
 /// `0`) instead of independent deltas from `doc_id_base`. This shrinks

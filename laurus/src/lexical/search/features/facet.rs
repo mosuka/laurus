@@ -202,7 +202,7 @@ impl Default for FacetConfig {
 /// #1187), so a single document can reach the same key more than once —
 /// through a repeated element (`["rust", "rust"]`) or through the shared
 /// ancestor of two hierarchical elements (`["a/b", "a/c"]` → `a`). Every
-/// [`Slot`] remembers the generation (`doc_gen`, advanced once per
+/// `Slot` remembers the generation (`doc_gen`, advanced once per
 /// `collect_doc`) of its last increment and refuses a second increment in
 /// the same generation, so counts stay per document — Lucene's
 /// `SortedSetDocValuesFacetCounts` semantics — at the cost of one compare

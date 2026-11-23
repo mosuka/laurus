@@ -30,7 +30,7 @@ pub struct TermStats {
 /// while let Some(term) = terms_enum.next()? {
 ///     println!("Term: {}, DocFreq: {}", term.term, term.doc_freq);
 /// }
-/// ```ignore
+/// ```
 pub trait TermsEnum: Send + Sync {
     /// Advance to the next term in the enumeration.
     ///
@@ -84,7 +84,7 @@ pub trait TermsEnum: Send + Sync {
 /// if iter.seek("prefix")? {
 ///     println!("Found exact match");
 /// }
-/// ```ignore
+/// ```
 pub trait Terms: Send + Sync {
     /// Get an iterator over all terms in this field.
     fn iterator(&self) -> Result<Box<dyn TermsEnum>>;
@@ -142,7 +142,7 @@ pub trait Terms: Send + Sync {
 /// while let Some(term_stats) = iter.next()? {
 ///     println!("{}: {} docs", term_stats.term, term_stats.doc_freq);
 /// }
-/// ```ignore
+/// ```
 pub trait TermDictionaryAccess {
     /// Get access to the term dictionary for the specified field.
     ///
@@ -157,7 +157,7 @@ pub trait TermDictionaryAccess {
     ///     let mut iter = terms.iterator()?;
     ///     iter.seek_exact(term)
     /// })
-    /// ```ignore
+    /// ```
     fn term_exists(&self, field: &str, term: &str) -> Result<bool> {
         if let Some(terms) = self.terms(field)? {
             let mut iter = terms.iterator()?;

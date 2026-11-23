@@ -18,8 +18,8 @@
 //! # Endianness
 //!
 //! The on-disk LRS1 payload is little-endian and the in-memory
-//! [`Self::data`] buffer holds those bytes verbatim. The
-//! [`Self::get_f32_slice`] hot-path accessor reinterprets the bytes
+//! [`RerankStoragePool::data`] buffer holds those bytes verbatim. The
+//! [`RerankStoragePool::get_f32_slice`] hot-path accessor reinterprets the bytes
 //! as `&[f32]` via [`std::slice::from_raw_parts`], which is sound
 //! only on little-endian hosts. A `compile_error!` below catches
 //! any attempt to build for a big-endian target.
