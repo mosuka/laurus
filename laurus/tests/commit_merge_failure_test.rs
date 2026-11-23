@@ -6,8 +6,9 @@
 //! commit, which stopped the engine's commit ladder before it committed the
 //! documents and truncated the WAL; a merge that fails every time then
 //! failed every later commit, until its cause was gone. The commit now
-//! completes and logs the failure as a warning, and the next commit retries
-//! the merge.
+//! completes and logs the failure as a warning, and the next commit with
+//! something to commit retries the merge (a commit with nothing to commit
+//! does nothing, Issue #1509).
 
 #[path = "common/log_capture.rs"]
 mod log_capture;
@@ -97,9 +98,11 @@ async fn search_ids(engine: &Engine) -> Vec<String> {
 
 /// An HNSW field persisted with a product quantizer `subvector_count` of 0
 /// (the index opens with a warning, Issue #1491) fails every merge: deleting
-/// half of its documents triggers a compaction that fails on every commit.
-/// Each commit still commits the documents and truncates the WAL, and logs
-/// the failure with the field and its reason.
+/// 2 of its 5 documents triggers a compaction that fails on every commit
+/// that has something to commit. Each such commit still commits the
+/// documents and truncates the WAL, and logs the failure with the field and
+/// its reason; a commit with nothing to commit retries nothing (Issue
+/// #1509).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_vector_merge_that_always_fails_does_not_fail_the_commit() {
     log_capture::install();
@@ -110,7 +113,7 @@ async fn a_vector_merge_that_always_fails_does_not_fail_the_commit() {
     let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
         .await
         .unwrap();
-    for i in 0..4 {
+    for i in 0..5 {
         let doc = Document::builder().add_field("vec", vector(i)).build();
         engine.put_document(&format!("d{i}"), doc).await.unwrap();
     }
@@ -124,6 +127,20 @@ async fn a_vector_merge_that_always_fails_does_not_fail_the_commit() {
     engine.delete_documents("d0").await.unwrap();
     engine.delete_documents("d1").await.unwrap();
     for attempt in 1..=2 {
+        if attempt == 2 {
+            // Nothing is left to commit, so this commit retries nothing
+            // (Issue #1509). The delete below gives the next one something
+            // to commit.
+            let before = warnings_containing(warning);
+            engine.commit().await.unwrap();
+            assert_eq!(wal_bytes(&dir), 0);
+            assert_eq!(
+                warnings_containing(warning),
+                before,
+                "a commit with nothing to commit must not retry the merge"
+            );
+            engine.delete_documents("d4").await.unwrap();
+        }
         let before = warnings_containing(warning);
         engine
             .commit()

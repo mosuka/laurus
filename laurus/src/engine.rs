@@ -135,7 +135,10 @@ pub enum CommitPolicy {
     /// The timer runs the full commit ladder on its own thread; the same
     /// best-effort concurrency caveat as `EveryDocs` applies (a commit racing a
     /// concurrent in-flight write may leave that write durable only at the next
-    /// commit). **Native targets only** — on `wasm32` there are no background
+    /// commit). A tick with nothing new to commit does nothing, as
+    /// [`Engine::commit`] then does (Issue #1509): an idle engine does no I/O
+    /// and keeps its cached searchers, however short the interval.
+    /// **Native targets only** — on `wasm32` there are no background
     /// threads, so `Interval` is a no-op (the timer is never started), just like
     /// a non-zero [`WalSyncPolicy::Group`] `max_interval`.
     ///
@@ -271,6 +274,9 @@ impl Drop for WalFlushTimer {
 /// timer needs only the `Arc` sub-parts — not the whole `Engine` (which would
 /// be a reference cycle).
 ///
+/// A commit with nothing to commit returns `Ok` before the first step (Issue
+/// #1509); see [`CommitGenerationTracker::has_nothing_to_commit`].
+///
 /// # Errors
 ///
 /// Returns [`LaurusError::WritesStopped`] without committing anything once
@@ -299,6 +305,13 @@ async fn run_commit_ladder(
     let applied_before = applied.watermark();
     // Whether anything finished at all, for the commit generation below.
     let progress_before = applied.progress();
+    // A commit with nothing to commit does nothing (Issue #1509), as
+    // Lucene's `IndexWriter.commit` skips a commit with no change since the
+    // last one: no I/O, and the stores keep their cached searchers. Without
+    // this an idle `CommitPolicy::Interval` tick ran every step below.
+    if commit_generation.has_nothing_to_commit(progress_before, applied_before) {
+        return Ok(());
+    }
     // Hard durability barrier: force the WAL durable before any store
     // materializes its state, so the WAL is never less durable than the
     // committed lexical/vector indexes. A near-no-op under the per-record
@@ -327,13 +340,19 @@ async fn run_commit_ladder(
     // commit. `progress_before` grows with every mutation that finished
     // before the snapshot, also one that finished above a slower one, which
     // this commit makes visible while the watermark stays below both (Issue
-    // #1499). Comparing against the last commit's value is what keeps an
-    // idle `CommitPolicy::Interval` tick (which runs this same ladder
-    // unconditionally on a timer) from making external readers see a false
-    // "something changed" signal on every tick. After a reopen over an empty
+    // #1499). Comparing against the last commit's value is what keeps a
+    // commit whose only work is truncating a record the last commit already
+    // counted (its watermark moved, Issue #1509) from making external
+    // readers see a false "something changed" signal; a commit with nothing
+    // to commit at all returned above. After a reopen over an empty
     // WAL, `recover()` marks the progress of raising the watermark to the
     // stores' highest checkpoint (Issue #1502) as committed.
     commit_generation.advance_if_changed(progress_before)?;
+    // With `advance_if_changed`'s progress, what the next commit compares
+    // against to tell whether it has anything to do (Issue #1509). Recorded
+    // only now, after every step succeeded: a failed commit records
+    // nothing, so the next one runs.
+    commit_generation.record_watermark(applied_before);
 
     Ok(())
 }
@@ -355,11 +374,12 @@ pub(crate) struct CommitGenerationFile {
     pub(crate) generation: u64,
 }
 
-/// Tracks and persists the cross-process commit generation counter (Issue
-/// #1088), grouped into one struct so it can be threaded through
-/// [`run_commit_ladder`]/[`CommitTimer::spawn`] as a single parameter
-/// instead of three (storage root, counter, last-seen progress of the
-/// applied WAL records).
+/// Records the last successful commit: the cross-process commit generation
+/// counter it persisted (Issue #1088), and the [`AppliedSeqs`] progress and
+/// watermark it took as its snapshot, which tell whether a later commit has
+/// anything to do (Issue #1509). Grouped into one struct so it can be
+/// threaded through [`run_commit_ladder`]/[`CommitTimer::spawn`] as a
+/// single parameter.
 #[derive(Clone)]
 struct CommitGenerationTracker {
     /// Bare root storage (outside any `PrefixedStorage` namespace) that
@@ -370,8 +390,11 @@ struct CommitGenerationTracker {
     /// [`Engine::stats`].
     generation: Arc<AtomicU64>,
     /// [`AppliedSeqs::progress`] as of the last commit, purely in-memory.
-    /// See [`Self::advance_if_changed`].
+    /// See [`Self::advance_if_changed`] and [`Self::has_nothing_to_commit`].
     last_progress: Arc<AtomicU64>,
+    /// [`AppliedSeqs::watermark`] as of the last commit, purely in-memory.
+    /// See [`Self::has_nothing_to_commit`].
+    last_watermark: Arc<AtomicU64>,
 }
 
 impl CommitGenerationTracker {
@@ -389,14 +412,44 @@ impl CommitGenerationTracker {
             root_storage,
             generation: Arc::new(AtomicU64::new(generation)),
             last_progress: Arc::new(AtomicU64::new(0)),
+            last_watermark: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Whether a commit whose snapshot is `progress` and `watermark` has
+    /// nothing to do (Issue #1509): both are what the last successful
+    /// commit took.
+    ///
+    /// Progress alone is not enough. The ladder snapshots the watermark
+    /// before progress, so a mutation right above the watermark that
+    /// finishes between the two reads is counted in progress while the
+    /// commit keeps its WAL record and covers it with no checkpoint. The
+    /// watermark has moved past it by the next commit, which then truncates
+    /// it.
+    ///
+    /// Nothing is left to commit when both are unchanged: a change in a
+    /// store's buffer grows progress once it finishes (and one that has
+    /// not finished is one a commit keeps in the WAL anyway), every WAL
+    /// record at or below the watermark was truncated by the last commit,
+    /// and a failed commit records neither, so the next one runs.
+    fn has_nothing_to_commit(&self, progress: u64, watermark: u64) -> bool {
+        progress == self.last_progress.load(Ordering::Acquire)
+            && watermark == self.last_watermark.load(Ordering::Acquire)
+    }
+
+    /// Record `watermark` as what a successful commit took (Issue #1509).
+    /// `fetch_max`: a concurrent ladder with an older snapshot must not
+    /// lower it.
+    fn record_watermark(&self, watermark: u64) {
+        self.last_watermark.fetch_max(watermark, Ordering::AcqRel);
     }
 
     /// Advance and persist the generation IF `progress_before` (the commit
     /// ladder's snapshot of [`AppliedSeqs::progress`]) shows something was
     /// applied since the last commit; a no-op (no I/O at all) otherwise --
-    /// the gate that keeps an idle `CommitPolicy::Interval` tick from
-    /// advancing it for no reason.
+    /// the gate that keeps a commit that only truncates a record the last
+    /// commit already counted from advancing it for no reason. (A commit
+    /// with nothing to commit at all never gets here, Issue #1509.)
     fn advance_if_changed(&self, progress_before: u64) -> Result<()> {
         if progress_before > self.last_progress.load(Ordering::Acquire) {
             let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -417,15 +470,18 @@ impl CommitGenerationTracker {
     }
 
     /// Record that everything up to `progress` (an
-    /// [`AppliedSeqs::progress`]) is already covered by the persisted
-    /// generation, so a later commit with nothing newer to apply leaves the
-    /// generation alone.
+    /// [`AppliedSeqs::progress`]) and `watermark` (an
+    /// [`AppliedSeqs::watermark`]) is already committed, so a later commit
+    /// with nothing newer to apply does nothing and leaves the generation
+    /// alone.
     ///
     /// For a reopen over an empty WAL (Issue #1502): raising the watermark
     /// to the stores' highest checkpoint counts as progress, and without
-    /// this the first idle commit would advance the generation for nothing.
-    fn mark_committed(&self, progress: u64) {
+    /// this the first idle commit would advance the generation for nothing,
+    /// and run the whole ladder for nothing (Issue #1509).
+    fn mark_committed(&self, progress: u64, watermark: u64) {
         self.last_progress.fetch_max(progress, Ordering::AcqRel);
+        self.record_watermark(watermark);
     }
 
     /// The current generation, for [`Engine::stats`].
@@ -436,7 +492,8 @@ impl CommitGenerationTracker {
 
 /// Background timer that runs the full commit ladder at least every interval for
 /// [`CommitPolicy::Interval`] (Issue #892), so a trailing partial batch is
-/// committed even while ingestion is idle.
+/// committed even while ingestion is idle. Once that is committed, each tick
+/// finds nothing to commit and returns at once (Issue #1509).
 ///
 /// Mirrors [`WalFlushTimer`]: a dedicated thread with an mpsc stop channel,
 /// joined on drop. Unlike the WAL timer (which calls the synchronous
@@ -1230,10 +1287,11 @@ impl Engine {
             // `last_seq()` above its retain point and rewrite the empty WAL
             // instead of taking its fast path (Issue #1499). And record it
             // as committed, or that same commit would advance the generation
-            // with nothing applied (#1088).
+            // with nothing applied (#1088) and run the whole ladder for
+            // nothing (#1509).
             self.applied.raise_to(seq_floor);
             self.commit_generation
-                .mark_committed(self.applied.progress());
+                .mark_committed(self.applied.progress(), self.applied.watermark());
             return Ok(());
         }
 
@@ -2294,7 +2352,18 @@ impl Engine {
     /// The automatic segment merge each store runs after its own commit in
     /// steps 2 and 3 does not fail the commit (Issue #1500): the store's
     /// changes and checkpoint are durable by then, so a failed merge is
-    /// logged as a warning and the next commit retries it.
+    /// logged as a warning and the next commit with something to commit
+    /// retries it.
+    ///
+    /// A commit with nothing to commit returns at once and does no I/O
+    /// (Issue #1509): when no put, add or delete finished applying since the
+    /// last successful commit and the watermark has not moved, the steps
+    /// above would only rewrite what is already durable, so none runs, and
+    /// the stores keep their cached searchers. As in Lucene, whose
+    /// `IndexWriter.commit` skips a commit with no change since the last
+    /// one, such a commit neither continues an automatic merge nor retries
+    /// one that failed. `CommitPolicy::Interval`'s ticks while ingestion is
+    /// idle are such commits.
     ///
     /// # Errors
     ///
@@ -9036,6 +9105,317 @@ mod tests {
         );
     }
 
+    /// A [`Storage`] over a [`MemoryStorage`] that records every call that
+    /// writes, as `<call> <file>`: creating an output or a temporary one,
+    /// renaming or deleting a file, syncing the storage, and each
+    /// `flush_and_sync` of an output it opened (Issue #1509).
+    #[derive(Debug)]
+    struct WriteRecordingStorage {
+        inner: Arc<dyn Storage>,
+        writes: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl WriteRecordingStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(MemoryStorage::new(Default::default())),
+                writes: Arc::default(),
+            })
+        }
+
+        /// The calls recorded since the last call to this, which it clears.
+        fn take_writes(&self) -> Vec<String> {
+            std::mem::take(&mut *self.writes.lock())
+        }
+
+        fn record(&self, call: &str, name: &str) {
+            self.writes.lock().push(format!("{call} {name}"));
+        }
+
+        fn wrap(
+            &self,
+            name: &str,
+            inner: Box<dyn crate::storage::StorageOutput>,
+        ) -> Box<dyn crate::storage::StorageOutput> {
+            Box::new(WriteRecordingOutput {
+                inner,
+                name: name.to_string(),
+                writes: Arc::clone(&self.writes),
+            })
+        }
+    }
+
+    impl Storage for WriteRecordingStorage {
+        fn loading_mode(&self) -> crate::storage::LoadingMode {
+            self.inner.loading_mode()
+        }
+        fn open_input(&self, name: &str) -> Result<Box<dyn crate::storage::StorageInput>> {
+            self.inner.open_input(name)
+        }
+        fn create_output(&self, name: &str) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.record("create_output", name);
+            let out = self.inner.create_output(name)?;
+            Ok(self.wrap(name, out))
+        }
+        fn create_output_append(
+            &self,
+            name: &str,
+        ) -> Result<Box<dyn crate::storage::StorageOutput>> {
+            self.record("create_output_append", name);
+            let out = self.inner.create_output_append(name)?;
+            Ok(self.wrap(name, out))
+        }
+        fn file_exists(&self, name: &str) -> bool {
+            self.inner.file_exists(name)
+        }
+        fn delete_file(&self, name: &str) -> Result<()> {
+            self.record("delete_file", name);
+            self.inner.delete_file(name)
+        }
+        fn list_files(&self) -> Result<Vec<String>> {
+            self.inner.list_files()
+        }
+        fn file_size(&self, name: &str) -> Result<u64> {
+            self.inner.file_size(name)
+        }
+        fn metadata(&self, name: &str) -> Result<crate::storage::FileMetadata> {
+            self.inner.metadata(name)
+        }
+        fn rename_file(&self, old_name: &str, new_name: &str) -> Result<()> {
+            self.record("rename_file", new_name);
+            self.inner.rename_file(old_name, new_name)
+        }
+        fn create_temp_output(
+            &self,
+            prefix: &str,
+        ) -> Result<(String, Box<dyn crate::storage::StorageOutput>)> {
+            self.record("create_temp_output", prefix);
+            let (name, out) = self.inner.create_temp_output(prefix)?;
+            let out = self.wrap(&name, out);
+            Ok((name, out))
+        }
+        fn sync(&self) -> Result<()> {
+            self.record("sync", "(storage)");
+            self.inner.sync()
+        }
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An output a [`WriteRecordingStorage`] opened: it records each
+    /// `flush_and_sync` and passes everything through.
+    #[derive(Debug)]
+    struct WriteRecordingOutput {
+        inner: Box<dyn crate::storage::StorageOutput>,
+        name: String,
+        writes: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl std::io::Write for WriteRecordingOutput {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl std::io::Seek for WriteRecordingOutput {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl crate::storage::StorageOutput for WriteRecordingOutput {
+        fn flush_and_sync(&mut self) -> Result<()> {
+            self.writes
+                .lock()
+                .push(format!("flush_and_sync {}", self.name));
+            self.inner.flush_and_sync()
+        }
+
+        fn position(&self) -> Result<u64> {
+            self.inner.position()
+        }
+
+        fn close(&mut self) -> Result<()> {
+            self.inner.close()
+        }
+    }
+
+    /// Issue #1509: a commit with nothing to commit does nothing. After a
+    /// put and its commit, more commits make no call that writes, and the
+    /// lexical store keeps the searcher the search between them cached. A
+    /// put after that is committed as before.
+    #[tokio::test]
+    async fn a_commit_with_nothing_new_does_no_io_and_keeps_the_searcher() {
+        let storage = WriteRecordingStorage::new();
+        let engine = Engine::new(storage.clone(), title_schema(&[]))
+            .await
+            .unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(title_hits(&engine, "alpha").await, vec!["a"]);
+        assert!(
+            engine.lexical.has_cached_searcher(),
+            "the search must cache a searcher"
+        );
+
+        storage.take_writes();
+        engine.commit().await.unwrap();
+        engine.commit().await.unwrap();
+        assert_eq!(
+            storage.take_writes(),
+            Vec::<String>::new(),
+            "a commit with nothing to commit wrote"
+        );
+        assert!(
+            engine.lexical.has_cached_searcher(),
+            "a commit with nothing to commit dropped the cached searcher"
+        );
+
+        engine.put_document("b", title_doc("beta")).await.unwrap();
+        storage.take_writes();
+        engine.commit().await.unwrap();
+        assert!(
+            !storage.take_writes().is_empty(),
+            "a commit after a put must commit it"
+        );
+        assert_eq!(title_hits(&engine, "beta").await, vec!["b"]);
+    }
+
+    /// Issue #1509: an idle `CommitPolicy::Interval` tick does nothing. The
+    /// timer commits a put, and after that its ticks write nothing, however
+    /// many run.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interval_tick_with_nothing_new_does_no_io() {
+        let storage = WriteRecordingStorage::new();
+        let dyn_storage: Arc<dyn Storage> = storage.clone();
+        let engine = Engine::builder(dyn_storage.clone(), title_schema(&[]))
+            .commit_policy(CommitPolicy::Interval(Duration::from_millis(5)))
+            .build()
+            .await
+            .unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+
+        // The ladder truncates the WAL before it advances the generation,
+        // so a generation of 1 means the timer's commit of the put got
+        // through both.
+        let mut committed = false;
+        for _ in 0..200 {
+            if engine.stats().unwrap().commit_generation == 1 {
+                committed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(committed, "the timer must commit the put");
+        assert_eq!(wal_bytes(&dyn_storage), 0);
+        // Let the tick that committed the put return.
+        std::thread::sleep(Duration::from_millis(20));
+
+        storage.take_writes();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            storage.take_writes(),
+            Vec::<String>::new(),
+            "an idle tick wrote"
+        );
+    }
+
+    /// Issue #1509: a commit after a delete still commits it, and the
+    /// commit after that has nothing to commit.
+    #[tokio::test]
+    async fn a_commit_after_a_delete_still_commits() {
+        let storage = unlocked_memory_storage();
+        let engine = Engine::new(storage.clone(), title_schema(&[]))
+            .await
+            .unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        engine.commit().await.unwrap();
+        let generation = engine.stats().unwrap().commit_generation;
+
+        engine.delete_documents("a").await.unwrap();
+        assert!(wal_bytes(&storage) > 0, "the delete must be in the WAL");
+        engine.commit().await.unwrap();
+        assert_eq!(
+            wal_bytes(&storage),
+            0,
+            "the commit must truncate the delete's record"
+        );
+        assert_eq!(engine.stats().unwrap().commit_generation, generation + 1);
+        assert!(title_hits(&engine, "alpha").await.is_empty());
+
+        engine.commit().await.unwrap();
+        assert_eq!(
+            engine.stats().unwrap().commit_generation,
+            generation + 1,
+            "the commit after it has nothing to commit"
+        );
+        drop(engine);
+
+        let reopened = Engine::new(storage, title_schema(&[])).await.unwrap();
+        assert!(
+            title_hits(&reopened, "alpha").await.is_empty(),
+            "the delete must be durable"
+        );
+    }
+
+    /// Issue #1509: a failed commit records nothing, so the next commit
+    /// runs even with no write in between, and commits what the failed one
+    /// did not.
+    #[tokio::test]
+    async fn a_commit_after_a_failed_one_retries() {
+        let storage = FaultStorage::new();
+        let dyn_storage: Arc<dyn Storage> = storage.clone();
+        let engine = boom_engine(storage.clone()).await.unwrap();
+        engine.put_document("a", title_doc("alpha")).await.unwrap();
+        let generation = engine.stats().unwrap().commit_generation;
+
+        // The document store's manifest, which the ladder writes after both
+        // stores committed and before it truncates the WAL.
+        storage.fail_create(|name| name.starts_with("documents/"));
+        assert!(
+            engine.commit().await.is_err(),
+            "the commit must fail at the document store"
+        );
+        assert!(storage.fired() > 0, "the injected failure must fire");
+        assert!(wal_bytes(&dyn_storage) > 0, "a failed commit keeps the WAL");
+
+        storage.disarm();
+        engine.commit().await.unwrap();
+        assert_eq!(
+            wal_bytes(&dyn_storage),
+            0,
+            "the commit after the failed one must run and truncate the WAL"
+        );
+        assert_eq!(engine.stats().unwrap().commit_generation, generation + 1);
+    }
+
+    /// Issue #1509: whether a commit has anything to do takes both the
+    /// progress and the watermark the last commit recorded. A mutation can
+    /// count in a commit's progress while the commit keeps its record; the
+    /// next commit sees only the watermark move past it.
+    #[test]
+    fn the_last_commit_needs_both_its_progress_and_its_watermark() {
+        let tracker =
+            CommitGenerationTracker::load(Arc::new(MemoryStorage::new(Default::default())))
+                .unwrap();
+        tracker.mark_committed(5, 3);
+        assert!(tracker.has_nothing_to_commit(5, 3));
+        assert!(
+            !tracker.has_nothing_to_commit(5, 4),
+            "a moved watermark is something to commit"
+        );
+        assert!(
+            !tracker.has_nothing_to_commit(6, 3),
+            "grown progress is something to commit"
+        );
+    }
+
     /// #876: a mutation whose WAL record was appended but not yet applied to
     /// the stores when a commit starts must not lose that record to the WAL
     /// truncate.
@@ -9706,6 +10086,59 @@ mod tests {
         assert_eq!(nearest_id(&reopened, [0.0, 0.0, 1.0]).await, vec!["d"]);
         assert!(reopened.get_documents("a").await.unwrap().is_empty());
         assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
+    }
+
+    /// Issue #1509: a commit after a reopen over a WAL that holds only
+    /// `Delete`s both stores' checkpoints cover still runs. Recovery skipped
+    /// them without committing, so their records are still in the WAL, and
+    /// the commit truncates them and advances the generation, which the
+    /// session that wrote them never got to (see the test above for how
+    /// such a WAL comes to be). The commit after it has nothing to commit.
+    #[tokio::test]
+    async fn a_commit_after_reopening_over_covered_deletes_still_runs() {
+        let storage = unlocked_memory_storage();
+        let schema = title_schema(&["vec"]);
+
+        let engine = Engine::new(storage.clone(), schema.clone()).await.unwrap();
+        engine
+            .put_document("a", vector_doc("alpha", "vec", [1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        engine
+            .put_document("b", vector_doc("beta", "vec", [0.0, 1.0, 0.0]))
+            .await
+            .unwrap();
+        engine.commit().await.unwrap();
+        engine.delete_documents("a").await.unwrap();
+        // The store commits of a commit that crashes before its truncate.
+        let watermark = engine.applied.watermark();
+        engine.lexical.commit_through(watermark).unwrap();
+        engine.vector.commit_through(watermark).await.unwrap();
+        std::mem::forget(engine);
+
+        let reopened = Engine::new(storage.clone(), schema).await.unwrap();
+        assert!(
+            wal_bytes(&storage) > 0,
+            "precondition: recovery did not commit, so the delete is still in the WAL"
+        );
+        let generation = reopened.stats().unwrap().commit_generation;
+
+        reopened.commit().await.unwrap();
+        assert_eq!(
+            wal_bytes(&storage),
+            0,
+            "the commit after the recovery must truncate the delete's record"
+        );
+        assert_eq!(reopened.stats().unwrap().commit_generation, generation + 1);
+        assert_eq!(title_hits(&reopened, "beta").await, vec!["b"]);
+        assert!(title_hits(&reopened, "alpha").await.is_empty());
+
+        reopened.commit().await.unwrap();
+        assert_eq!(
+            reopened.stats().unwrap().commit_generation,
+            generation + 1,
+            "the commit after it has nothing to commit"
+        );
     }
 
     /// A put caught between its WAL append and its apply to the stores, as

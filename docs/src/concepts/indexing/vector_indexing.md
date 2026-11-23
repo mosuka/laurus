@@ -1045,7 +1045,8 @@ segments:
   merges, unlike HNSW's/IVF's lossless-ish requantization path. Merges run
   inside `commit()` after the commit's segment and deletions are durable,
   so a merge that fails does not fail the commit (Issue #1500): it is
-  logged as a warning that names the field, and the next commit retries it.
+  logged as a warning that names the field, and the next commit that has
+  something to commit retries it (Issue #1509).
   Searches keep running during a merge and read either the segments it
   replaces or the merged one: the merge deletes the replaced segments'
   files only once every search that listed them has loaded them, so it
