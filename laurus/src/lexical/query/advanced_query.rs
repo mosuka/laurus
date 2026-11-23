@@ -575,7 +575,7 @@ pub enum MultiFieldQueryType {
     /// BM25F weight — `2.0` counts the field as if it were indexed twice —
     /// rather than a multiplier on the field's score. Every boost must be
     /// finite and greater than zero; searching with any other returns
-    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument).
+    /// [`LaurusError::InvalidArgument`].
     CombinedFields,
 }
 

@@ -398,8 +398,10 @@ pub(crate) const HNSW_DEFAULT_EF_SEARCH: usize = 50;
 ///
 /// The searcher's `default_ef_search` field holds the schema-level
 /// fallback for the `ef_search` parameter. Per-query callers can override
-/// it via [`VectorIndexQueryParams::ef_search`]; the effective value used
-/// by the graph traversal is computed by [`Self::effective_ef`] for each
+/// it via
+/// [`VectorIndexQueryParams::ef_search`](crate::vector::search::searcher::VectorIndexQueryParams::ef_search);
+/// the effective value used
+/// by the graph traversal is computed by `Self::effective_ef` for each
 /// search request.
 #[derive(Debug)]
 pub struct HnswSearcher {
@@ -409,7 +411,7 @@ pub struct HnswSearcher {
 
 impl HnswSearcher {
     /// Create a new HNSW searcher with the built-in fallback `ef_search`
-    /// of [`HNSW_DEFAULT_EF_SEARCH`].
+    /// of `HNSW_DEFAULT_EF_SEARCH`.
     ///
     /// For schemas that opt into a higher schema-level default, use
     /// [`Self::with_default_ef_search`] instead. Per-query overrides are
@@ -423,7 +425,7 @@ impl HnswSearcher {
 
     /// Create a new HNSW searcher with an explicit schema-level
     /// `default_ef_search`. Pass `None` to use the built-in fallback
-    /// ([`HNSW_DEFAULT_EF_SEARCH`]).
+    /// (`HNSW_DEFAULT_EF_SEARCH`).
     ///
     /// Issue [#644](https://github.com/mosuka/laurus/issues/644).
     pub fn with_default_ef_search(
@@ -440,8 +442,9 @@ impl HnswSearcher {
     /// constructing the searcher with [`Self::with_default_ef_search`]
     /// after the fact.
     ///
-    /// Per-query [`VectorIndexQueryParams::ef_search`] overrides this
-    /// value at search time.
+    /// Per-query
+    /// [`VectorIndexQueryParams::ef_search`](crate::vector::search::searcher::VectorIndexQueryParams::ef_search)
+    /// overrides this value at search time.
     pub fn set_ef_search(&mut self, ef_search: usize) {
         self.default_ef_search = ef_search;
     }

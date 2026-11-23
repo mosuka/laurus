@@ -460,7 +460,7 @@ impl Storage for FileStorage {
     /// dropped before another code path invokes this method —
     /// otherwise the outstanding `Arc<Mmap>` clone will keep the
     /// Windows lock alive and the OS returns `ERROR_USER_MAPPED_FILE`.
-    /// See [`Self::evict_mmap`] for the full lifetime contract.
+    /// See `Self::evict_mmap` for the full lifetime contract.
     fn create_output(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
         self.check_closed()?;
 
@@ -500,7 +500,7 @@ impl Storage for FileStorage {
     /// the current codebase, so the cache eviction below is purely
     /// defensive. If a future change starts mmap'ing one of these
     /// files, the Windows lifecycle contract documented on
-    /// [`Self::evict_mmap`] already applies (Issue #508).
+    /// `Self::evict_mmap` already applies (Issue #508).
     fn create_output_append(&self, name: &str) -> Result<Box<dyn StorageOutput>> {
         self.check_closed()?;
 
@@ -549,7 +549,7 @@ impl Storage for FileStorage {
     /// evicts the storage's own cached `Arc<Mmap>` first to release
     /// the lock (Issue #508). Outstanding `StorageInput` clones held
     /// elsewhere keep the lock alive until they drop; the same
-    /// lifetime contract documented on [`Self::evict_mmap`] applies.
+    /// lifetime contract documented on `Self::evict_mmap` applies.
     fn delete_file(&self, name: &str) -> Result<()> {
         self.check_closed()?;
 

@@ -38,7 +38,7 @@ pub fn from_proto(proto: &v1::Document) -> Document {
 /// Convert a [`DataValue`] into a proto `Value`.
 ///
 /// Used by both the gRPC document path ([`to_proto`]) and the HTTP gateway
-/// JSON path (after [`laurus::engine::type_inference::infer_from_json`]).
+/// JSON path (after [`laurus::infer_from_json`]).
 ///
 /// # Arguments
 ///

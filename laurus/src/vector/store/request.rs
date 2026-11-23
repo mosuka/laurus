@@ -5,8 +5,10 @@
 //!
 //! The high-level request and query types ([`VectorSearchRequest`],
 //! [`VectorSearchQuery`]) live in [`crate::vector::search::searcher`], mirroring
-//! the lexical module's organization where [`LexicalSearchRequest`] and
-//! [`LexicalSearchQuery`] live in [`crate::lexical::search::searcher`].
+//! the lexical module's organization where
+//! [`LexicalSearchRequest`](crate::lexical::search::searcher::LexicalSearchRequest)
+//! and [`LexicalSearchQuery`](crate::lexical::search::searcher::LexicalSearchQuery)
+//! live in [`crate::lexical::search::searcher`].
 
 use serde::{Deserialize, Serialize};
 
@@ -80,12 +82,12 @@ pub struct QueryVector {
     ///
     /// Every component must be finite, as for a document's vector; a search
     /// with a `NaN` or infinite component fails with
-    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// [`LaurusError::InvalidArgument`]
     /// (Issue #1573).
     ///
     /// Its dimension must be that of every field it is searched in (see
     /// [`fields`](Self::fields)); a search where it is not fails with
-    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument),
+    /// [`LaurusError::InvalidArgument`],
     /// whatever the index holds (Issue #1575).
     pub vector: Vector,
     /// Multiplicative weight applied to the similarity score produced by this
@@ -93,7 +95,7 @@ pub struct QueryVector {
     ///
     /// Must be finite and at least `0` (`-0.0` is rejected); a search with any
     /// other weight fails with
-    /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// [`LaurusError::InvalidArgument`]
     /// (Issue #1552). A weight of `0` gives the vector's hits a score of `0`;
     /// in a hybrid search they still take part in fusion (RRF ranks them, and
     /// `WeightedSum` normalizes a list whose scores are all equal to `1.0`).

@@ -483,7 +483,7 @@ impl SegmentManager {
     }
 
     /// Record the last applied WAL sequence number; persisted by the next
-    /// save (see [`SegmentManifest::last_wal_seq`]).
+    /// save (see `SegmentManifest::last_wal_seq`).
     pub fn set_last_wal_seq(&self, seq: u64) {
         self.last_wal_seq.store(seq, Ordering::Release);
     }
@@ -559,7 +559,7 @@ impl SegmentManager {
     /// # Errors
     ///
     /// Returns an error if persisting the manifest fails. The in-memory
-    /// list is then unchanged; see [`Self::publish_locked`] for a save that
+    /// list is then unchanged; see `Self::publish_locked` for a save that
     /// published the manifest but failed to sync it.
     pub fn add_segment(&self, mut info: ManagedSegmentInfo) -> Result<()> {
         if info.size_bytes == 0 {

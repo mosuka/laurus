@@ -120,7 +120,7 @@ pub const VERSION_ORDINAL_GRAPH: u16 = 2;
 /// (Issue #633, Lucene `fnm` precedent).
 ///
 /// At this version the record prefix is `[doc_id u64][field_id u16]`
-/// (see [`record_prefix_size`]) instead of the inline
+/// (see `record_prefix_size`) instead of the inline
 /// `[doc_id u64][name_len u32][name UTF-8]`, and the dictionary block
 /// follows the quantization metadata (see the module docs). Implies the
 /// [`VERSION_ORDINAL_GRAPH`] graph encoding for HNSW segments.

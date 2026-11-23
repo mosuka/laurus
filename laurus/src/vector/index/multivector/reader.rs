@@ -62,7 +62,7 @@ impl MultiVectorSnapshot {
     /// The still-encoded token vector rows of `doc_id`, or `None` when the
     /// document has none or is deleted. Prefer this over [`Self::vectors`]
     /// when the caller can score a compressed element kind directly (see
-    /// [`Self::max_sim_query`]), to avoid decoding a document that was
+    /// `Self::max_sim_query`), to avoid decoding a document that was
     /// never going to be borrowed anyway.
     ///
     /// # Errors

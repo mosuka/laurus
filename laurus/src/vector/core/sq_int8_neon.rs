@@ -5,12 +5,12 @@
 //! intrinsics, processing **16 bytes per iteration** in a 128-bit
 //! register:
 //!
-//! - [`dot_u8_to_i32_neon`] — widen `u8 → u16`, multiply-accumulate
+//! - `dot_u8_to_i32_neon` — widen `u8 → u16`, multiply-accumulate
 //!   with `vmlal_u16` into a u32x4 accumulator.
-//! - [`sq_diff_u8_to_i32_neon`] — `vabdq_u8` gives `|a - b|` as u8;
+//! - `sq_diff_u8_to_i32_neon` — `vabdq_u8` gives `|a - b|` as u8;
 //!   squaring the absolute difference equals `(a - b)²`, accumulated
 //!   with `vmlal_u16`.
-//! - [`abs_diff_u8_to_i32_neon`] — `vabdq_u8` then `vpadalq_u16`
+//! - `abs_diff_u8_to_i32_neon` — `vabdq_u8` then `vpadalq_u16`
 //!   pairwise-accumulate into u32x4 (a u16 accumulator would overflow
 //!   for `dim > 257`).
 //!

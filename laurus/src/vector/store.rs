@@ -377,7 +377,7 @@ impl VectorStore {
     /// single-method `upsert_document_by_internal_id`, Issue #1326).
     ///
     /// Pools the token vectors of every multi-vector field that pools (see
-    /// [`Self::prepare`]), then acquires the writer lock, deletes any
+    /// `Self::prepare`), then acquires the writer lock, deletes any
     /// existing vectors for `doc_id`, and adds the given ones. Callers are
     /// expected to have produced `fields` via [`Self::embed_document`],
     /// which has already validated them; this phase performs no further
@@ -1014,7 +1014,7 @@ impl VectorStore {
     /// The per-field candidate pool is widened by
     /// [`overfetch`](crate::vector::search::searcher::VectorSearchParams::overfetch)
     /// via
-    /// [`overfetch_top_k`](crate::vector::search::searcher::VectorSearchParams::overfetch_top_k)
+    /// `overfetch_top_k`
     /// (Issue #675) so the score-mode merge has headroom before the final
     /// truncation to `limit`.
     ///
@@ -1037,7 +1037,7 @@ impl VectorStore {
     /// Returns an error if obtaining the searcher or executing the underlying
     /// index search fails, or if the query contains unresolved payloads.
     ///
-    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
+    /// Returns [`LaurusError::InvalidArgument`]
     /// if a query vector's weight is not finite or is negative (`-0.0`
     /// included), or if the
     /// [`min_score`](crate::vector::search::searcher::VectorSearchParams::min_score)
@@ -1691,7 +1691,7 @@ impl VectorStore {
     /// Set the last processed WAL sequence number.
     ///
     /// A segmented field records it as pending; the next commit publishes
-    /// it. The engine records its checkpoint through [`Self::commit_through`]
+    /// it. The engine records its checkpoint through `Self::commit_through`
     /// instead, under the writer lock (Issue #1499).
     ///
     /// Note: This method doesn't return Result for Engine compatibility.
@@ -1718,7 +1718,7 @@ impl VectorStore {
     /// skipped.
     ///
     /// If the underlying index's embedder is a
-    /// [`PerFieldEmbedder`](crate::embedding::per_field::PerFieldEmbedder),
+    /// [`PerFieldEmbedder`],
     /// this method registers the given embedder for the specified field.
     ///
     /// The field starts empty, also under the name of a field that

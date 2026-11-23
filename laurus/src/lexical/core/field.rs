@@ -434,7 +434,8 @@ pub struct BytesOption {
     /// Whether this field accepts multiple values per document
     /// (Issue #1176).
     ///
-    /// When `true`, the field accepts [`DataValue::BytesArray`] (a single
+    /// When `true`, the field accepts
+    /// [`DataValue::BytesArray`](crate::data::DataValue::BytesArray) (a single
     /// `Bytes` is auto-wrapped into a one-element array), each element
     /// carrying its own optional MIME type just like the scalar variant.
     /// `Bytes` fields are never indexed, so unlike the other multi-valued
@@ -634,7 +635,8 @@ pub struct BooleanOption {
     /// Whether this field accepts multiple values per document
     /// (Issue #1180).
     ///
-    /// When `true`, the field accepts [`DataValue::BoolArray`] (a single
+    /// When `true`, the field accepts
+    /// [`DataValue::BoolArray`](crate::data::DataValue::BoolArray) (a single
     /// `Bool` is auto-wrapped into a one-element array). Every element is
     /// indexed as its own `"true"` / `"false"` term posting — Boolean fields
     /// have no BKD points — so a term query such as `flags:true` matches a

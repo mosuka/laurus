@@ -317,7 +317,7 @@ const MAX_JSON_VALUE_DEPTH: usize = 32;
 /// - sequential array (list)       → `Value::Array`
 /// - associative array             → `Value::Object`
 ///
-/// Any other type, or nesting deeper than [`MAX_JSON_VALUE_DEPTH`], is
+/// Any other type, or nesting deeper than `MAX_JSON_VALUE_DEPTH`, is
 /// rejected with an error.
 pub fn zval_to_json_value(zv: &Zval) -> PhpResult<serde_json::Value> {
     zval_to_json_value_inner(zv, 0)

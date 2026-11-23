@@ -27,7 +27,7 @@ pub fn closed_err() -> PhpException {
 ///
 /// A failed batch throws the exception of its source, so a batch that
 /// failed on a caller's mistake throws `ValueError` as the same call on its
-/// own would (Issue #1627). The message is [`message`].
+/// own would (Issue #1627). The message is `message`.
 pub fn laurus_err(err: LaurusError) -> PhpException {
     PhpException::new(message(&err), 0, class_for(&err))
 }

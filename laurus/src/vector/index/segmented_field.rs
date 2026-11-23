@@ -62,7 +62,7 @@ pub struct SegmentedVectorField {
     pub deletion_bitmap: Option<Arc<DeletionBitmap>>,
 
     /// Per-segment [`HnswIndexReader`] cache used by
-    /// [`Self::search_managed_segments`]. Without this cache every query
+    /// `Self::search_managed_segments`. Without this cache every query
     /// reloaded every managed segment from disk; with it, the second and
     /// subsequent queries against the same segment hit memory only.
     ///

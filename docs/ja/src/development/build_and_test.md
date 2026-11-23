@@ -133,6 +133,13 @@ cargo fmt
 ```bash
 # Rust API ドキュメントを生成して開く
 cargo doc --no-deps --open
+
+# 各 crate を単独で、既定の feature と全 feature の 2 通りで生成し、
+# rustdoc の警告が 1 つでもあれば失敗する（CI の Rustdoc ジョブと同じ。
+# `make lint` からも実行される）
+make lint-rustdoc
+# 同じ検査を一部の crate だけで実行する
+python3 scripts/check-rustdoc.py --package laurus --package laurus-server
 ```
 
 ### mdBook ドキュメント

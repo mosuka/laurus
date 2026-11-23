@@ -135,6 +135,13 @@ cargo fmt
 ```bash
 # Generate and open Rust API docs
 cargo doc --no-deps --open
+
+# Document each crate on its own, with its default features and with all
+# its features, failing on any rustdoc warning (as the Rustdoc job of CI
+# does; also run by `make lint`)
+make lint-rustdoc
+# Same as above, for some crates only
+python3 scripts/check-rustdoc.py --package laurus --package laurus-server
 ```
 
 ### mdBook Documentation

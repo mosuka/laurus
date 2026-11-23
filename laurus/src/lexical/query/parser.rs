@@ -1365,10 +1365,10 @@ fn parse_numeric_bound(text: &str) -> Result<Option<f64>> {
     }
 }
 
-/// Builder for constructing a [`QueryParser`] with a fluent API.
+/// Builder for constructing a [`LexicalQueryParser`] with a fluent API.
 ///
 /// Allows configuring the analyzer, default search fields, and default boolean
-/// occurrence before building the final [`QueryParser`] instance.
+/// occurrence before building the final [`LexicalQueryParser`] instance.
 pub struct QueryParserBuilder {
     analyzer: Arc<dyn Analyzer>,
     default_fields: Vec<String>,

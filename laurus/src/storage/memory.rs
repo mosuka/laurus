@@ -106,7 +106,7 @@ impl MemFile {
 /// An in-memory storage implementation.
 ///
 /// All files are held in a shared `HashMap<String, Arc<MemFile>>` guarded by a
-/// [`parking_lot::RwLock`]. Each [`MemFile`] keeps a growing backing buffer plus
+/// [`parking_lot::RwLock`]. Each `MemFile` keeps a growing backing buffer plus
 /// a `committed` length marking the reader-visible prefix; an open writer shares
 /// the same `Arc<MemFile>` as the map, so flushing only advances `committed`
 /// instead of cloning the buffer (Issue #812). The outer `RwLock` allows multiple
@@ -434,7 +434,7 @@ impl StorageInput for MemoryInput {
 
 /// A write handle backed by an in-memory byte buffer.
 ///
-/// `MemoryOutput` writes directly into a shared [`MemFile`] buffer. Each
+/// `MemoryOutput` writes directly into a shared `MemFile` buffer. Each
 /// [`flush_and_sync`](StorageOutput::flush_and_sync) (or `close`) advances the
 /// file's `committed` length and publishes the shared `Arc<MemFile>` into the
 /// file map, so the flushed prefix becomes visible to subsequent

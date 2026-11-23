@@ -30,7 +30,7 @@ use crate::vector::core::vector::Vector;
 
 /// Cache key for a query-time embedding.
 ///
-/// The payload is stored as a 64-bit hash (see [`hash_embed_input`]) rather
+/// The payload is stored as a 64-bit hash (see `hash_embed_input`) rather
 /// than its full bytes to keep the cache compact. `field` distinguishes
 /// per-field embedders and `embedder` distinguishes different embedder
 /// configurations, so an entry is only reused when the same embedder embeds
@@ -187,7 +187,7 @@ pub async fn embed_with_cache(
 ///
 /// Embeds many `(field, input)` pairs together so an embedder with a real
 /// batch API (e.g. a remote model that serves many inputs per request, like
-/// [`OpenAIEmbedder`](crate::embedding::openai_embedder::OpenAIEmbedder)) pays
+/// `OpenAIEmbedder`) pays
 /// one round trip instead of one per payload. Replaces the per-payload
 /// `embed_with_cache` loops in the engine's `Payloads` fallback and the
 /// vector query parser.

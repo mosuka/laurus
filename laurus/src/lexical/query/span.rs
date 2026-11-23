@@ -62,7 +62,8 @@ pub trait SpanQuery: Send + Sync + std::fmt::Debug {
     fn get_spans(&self, doc_id: u64, reader: &dyn LexicalIndexReader) -> Result<Vec<Span>>;
 
     /// Return the set of candidate doc IDs that *might* match this span query.
-    /// The result is an upper bound; actual matches are confirmed by [`get_spans`].
+    /// The result is an upper bound; actual matches are confirmed by
+    /// [`get_spans`](Self::get_spans).
     fn candidate_doc_ids(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<u64>>;
 
     /// Get the field name this span query operates on.

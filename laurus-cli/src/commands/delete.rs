@@ -13,7 +13,8 @@ use crate::context;
 
 /// Execute the `delete field` command.
 ///
-/// Opens the index at `index_dir` and calls [`Engine::delete_field`], which
+/// Opens the index at `index_dir` and calls
+/// [`Engine::delete_field`](laurus::Engine::delete_field), which
 /// persists the updated schema itself (the engine returned by
 /// [`context::open_index`] is configured with a schema-persist hook — see
 /// Issue #1078). The field is no longer indexed or searchable. A lexical

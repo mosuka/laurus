@@ -16,7 +16,8 @@ use crate::json_doc::parse_document_json;
 /// Execute the `add field` command.
 ///
 /// Opens the index at `index_dir`, parses the field option JSON, and calls
-/// [`Engine::add_field`], which persists the updated schema itself (the
+/// [`Engine::add_field`](laurus::Engine::add_field), which persists the
+/// updated schema itself (the
 /// engine returned by [`context::open_index`] is configured with a
 /// schema-persist hook — see Issue #1078).
 ///

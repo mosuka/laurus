@@ -66,12 +66,13 @@ jobs:
               - '.cargo/**'
               - '.github/actions/**'
               - '.github/workflows/regression.yml'
-            # code: triggers format + clippy
+            # code: triggers format + clippy + rustdoc
             code:
               - *shared
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'laurus-server/proto/**'
+              - 'scripts/check-rustdoc.py'
             # laurus: core library
             laurus: &laurus
               - *shared
@@ -280,6 +281,66 @@ jobs:
               --target x86_64-unknown-linux-musl -i openssl-sys >&2
             exit 1
           fi
+
+  # ============================================================
+  # Rustdoc (Issue #1675): document each workspace crate on its own,
+  # with its default features (what docs.rs builds) and with all its
+  # features, and fail on any rustdoc warning
+  # (scripts/check-rustdoc.py). The public docs of laurus also depend
+  # on the target architecture (its SIMD kernel modules), so laurus is
+  # documented on aarch64 too; no other crate has a target_arch cfg in
+  # its public items.
+  # ============================================================
+  rustdoc:
+    name: Rustdoc
+    needs: [changes]
+    if: ${{ !failure() && !cancelled() && needs.changes.outputs.code == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            packages: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            packages: "--package laurus"
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v7
+
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/free-disk-space
+
+      - name: Install protoc
+        uses: ./.github/actions/install-protoc
+        with:
+          version: "24.4"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "stable-${{ matrix.platform.target }}"
+
+      - name: Match libclang to clang
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/match-libclang
+
+      - name: Run rustdoc
+        run: python3 scripts/check-rustdoc.py ${{ matrix.platform.packages }}
 
   # ============================================================
   # Test laurus (core library)
@@ -795,14 +856,14 @@ jobs:
   test-all:
     name: Test All
     # Test All needs every other job of this workflow: Detect Changes, CI
-    # Filters, Binding Snippets, Format, Clippy, every test job and Index
-    # Interop (Issue #1716). A job it does not need can fail without failing
-    # it, and a failed Detect Changes skips every job that needs it, so a new
-    # job goes into `needs` too. A job skipped because its filter did not
-    # match counts as passing. `!cancelled()` (rather than `!failure() &&
-    # !cancelled()`) lets this step run even when a need was cancelled, so
-    # the explicit result check below can tell "cancelled" apart from
-    # "succeeded" instead of both silently passing.
+    # Filters, Binding Snippets, Format, Clippy, Rustdoc, every test job and
+    # Index Interop (Issue #1716). A job it does not need can fail without
+    # failing it, and a failed Detect Changes skips every job that needs it,
+    # so a new job goes into `needs` too. A job skipped because its filter
+    # did not match counts as passing. `!cancelled()` (rather than
+    # `!failure() && !cancelled()`) lets this step run even when a need was
+    # cancelled, so the explicit result check below can tell "cancelled"
+    # apart from "succeeded" instead of both silently passing.
     if: ${{ !cancelled() }}
     needs:
       [
@@ -811,6 +872,7 @@ jobs:
         snippets,
         format,
         clippy,
+        rustdoc,
         test-laurus,
         test-cli,
         test-server,

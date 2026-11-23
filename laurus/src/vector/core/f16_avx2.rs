@@ -7,7 +7,7 @@
 //! [`crate::vector::core::sq_int8_avx2`]; without them the dispatcher in
 //! [`crate::vector::core::distance_f16`] uses the portable kernel. The
 //! `len % 8` tail goes to
-//! [`crate::vector::core::distance_f16::accumulate_scalar`].
+//! `crate::vector::core::distance_f16::accumulate_scalar`.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;

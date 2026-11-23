@@ -75,7 +75,7 @@ use crate::lexical::core::field::FieldValue;
 /// - `field_terms` - Map of field names to their analyzed terms
 /// - `stored_fields` - Original field values to be stored (for retrieval)
 /// - `field_lengths` - Number of *positions* per field (used for BM25 scoring;
-///   see [`field_length_from_terms`])
+///   see `field_length_from_terms`)
 /// - `point_values` - Numeric point values per field (for BKD tree range queries)
 ///
 /// # Usage
@@ -92,7 +92,7 @@ pub struct AnalyzedDocument {
     /// Field name to field length mapping. The length is the number of
     /// distinct positions, not of terms: a synonym stacked on another token
     /// shares its position and is not counted again (Issue #1257). Compute
-    /// it with [`field_length_from_terms`] rather than `terms.len()`.
+    /// it with `field_length_from_terms` rather than `terms.len()`.
     pub field_lengths: AHashMap<String, u32>,
     /// Field name to numeric point values for the BKD tree.
     ///

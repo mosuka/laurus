@@ -947,7 +947,7 @@ impl LexicalStore {
     /// If a writer is cached, it sets the sequence on the writer.
     /// Otherwise, it sets it on the underlying index, which persists it at
     /// once. The engine records its checkpoint through
-    /// [`Self::commit_through`] instead (Issue #1499).
+    /// `Self::commit_through` instead (Issue #1499).
     pub fn set_last_wal_seq(&self, seq: u64) -> Result<()> {
         if let Some(writer) = self.writer_cache.lock().as_mut() {
             writer.set_last_wal_seq(seq)?;

@@ -78,7 +78,7 @@ pub struct InvertedIndexWriterConfig {
     pub store_term_positions: bool,
 
     /// Index-wide default for whether a field's value is also copied into
-    /// DocValues (Issue #1047). See [`Self::stores_doc_values`].
+    /// DocValues (Issue #1047). See `Self::stores_doc_values`.
     pub store_doc_values: bool,
 
     /// Analyzer for text fields (can be PerFieldAnalyzer for field-specific analysis).
@@ -96,7 +96,7 @@ pub struct InvertedIndexWriterConfig {
     /// Set only when replaying documents during a segment merge or a
     /// field rebuild, to reproduce the positions state each field already
     /// had on disk regardless of the current schema. Empty in the normal
-    /// document-indexing path, where [`Self::stores_term_positions`]
+    /// document-indexing path, where `Self::stores_term_positions`
     /// instead resolves from `fields` and `store_term_positions`.
     pub field_term_positions: HashMap<String, bool>,
 
@@ -106,7 +106,7 @@ pub struct InvertedIndexWriterConfig {
     /// Set only when replaying documents during a segment merge or a
     /// field rebuild, to reproduce the DocValues state each field already
     /// had on disk regardless of the current schema. Empty in the normal
-    /// document-indexing path, where [`Self::stores_doc_values`] instead
+    /// document-indexing path, where `Self::stores_doc_values` instead
     /// resolves from `fields` and `store_doc_values`.
     pub field_doc_values: HashMap<String, bool>,
 }
@@ -829,7 +829,7 @@ impl InvertedIndexWriter {
     /// are NOT registered with an index's manifest. Writers that should
     /// maintain the shared state are built by
     /// [`InvertedIndex::writer`](crate::lexical::index::inverted::InvertedIndex)
-    /// through [`Self::with_shared_state`].
+    /// through `Self::with_shared_state`.
     pub fn new(storage: Arc<dyn Storage>, config: InvertedIndexWriterConfig) -> Result<Self> {
         Self::build(storage, config, None, None)
     }
@@ -1743,7 +1743,7 @@ impl InvertedIndexWriter {
     /// Flush the currently buffered documents to a caller-named segment,
     /// returning the written file paths (Issue #753).
     ///
-    /// Unlike [`Self::flush_segment`], the segment name is supplied by the
+    /// Unlike `Self::flush_segment`, the segment name is supplied by the
     /// caller (the merge engine names the merged segment) and the auto-naming
     /// counter is left untouched. Buffers are cleared afterwards so the writer
     /// can be dropped. Returns an empty vector when nothing is buffered.
@@ -2756,8 +2756,8 @@ impl InvertedIndexWriter {
         ))
     }
 
-    /// Rebuild [`Self::segment_ranges`] / [`Self::max_committed_doc_id`]
-    /// and drop the cached [`Self::deletion_manager`].
+    /// Rebuild `Self::segment_ranges` / `Self::max_committed_doc_id`
+    /// and drop the cached `Self::deletion_manager`.
     ///
     /// A writer holding the shared manifest handle rebuilds from memory —
     /// infallible and I/O-free (#1024); a handle-less writer re-scans the
@@ -2851,7 +2851,7 @@ impl InvertedIndexWriter {
     /// Group-commit all buffered deletion state (Issue #875).
     ///
     /// Persists every dirty deletion bitmap via
-    /// [`DeletionManager::flush`](crate::maintenance::deletion::DeletionManager::flush)
+    /// `DeletionManager::flush`
     /// and then flips the pending `.meta` `has_deletions` flags — in that
     /// order, so a reader (or the merge engine) that observes the flag always
     /// finds the corresponding `.delmap` on storage.

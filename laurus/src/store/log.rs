@@ -734,7 +734,7 @@ impl DocumentLog {
     /// # Errors
     ///
     /// Returns an error if the WAL cannot be opened for appending (see
-    /// [`Self::ensure_writer`], which can sync the storage first), or
+    /// `Self::ensure_writer`, which can sync the storage first), or
     /// encoding, writing or syncing the record fails.
     pub fn append_put(
         &self,
@@ -1001,9 +1001,10 @@ impl DocumentLog {
     /// Force every appended-but-unsynced WAL record durable.
     ///
     /// Under the default per-record contract this is a near-no-op: each append
-    /// already self-syncs, so the [`WalWriterState::dirty`] guard skips the
+    /// already self-syncs, so the `WalWriterState::dirty` guard skips the
     /// fsync. It is the load-bearing commit-time barrier once a future
-    /// group-commit path (#542 Phase 4) defers per-append fsync — [`Engine::commit`]
+    /// group-commit path (#542 Phase 4) defers per-append fsync —
+    /// [`Engine::commit`](crate::engine::Engine::commit)
     /// calls it before any store materializes its state, so the WAL is never
     /// less durable than the committed lexical/vector indexes. A no-op if no
     /// writer is currently open (e.g. right after a [`Self::truncate`]).
@@ -1109,7 +1110,7 @@ impl DocumentLog {
     /// writing to the replaced file (under [`WalSyncPolicy::Group`] a
     /// buffered writer can leave part of a record in the file and the rest
     /// in its buffer). A file in an older framing keeps it; the first append
-    /// rewrites it in v4 (see [`Self::ensure_writer`]).
+    /// rewrites it in v4 (see `Self::ensure_writer`).
     ///
     /// A WAL whose header names a version this build does not know was
     /// written by a newer build, whose records this build can neither read
@@ -1131,7 +1132,7 @@ impl DocumentLog {
     /// Returns an error if the WAL has a version this build does not know,
     /// or if reading the WAL, or cutting it back, fails. A cut whose only
     /// failure is the storage sync after its rename leaves the cut file in
-    /// place (see [`Self::cut_wal`]).
+    /// place (see `Self::cut_wal`).
     pub fn read_all(&self) -> Result<Vec<LogRecord>> {
         // Held across the sweep, the read and the cut, so that no append
         // opens the file, and no replacement writes a temporary file, in
@@ -1381,7 +1382,7 @@ impl DocumentLog {
     /// Returns an error if flushing, reading back, recreating, or re-appending
     /// to the WAL file, or syncing the storage after it, fails. When the slow
     /// path fails only at the sync after its rename, the WAL is the new file
-    /// already (see [`Self::rewrite_wal`]).
+    /// already (see `Self::rewrite_wal`).
     pub fn truncate_retaining_after(&self, retain_after_seq: SeqNumber) -> Result<()> {
         // Hold the writer lock across the whole operation so a concurrent
         // append cannot interleave with the read-back and rewrite; it blocks
@@ -1667,7 +1668,8 @@ impl DocumentLog {
     ///
     /// # Errors
     ///
-    /// Returns [`LaurusError`] on storage I/O or deserialization failure.
+    /// Returns [`LaurusError`](crate::error::LaurusError) on storage I/O or
+    /// deserialization failure.
     pub fn get_documents_batch(
         &self,
         doc_ids: &[u64],

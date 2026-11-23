@@ -97,10 +97,8 @@ impl SynonymGraphBuilder {
     /// earlier synonym filter can leave it) lands on the last inner node.
     ///
     /// The index stores no `position_length`, so indexing lays the graph
-    /// out on its longest path ([`flatten_token_graph`]), where the paths'
+    /// out on its longest path (`flatten_token_graph`), where the paths'
     /// words share positions again.
-    ///
-    /// [`flatten_token_graph`]: crate::analysis::token::flatten_token_graph
     pub fn build_graph_tokens(
         &self,
         original_tokens: &[Token],

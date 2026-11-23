@@ -22,7 +22,7 @@
 //!
 //! Design notes:
 //!
-//! - **No chunk index / random-access seeking.** The reader ([`StoredFieldsReader::load`])
+//! - **No chunk index / random-access seeking.** The reader (`StoredFieldsReader::load`)
 //!   decodes every chunk sequentially into an in-memory `BTreeMap<u64, Document>`, exactly
 //!   matching the pre-#548 format's "decode the whole segment once" contract (locked in by
 //!   the `stored_documents_decode_once_per_segment` test, Issue #994). Nothing in this codebase

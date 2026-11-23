@@ -42,7 +42,7 @@ use crate::lexical::reader::LexicalIndexReader;
 ///
 /// // Results are limited by max_expansions (default 50)
 /// println!("Found {} matching terms", matching_terms.len());
-/// ```ignore
+/// ```
 pub trait MultiTermQuery: Query {
     /// Get the field name this query searches in.
     fn field(&self) -> &str;
@@ -99,7 +99,7 @@ pub trait MultiTermQuery: Query {
     ///     let automaton = LevenshteinAutomaton::build(&self.term, self.max_edits);
     ///     Ok(Box::new(AutomatonTermsEnum::new(terms, automaton)))
     /// }
-    /// ```ignore
+    /// ```
     fn get_terms_enum(
         &self,
         _reader: &dyn LexicalIndexReader,

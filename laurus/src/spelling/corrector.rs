@@ -281,7 +281,7 @@ impl SpellingCorrector {
     ///     ("world".to_string(), 50),
     /// ];
     /// corrector.learn_from_terms(terms.into_iter())?;
-    /// ```ignore
+    /// ```
     pub fn learn_from_terms<I>(&mut self, terms: I) -> Result<()>
     where
         I: IntoIterator<Item = (String, u32)>,

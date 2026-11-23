@@ -9,7 +9,7 @@
 //! header format and whether the inner writer's own pending-changes flag
 //! matters before a segment is sealed).
 //!
-//! [`SegmentedCore`] (deletion bitmap, WAL checkpoint, merge publish) and
+//! `SegmentedCore` (deletion bitmap, WAL checkpoint, merge publish) and
 //! [`SegmentedReaderCache`] are unchanged by this generic layer — they are
 //! also used by the MultiVector index (out of scope for #1409), so their
 //! public signatures stay as they are.
@@ -280,7 +280,7 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
     ///
     /// The manifest records the kind, dimension and distance the segments
     /// are written with, and an index that has segments only opens under
-    /// the same ones (Issue #1547; see [`check_field_record`]).
+    /// the same ones (Issue #1547; see `check_field_record`).
     ///
     /// # Errors
     ///

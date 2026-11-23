@@ -138,7 +138,9 @@ impl VectorIndexConfig {
         &self.embedder
     }
 
-    /// Build a per-field [`VectorIndexTypeConfig`] map from this
+    /// Build a per-field
+    /// [`VectorIndexTypeConfig`](crate::vector::index::config::VectorIndexTypeConfig)
+    /// map from this
     /// collection's schema (Issue [#948](https://github.com/mosuka/laurus/issues/948)).
     ///
     /// Replaces the old `VectorStore::extract_index_type_config`, which
@@ -146,7 +148,8 @@ impl VectorIndexConfig {
     /// first out of `fields` (a `HashMap`, so non-deterministic) --
     /// silently discarding every other field's dimension, distance metric,
     /// and HNSW parameters. This converts EVERY field carrying a `vector`
-    /// option, keyed by field name in a [`BTreeMap`] for deterministic
+    /// option, keyed by field name in a
+    /// [`BTreeMap`](std::collections::BTreeMap) for deterministic
     /// ordering (feeds directly into
     /// [`MultiFieldVectorIndex::open_or_create`](crate::vector::index::multi_field::MultiFieldVectorIndex::open_or_create)).
     ///
@@ -172,7 +175,8 @@ impl VectorIndexConfig {
 }
 
 /// Convert one field's schema-level [`FieldOption`] into a full
-/// [`VectorIndexTypeConfig`], given the collection-wide embedder and
+/// [`VectorIndexTypeConfig`](crate::vector::index::config::VectorIndexTypeConfig),
+/// given the collection-wide embedder and
 /// deletion policy (Issue [#948](https://github.com/mosuka/laurus/issues/948)).
 ///
 /// Shared by [`VectorIndexConfig::field_index_configs`] (batch conversion
