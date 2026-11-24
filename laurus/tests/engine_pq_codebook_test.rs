@@ -12,10 +12,12 @@
 //! the one in use. Each used to leave the field with no codebook.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use laurus::storage::file::FileStorageConfig;
+use laurus::storage::manifest::load_checksummed_json;
 use laurus::storage::prefixed::PrefixedStorage;
 use laurus::storage::{Storage, StorageConfig, StorageFactory};
 use laurus::vector::Vector;
@@ -340,13 +342,23 @@ fn train_shape(
     read_pq_codebook(root.as_ref(), name).unwrap().codebook
 }
 
-/// Damage codebook `embedding.pqcb` on disk.
-fn damage(dir: &TempDir) {
-    let path = dir.path().join("vector/embedding.pqcb");
-    let mut bytes = std::fs::read(&path).unwrap();
+/// Damage codebook `embedding.pqcb`, through the storage, which gives up its
+/// mapping of the file: Windows refuses to write to a mapped one.
+fn damage(storage: &Arc<dyn Storage>) {
+    const NAME: &str = "vector/embedding.pqcb";
+    const STAGED: &str = "vector/embedding.pqcb.damaged";
+    let mut bytes = Vec::new();
+    storage
+        .open_input(NAME)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0xff;
-    std::fs::write(&path, bytes).unwrap();
+    let mut output = storage.create_output(STAGED).unwrap();
+    output.write_all(&bytes).unwrap();
+    output.close().unwrap();
+    storage.rename_file(STAGED, NAME).unwrap();
 }
 
 /// Put documents `ids`, each with a vector of its own.
@@ -383,21 +395,24 @@ fn ids(numbers: impl IntoIterator<Item = u64>) -> BTreeSet<String> {
 }
 
 /// The centroids each of the field's HNSW segments embeds, `None` for one
-/// that is not product-quantized, oldest first.
+/// that is not product-quantized, in the order of the field's manifest,
+/// oldest first. A file of a replaced segment can stay on Windows until the
+/// next open, so the files are not listed.
 fn segment_codebooks(storage: &Arc<dyn Storage>) -> Vec<Option<Vec<f32>>> {
     let field: Arc<dyn Storage> = Arc::new(PrefixedStorage::new("embedding", vector_root(storage)));
-    let mut names: Vec<String> = field
-        .list_files()
+    let Some((manifest, _)) =
+        load_checksummed_json::<serde_json::Value>(field.as_ref(), "segments.json", None).unwrap()
+    else {
+        return Vec::new();
+    };
+    manifest["segments"]
+        .as_array()
         .unwrap()
-        .into_iter()
-        .filter_map(|file| file.strip_suffix(".hnsw").map(str::to_string))
-        .collect();
-    names.sort();
-    names
-        .into_iter()
-        .map(|name| {
+        .iter()
+        .map(|segment| {
+            let name = segment["segment_id"].as_str().unwrap();
             let reader =
-                HnswIndexReader::load(field.clone(), &name, DistanceMetric::Euclidean).unwrap();
+                HnswIndexReader::load(field.clone(), name, DistanceMetric::Euclidean).unwrap();
             match reader.vectors() {
                 VectorStorage::OwnedPq(pool) => Some(pool.codebook.clone()),
                 _ => None,
@@ -619,7 +634,7 @@ async fn a_metadata_only_change_keeps_the_codebook_in_use() {
             let mut again = codebook.clone();
             match file {
                 "trained again" => again = train(&storage, "embedding.pqcb", 2),
-                "damaged" => damage(&dir),
+                "damaged" => damage(&storage),
                 "removed" => storage.delete_file("vector/embedding.pqcb").unwrap(),
                 _ => {}
             }
@@ -688,7 +703,7 @@ async fn a_corrupt_codebook_fails_a_change_before_anything_changes() {
         let engine = open(&storage, Some(before.clone())).await;
         put(&engine, 0..20).await;
         engine.commit().await.unwrap();
-        damage(&dir);
+        damage(&storage);
         let files = field_files(&dir);
         match engine
             .update_field("embedding", after.clone(), REINDEX)
@@ -727,7 +742,7 @@ async fn a_corrupt_codebook_fails_a_change_before_anything_changes() {
     let dir = TempDir::new().unwrap();
     let storage = file_storage(&dir);
     let codebook = train(&storage, "embedding.pqcb", 1);
-    damage(&dir);
+    damage(&storage);
     let engine = open(&storage, None).await;
     match engine.add_field("embedding", hnsw(|_| {})).await {
         Err(e) if e.to_string().contains("corrupted") => {}
