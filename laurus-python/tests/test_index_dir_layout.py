@@ -110,7 +110,7 @@ def _schema_with_malformed_regex_analyzer():
 def test_build_failure_leaves_nothing_behind_and_retry_succeeds(tmp_path):
     schema = _schema_with_malformed_regex_analyzer()
 
-    with pytest.raises(RuntimeError, match="Invalid regex pattern"):
+    with pytest.raises(ValueError, match="Invalid regex pattern"):
         laurus.Index(path=str(tmp_path), schema=schema)
 
     assert not (tmp_path / "schema.toml").exists()
@@ -133,7 +133,7 @@ def test_build_failure_does_not_remove_unrelated_pre_existing_files(tmp_path):
 
     schema = _schema_with_malformed_regex_analyzer()
 
-    with pytest.raises(RuntimeError, match="Invalid regex pattern"):
+    with pytest.raises(ValueError, match="Invalid regex pattern"):
         laurus.Index(path=str(tmp_path), schema=schema)
 
     assert (tmp_path / "README.txt").is_file()

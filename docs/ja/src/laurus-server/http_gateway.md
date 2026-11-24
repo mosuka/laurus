@@ -88,6 +88,15 @@ curl -X POST http://localhost:8080/v1/index \
 
 本文のスキーマのうち、コンポーネントとエンベッダー以外（アナライザーの `char_filters`・`tokenizer`・`token_filters` のキー、フィールドのオプション、スキーマの一番上の階層）は gateway が自分で読み、そこでも取らないキーを拒否します。たとえば `text` のフィールドのオプションの `"indexd"` がこれに当たります（[リクエスト/レスポンス形式](#リクエストレスポンス形式) を参照、Issue #1706）。
 
+読めてもエンジンが使えないスキーマも 400 で拒否され、インデックスは作られません（Issue #1730）。定義のない `analyzer` を指定したテキストフィールド、設定の誤ったアナライザー（誤った正規表現、大小が逆の `ngram` の範囲、未知の `mode`・`form`・`stem_type`）、宣言のない、またはフィールドに合わない `embedder` を指定したベクトルフィールドが当たります。メッセージはフィールドを名指しし、`POST /v1/schema/fields` も同じように返します。読み込めない Lindera 辞書は 500 です。この修正より古いサーバーは、`POST /v1/index` でこれらすべてに 500 を返していました。たとえば次のようになります。
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"body": {"text": {"analyzer": "trigram"}}}, "analyzers": {"trigram": {"tokenizer": {"type": "ngram", "min_gram": 3, "max_gram": 2}}}}}'
+# => {"error":{"code":400,"message":"Invalid argument: Failed to resolve analyzer for field 'body': max_gram (2) must be >= min_gram (3)"}}
+```
+
 データディレクトリに `store/` があり `schema.toml` がない場合、リクエストは 412 で拒否され、何も書き込まず何も削除しません。`store/` に以前のインデックスのドキュメントが残っている可能性があるためです（Issue #1560）。そのインデックスを開くには `schema.toml` を戻してサーバーを再起動し、新しいインデックスを作るには `store/` を削除してください。このチェックより前のサーバーは、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。
 
 ### インデックス統計情報の取得

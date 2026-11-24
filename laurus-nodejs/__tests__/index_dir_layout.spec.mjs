@@ -114,7 +114,10 @@ describe("Index.create build-time failure cleanup (#1308)", () => {
   it("a build failure in a fresh directory leaves nothing behind, and a fixed retry succeeds", async () => {
     const dir = freshDir();
 
-    await expect(Index.create(dir, brokenSchema())).rejects.toThrow();
+    // The caller's mistake (Issue #1730).
+    await expect(Index.create(dir, brokenSchema())).rejects.toMatchObject({
+      code: "InvalidArg",
+    });
     expect(existsSync(join(dir, "schema.toml"))).toBe(false);
     expect(existsSync(join(dir, "store"))).toBe(false);
 
@@ -127,7 +130,10 @@ describe("Index.create build-time failure cleanup (#1308)", () => {
     const dir = freshDir();
     writeFileSync(join(dir, "README.txt"), "keep me");
 
-    await expect(Index.create(dir, brokenSchema())).rejects.toThrow();
+    // The caller's mistake (Issue #1730).
+    await expect(Index.create(dir, brokenSchema())).rejects.toMatchObject({
+      code: "InvalidArg",
+    });
 
     expect(existsSync(join(dir, "README.txt"))).toBe(true);
     expect(existsSync(join(dir, "schema.toml"))).toBe(false);

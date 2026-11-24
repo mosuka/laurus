@@ -1,10 +1,12 @@
 //! Error-to-[`tonic::Status`] conversion utilities.
 //!
-//! Maps [`LaurusError`] variants to appropriate gRPC status codes (e.g.
-//! `INVALID_ARGUMENT`, `FAILED_PRECONDITION`, `UNIMPLEMENTED`, `INTERNAL`)
-//! and provides a catch-all converter for [`anyhow::Error`].
+//! Maps [`LaurusError`] and [`IndexDirError`] variants to appropriate gRPC
+//! status codes (e.g. `INVALID_ARGUMENT`, `FAILED_PRECONDITION`,
+//! `UNIMPLEMENTED`, `INTERNAL`) and provides a catch-all converter for
+//! [`anyhow::Error`].
 
 use laurus::LaurusError;
+use laurus::index_dir::IndexDirError;
 use tonic::Status;
 
 /// Convert a LaurusError into a tonic Status.
@@ -57,17 +59,26 @@ fn code_for(err: &LaurusError) -> tonic::Code {
 }
 
 /// Convert the error of `crate::context::create_index` into a tonic
-/// Status: an index that already exists, or that another call is creating
-/// or opening, is `ALREADY_EXISTS`, and a `store/` left without
-/// `schema.toml` is `FAILED_PRECONDITION` (Issue #1560, #1665). Any other
-/// error converts as in [`anyhow_to_status`].
-pub fn create_index_to_status(err: anyhow::Error) -> Status {
-    use laurus::index_dir::IndexDirError;
-    match err.downcast_ref::<IndexDirError>() {
-        Some(IndexDirError::AlreadyExists { .. }) => Status::already_exists(err.to_string()),
-        Some(IndexDirError::LeftoverStore { .. }) => Status::failed_precondition(err.to_string()),
-        _ => anyhow_to_status(err),
-    }
+/// Status.
+///
+/// An index that already exists, or that another call is creating or
+/// opening, is `ALREADY_EXISTS`, and a `store/` left without `schema.toml`
+/// is `FAILED_PRECONDITION` (Issue #1560, #1665). An error of the core, such
+/// as a schema the engine cannot be built from, is classified as in
+/// [`to_status`], so that a mistake of the caller's is `INVALID_ARGUMENT`
+/// (Issue #1730). Anything else is `INTERNAL`.
+pub fn index_dir_to_status(err: IndexDirError) -> Status {
+    let code = match &err {
+        IndexDirError::AlreadyExists { .. } => tonic::Code::AlreadyExists,
+        IndexDirError::LeftoverStore { .. } => tonic::Code::FailedPrecondition,
+        IndexDirError::Core(err) => code_for(err),
+        IndexDirError::SchemaConflict { .. }
+        | IndexDirError::LegacyFlatLayout { .. }
+        | IndexDirError::InUse { .. }
+        | IndexDirError::Io { .. }
+        | IndexDirError::NotAnIndexDirectory { .. } => tonic::Code::Internal,
+    };
+    Status::new(code, err.to_string())
 }
 
 /// Convert an anyhow::Error into a tonic Status.
@@ -177,5 +188,71 @@ mod tests {
         let status = batch_search_to_status(LaurusError::invalid_argument("bad value"));
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert_eq!(status.message(), "Invalid argument: bad value");
+    }
+
+    /// Issue #1730: an error of the core keeps the code `to_status` gives
+    /// it, and the message of every variant is its `Display`.
+    #[test]
+    fn index_dir_errors_are_classified_by_variant() {
+        use tonic::Code;
+
+        let path = || std::path::PathBuf::from("idx");
+        let io_error = || std::io::Error::other("the disk is full");
+        let cases = [
+            (
+                IndexDirError::AlreadyExists { path: path() },
+                Code::AlreadyExists,
+            ),
+            (
+                IndexDirError::LeftoverStore { path: path() },
+                Code::FailedPrecondition,
+            ),
+            (
+                IndexDirError::Core(LaurusError::invalid_argument("bad value")),
+                Code::InvalidArgument,
+            ),
+            (
+                IndexDirError::Core(LaurusError::not_implemented("no such feature")),
+                Code::Unimplemented,
+            ),
+            (
+                IndexDirError::Core(LaurusError::analysis("no dictionary")),
+                Code::Internal,
+            ),
+            (
+                IndexDirError::Core(LaurusError::storage("disk on fire")),
+                Code::Internal,
+            ),
+            (
+                IndexDirError::Core(LaurusError::from(io_error())),
+                Code::Internal,
+            ),
+            (
+                IndexDirError::Io {
+                    path: path(),
+                    error: io_error(),
+                },
+                Code::Internal,
+            ),
+            (
+                IndexDirError::SchemaConflict { path: path() },
+                Code::Internal,
+            ),
+            (
+                IndexDirError::LegacyFlatLayout { path: path() },
+                Code::Internal,
+            ),
+            (IndexDirError::InUse { path: path() }, Code::Internal),
+            (
+                IndexDirError::NotAnIndexDirectory { path: path() },
+                Code::Internal,
+            ),
+        ];
+        for (err, code) in cases {
+            let message = err.to_string();
+            let status = index_dir_to_status(err);
+            assert_eq!(status.code(), code, "{message}");
+            assert_eq!(status.message(), message);
+        }
     }
 }

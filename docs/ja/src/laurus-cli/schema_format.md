@@ -600,7 +600,7 @@ analyzer = "english_stemmed"
 
 - 未知の `type`、必須キーの欠落、コンポーネントが取らないキー（[知らないキー](#知らないキー) を参照）は、スキーマの解析時にエラーになります。このとき `create index` は何も作りません。
 - 組み込みと同じ名前のエントリは、インデックスの作成時に `Analyzer name 'standard' is reserved for a built-in analyzer; choose another name` というエラーになります。このとき `create index` は何も作りません。各バインディングの `addAnalyzer` / `add_analyzer`（WASM では `addAnalyzerDefinition`）も同じエラーを返します。この検査より前に作ったインデックスは、これまでどおり開けます。エントリは使われないままで、開くときに `log` クレートで警告を出します（`laurus-server` はこれをログに表示します）。`boost` が有限でないか負の `boost` トークンフィルターも、同じく `Analyzer 'a': token_filters[0]: boost must be finite and at least 0, got NaN` というエラーになります（Issue #1701）。バインディングの `addAnalyzer` はこれを検査せず、インデックスの作成が検査します。この検査より前に作ったインデックスは、そのフィルターを外して警告を出したうえで開くので、それまでの検索結果のままです。Issue #1701 より前は、このフィルターはどのスコアも変えていませんでした。
-- 不正な値（誤った正規表現、未知の `form` や `stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。このとき `create index` は何も作りません — `schema.toml` と `store/` は、呼び出し前の状態（何もなければ「何もない」状態）まで巻き戻されます。
+- 不正な値（誤った正規表現、大小が逆の `ngram` の範囲、未知の `mode`・`form`・`stem_type`、存在しない Lindera 辞書）や、どこにも見つからない `analyzer` の名前は、インデックスの構築時に `Failed to resolve analyzer for field 'body': ...` のようなエラーになります。このとき `create index` は何も作りません — `schema.toml` と `store/` は、呼び出し前の状態（何もなければ「何もない」状態）まで巻き戻されます。辞書のほかは引数の誤りで（Issue #1730）、`laurus-server` は `INVALID_ARGUMENT`（HTTP では 400）を返し、バインディングは `ValueError`（Python、PHP）、`ArgumentError`（Ruby）、code が `InvalidArg` のエラー（Node.js）を投げます。読み込めない辞書は `INTERNAL`（500）で、バインディングは `RuntimeError`（Python、Ruby）、`Exception`（PHP）、code が `GenericFailure` のエラー（Node.js）を投げます。
 
 ### 例: ステミング付きの英語テキスト
 

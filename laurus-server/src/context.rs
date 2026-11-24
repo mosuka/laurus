@@ -65,36 +65,34 @@ fn schema_persist_hook(data_dir: &Path) -> laurus::SchemaPersistHook {
 /// A `store/` left without `schema.toml` is checked here only once the
 /// claim is held ([`IndexDirError::LeftoverStore`]): the caller,
 /// `IndexService::create_index`, refuses it first with
-/// [`laurus::index_dir::check_no_leftover_store`] (Issue #1560). Both errors
-/// are returned as [`IndexDirError`], so that the caller can report them
-/// with their own status codes.
+/// [`laurus::index_dir::check_no_leftover_store`] (Issue #1560). An engine
+/// that cannot be built from `schema` is an [`IndexDirError::Core`]. The
+/// caller reports each error with its own status code (Issue #1730).
 pub async fn create_index(
     data_dir: &Path,
     schema: &Schema,
     wal_policy: WalSyncPolicy,
     commit_policy: CommitPolicy,
-) -> anyhow::Result<Engine> {
+) -> Result<Engine, IndexDirError> {
     let already_exists = || IndexDirError::AlreadyExists {
         path: data_dir.to_path_buf(),
     };
     if data_dir.join(SCHEMA_FILE).exists() {
-        return Err(already_exists().into());
+        return Err(already_exists());
     }
 
     let claim = IndexDirClaim::acquire_for_create(data_dir)?;
 
     // A failure from here on must not leave schema.toml/store/ behind to
     // block a retry (Issue #1308), so undo exactly what this call added.
-    let result: anyhow::Result<Engine> = async {
+    let result: Result<Engine, IndexDirError> = async {
         if claim.schema_existed() {
-            return Err(already_exists().into());
+            return Err(already_exists());
         }
         laurus::index_dir::check_no_leftover_store(data_dir)?;
 
         // schema.toml, then store/, durably and in that order (Issue #1587).
-        let storage = claim
-            .create_schema_and_store(schema)
-            .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
+        let storage = claim.create_schema_and_store(schema)?;
         let engine = Engine::builder(storage, schema.clone())
             .wal_sync_policy(wal_policy)
             .commit_policy(commit_policy)
