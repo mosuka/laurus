@@ -37,6 +37,8 @@ rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
 
 Create a new index with the given schema. Fails with `ALREADY_EXISTS` if an index is already open, if the data directory already holds an index (one another process created, for example), or if another process is creating or opening an index there at the same moment (Issue #1665), and with `FAILED_PRECONDITION` if the data directory has a `store/` but no `schema.toml` (Issue #1560): the `store/` may hold the documents of an earlier index, so nothing is written or removed. Restore `schema.toml` and restart the server to open that index, or remove `store/` to create a new one. A server older than this check opened such a `store/` as the new index's storage and served its documents.
 
+A schema the engine cannot use fails with `INVALID_ARGUMENT`, as from `AddField`, and creates nothing: an analyzer that is not defined or has a wrong setting (such as a malformed regular expression), or an embedder that is not declared or does not fit its field. A Lindera dictionary that cannot be loaded fails with `INTERNAL`. A server older than Issue #1730 answered `INTERNAL` to all of these.
+
 ```protobuf
 rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
 ```
@@ -848,10 +850,10 @@ gRPC errors are returned as standard `Status` codes:
 
 | Laurus Error | gRPC Status | When |
 | :--- | :--- | :--- |
-| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query, a search whose `offset + limit` exceeds `max_result_window` |
+| Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, a schema the engine cannot use (such as an analyzer that is not defined), unknown field in a query, a search whose `offset + limit` exceeds `max_result_window` |
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
 | Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed at or after its write-ahead-log append; restart the server to replay the log, which applies that write whole if its record reached the log in full, and otherwise not at all (see [Failed Writes](../laurus/persistence.md#failed-writes)). A write whose call is cancelled, whose deadline expires or whose client disconnects does not stop writes: each of its documents is either applied in full or not written at all |
 | Leftover store | `FAILED_PRECONDITION` | `CreateIndex` over a data directory that has a `store/` but no `schema.toml` |
 | Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice, over an index another process created, or while another process creates or opens an index in the data directory |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |
-| Internal errors | `INTERNAL` | I/O, storage, or unexpected errors |
+| Internal errors | `INTERNAL` | I/O, storage, or unexpected errors, a Lindera dictionary that cannot be loaded |

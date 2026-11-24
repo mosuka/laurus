@@ -138,6 +138,22 @@ read by the gateway itself, which rejects a key it does not take there too,
 such as `"indexd"` in a `text` field option (see
 [Request/Response Format](#requestresponse-format); Issue #1706).
 
+A schema that is read but that the engine cannot use is rejected with 400
+too, and no index is created (Issue #1730): a text field whose `analyzer` is
+not defined, an analyzer with a wrong setting (a malformed regular
+expression, `ngram` sizes out of order, or an unknown `mode`, `form` or
+`stem_type`), or a vector field whose `embedder` is not declared or does not
+fit it. The message names the field, and `POST /v1/schema/fields` answers the
+same. A Lindera dictionary that cannot be loaded is a 500. A server older
+than this fix answered 500 to all of these on `POST /v1/index`. For example:
+
+```bash
+curl -X POST http://localhost:8080/v1/index \
+  -H 'Content-Type: application/json' \
+  -d '{"schema": {"fields": {"body": {"text": {"analyzer": "trigram"}}}, "analyzers": {"trigram": {"tokenizer": {"type": "ngram", "min_gram": 3, "max_gram": 2}}}}}'
+# => {"error":{"code":400,"message":"Invalid argument: Failed to resolve analyzer for field 'body': max_gram (2) must be >= min_gram (3)"}}
+```
+
 If the data directory has a `store/` but no `schema.toml`, the request is
 rejected with 412 and nothing is written or removed, since the `store/` may
 hold the documents of an earlier index (Issue #1560). Restore `schema.toml`

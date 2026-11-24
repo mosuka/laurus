@@ -203,9 +203,10 @@ pub fn create_analyzer_by_name(name: &str) -> Result<Arc<dyn Analyzer>> {
 ///
 /// # Errors
 ///
-/// Returns an error if no resolution path applies (unknown name with
-/// no runtime, built-in, or schema entry) or if dictionary loading
-/// fails for a built-in preset.
+/// Returns [`LaurusError::InvalidArgument`] if no resolution path applies
+/// (unknown name with no runtime, built-in, or schema entry) or if a
+/// setting is wrong, and [`LaurusError::Analysis`] if a dictionary cannot be
+/// loaded (Issue #1730).
 ///
 /// [`EngineBuilder::register_runtime_analyzer`]: crate::engine::EngineBuilder::register_runtime_analyzer
 pub fn create_analyzer_from_spec(
@@ -266,8 +267,9 @@ pub fn create_analyzer_from_spec(
 ///
 /// # Errors
 ///
-/// Returns an error if any component configuration is invalid
-/// (e.g. bad regex pattern, unknown stemmer type).
+/// Returns [`LaurusError::InvalidArgument`] if a component's setting is
+/// wrong (e.g. a malformed regex pattern, an unknown stemmer type), and
+/// [`LaurusError::Analysis`] if a dictionary cannot be loaded (Issue #1730).
 pub fn create_analyzer_from_definition(
     name: &str,
     definition: &AnalyzerDefinition,
@@ -615,5 +617,99 @@ mod tests {
         }
         assert_eq!(boosts(2.0), [2.0, 2.0]);
         assert_eq!(boosts(0.0), [0.0, 0.0]);
+    }
+
+    /// Issue #1730: a setting that is wrong is the caller's mistake,
+    /// `InvalidArgument`, in every component. The regular expressions, the
+    /// n-gram sizes and the Lindera mode used to be `Analysis` or `Anyhow`.
+    #[test]
+    fn a_malformed_setting_is_a_caller_error() {
+        let cases = [
+            (
+                r#"{"tokenizer": {"type": "regex", "pattern": "("}}"#,
+                "Invalid regex pattern: ",
+            ),
+            (
+                r#"{"tokenizer": {"type": "regex", "pattern": "(", "gaps": true}}"#,
+                "Invalid regex pattern: ",
+            ),
+            (
+                r#"{"tokenizer": {"type": "ngram", "min_gram": 0, "max_gram": 2}}"#,
+                "min_gram must be at least 1",
+            ),
+            (
+                r#"{"tokenizer": {"type": "ngram", "min_gram": 3, "max_gram": 2}}"#,
+                "max_gram (2) must be >= min_gram (3)",
+            ),
+            (
+                r#"{"tokenizer": {"type": "lindera", "mode": "nope", "dict": "/nonexistent"}}"#,
+                "Invalid mode 'nope': ",
+            ),
+            (
+                r#"{"tokenizer": {"type": "whitespace"},
+                    "char_filters": [
+                        {"type": "pattern_replace", "pattern": "(", "replacement": ""}
+                    ]}"#,
+                "Invalid regex pattern: ",
+            ),
+            (
+                r#"{"tokenizer": {"type": "whitespace"},
+                    "char_filters": [{"type": "unicode_normalization", "form": "nfx"}]}"#,
+                "Unknown normalization form: nfx",
+            ),
+            (
+                r#"{"tokenizer": {"type": "whitespace"},
+                    "token_filters": [{"type": "stem", "stem_type": "nope"}]}"#,
+                "Unknown stemmer type: nope",
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (definition, message) in cases {
+            let parsed: AnalyzerDefinition = serde_json::from_str(definition).unwrap();
+            match create_analyzer_from_definition("a", &parsed).map(|_| ()) {
+                Err(LaurusError::InvalidArgument(m)) if m.starts_with(message) => {}
+                other => wrong.push(format!("{definition}: {other:?}")),
+            }
+        }
+        let japanese = AnalyzerSpec::Builtin(BuiltinAnalyzerSpec::Japanese {
+            mode: "nope".into(),
+            dict: "/nonexistent".into(),
+            user_dict: None,
+        });
+        match create_analyzer_from_spec(&japanese, &Default::default(), &Default::default())
+            .map(|_| ())
+        {
+            Err(LaurusError::InvalidArgument(m)) if m.starts_with("Invalid mode 'nope': ") => {}
+            other => wrong.push(format!("japanese: {other:?}")),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1253, #1730: a dictionary that cannot be loaded is not the
+    /// caller's mistake, so it stays `Analysis`.
+    #[test]
+    fn a_dictionary_that_cannot_be_loaded_is_not_a_caller_error() {
+        let definition: AnalyzerDefinition = serde_json::from_str(
+            r#"{"tokenizer": {"type": "lindera", "mode": "normal", "dict": "/nonexistent"}}"#,
+        )
+        .unwrap();
+        let japanese = AnalyzerSpec::Builtin(BuiltinAnalyzerSpec::Japanese {
+            mode: "normal".into(),
+            dict: "/nonexistent".into(),
+            user_dict: None,
+        });
+        for result in [
+            create_analyzer_from_definition("a", &definition),
+            create_analyzer_from_spec(&japanese, &Default::default(), &Default::default()),
+        ] {
+            let result = result.map(|_| ());
+            assert!(
+                matches!(
+                    &result,
+                    Err(LaurusError::Analysis(m)) if m.starts_with("Failed to load dictionary: ")
+                ),
+                "{result:?}"
+            );
+        }
     }
 }

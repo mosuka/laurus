@@ -47,8 +47,7 @@ impl IndexServiceTrait for IndexService {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("schema is required"))?;
         let schema = schema_convert::from_proto(proto_schema).map_err(Status::invalid_argument)?;
-        // Here rather than in `context::create_index`, whose anyhow error
-        // would be reported as Internal instead of InvalidArgument.
+        // Before the data directory is looked at or written to.
         schema.validate_for_create().map_err(error::to_status)?;
 
         let mut guard = self.engine.write().await;
@@ -57,17 +56,19 @@ impl IndexServiceTrait for IndexService {
         }
         // A store/ left without schema.toml would be opened as the new
         // index's storage and serve its documents (Issue #1560). Checked
-        // here for the same reason as `validate_for_create`, so that it is
-        // reported as FailedPrecondition.
+        // here too, before `context::create_index` takes the directory's
+        // lock.
         laurus::index_dir::check_no_leftover_store(&self.data_dir)
-            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            .map_err(error::index_dir_to_status)?;
 
         // An index another process created or is creating (Issue #1665) is
-        // ALREADY_EXISTS, as one this server loaded is above.
+        // ALREADY_EXISTS, as one this server loaded is above. A schema the
+        // engine cannot be built from is classified by its error, as
+        // AddField does (Issue #1730).
         let engine =
             context::create_index(&self.data_dir, &schema, self.wal_policy, self.commit_policy)
                 .await
-                .map_err(error::create_index_to_status)?;
+                .map_err(error::index_dir_to_status)?;
         *guard = Some(engine);
 
         tracing::info!("Index created at {}", self.data_dir.display());
@@ -447,6 +448,131 @@ mod tests {
             "{message}"
         );
         assert_eq!(message.matches("os error").count(), 1, "{message}");
+    }
+
+    /// Issue #1730: a schema the engine cannot be built from is classified
+    /// by its error, and `CreateIndex` classifies it as `AddField` does.
+    /// `CreateIndex` used to answer `INTERNAL` to each of these, and
+    /// `AddField` to the malformed regular expressions, n-gram sizes and
+    /// mode. Neither leaves anything behind.
+    #[tokio::test]
+    async fn create_index_and_add_field_classify_a_rejected_field_alike() {
+        use tonic::Code::{Internal, InvalidArgument};
+
+        const TEXT: &str = "[fields.body.Text]\nanalyzer = \"a\"\n";
+        let analyzer = |component: &str| format!("[analyzers.a]\n{component}\n");
+        let whitespace = "tokenizer = { type = \"whitespace\" }";
+        // The definitions the schema holds, the field, the code of both
+        // calls, and what both messages say.
+        let cases = [
+            (
+                String::new(),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': Unknown analyzer 'a'",
+            ),
+            (
+                analyzer(&format!(
+                    "{whitespace}\nchar_filters = [{{ type = \"unicode_normalization\", form = \"nfx\" }}]"
+                )),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': Unknown normalization form: nfx",
+            ),
+            (
+                analyzer(&format!(
+                    "{whitespace}\ntoken_filters = [{{ type = \"stem\", stem_type = \"nope\" }}]"
+                )),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': Unknown stemmer type: nope",
+            ),
+            (
+                analyzer("tokenizer = { type = \"regex\", pattern = \"(\" }"),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': Invalid regex pattern: ",
+            ),
+            (
+                analyzer(&format!(
+                    "{whitespace}\nchar_filters = [{{ type = \"pattern_replace\", pattern = \"(\", replacement = \"\" }}]"
+                )),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': Invalid regex pattern: ",
+            ),
+            (
+                analyzer("tokenizer = { type = \"ngram\", min_gram = 3, max_gram = 2 }"),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': max_gram (2) must be >= min_gram (3)",
+            ),
+            (
+                analyzer(
+                    "tokenizer = { type = \"lindera\", mode = \"nope\", dict = \"/nonexistent\" }",
+                ),
+                TEXT,
+                InvalidArgument,
+                "for field 'body': Invalid mode 'nope': ",
+            ),
+            (
+                String::new(),
+                "[fields.body.Hnsw]\ndimension = 4\nembedder = \"nope\"\n",
+                InvalidArgument,
+                "Unknown embedder 'nope' for field 'body'",
+            ),
+            (
+                "[embedders.c]\ntype = \"candle_colbert\"\nmodel = \"m\"\n".to_string(),
+                "[fields.body.Hnsw]\ndimension = 4\nembedder = \"c\"\n",
+                InvalidArgument,
+                "but field 'body' holds one vector per document",
+            ),
+            // Not the caller's mistake (Issue #1253).
+            (
+                analyzer(
+                    "tokenizer = { type = \"lindera\", mode = \"normal\", dict = \"/nonexistent\" }",
+                ),
+                TEXT,
+                Internal,
+                "for field 'body': Failed to load dictionary: ",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (definitions, field, code, says) in cases {
+            let mut check = |call: &str, status: Status| {
+                if status.code() != code || !status.message().contains(says) {
+                    wrong.push(format!("{call} of {definitions}{field}: {status:?}"));
+                }
+            };
+            let proto = schema_convert::to_proto(
+                &Schema::from_toml(&format!("{definitions}{field}")).unwrap(),
+            );
+
+            let dir = tempfile::tempdir().unwrap();
+            let data_dir = dir.path().join("data");
+            let service = service_without_index(&data_dir);
+            let created = service
+                .create_index(Request::new(CreateIndexRequest {
+                    schema: Some(proto.clone()),
+                }))
+                .await;
+            check("CreateIndex", created.unwrap_err());
+            assert!(!data_dir.exists(), "a failed create must leave nothing");
+            assert!(service.engine.read().await.is_none());
+
+            let (_dir, service) =
+                service_with_index(&format!("{definitions}[fields.title.Text]\n")).await;
+            let added = service
+                .add_field(Request::new(AddFieldRequest {
+                    name: "body".to_string(),
+                    field_option: proto.fields.get("body").cloned(),
+                }))
+                .await;
+            check("AddField", added.unwrap_err());
+            assert!(!schema_of(&service).await.fields.contains_key("body"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// The schema `GetSchema` returns, which is read back from disk.

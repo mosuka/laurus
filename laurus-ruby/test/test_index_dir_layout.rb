@@ -124,9 +124,9 @@ class TestIndexDirLayout < Minitest::Test
       bad_schema = Laurus::Schema.from_toml(MALFORMED_REGEX_SCHEMA_TOML)
 
       # A bad regex is only caught once the engine resolves the analyzer at
-      # build time -- it surfaces as `LaurusError::Analysis`, which
-      # `laurus_err` maps to `RuntimeError` (not `ArgumentError`).
-      err = assert_raises(RuntimeError) do
+      # build time -- it surfaces as `LaurusError::InvalidArgument`, which
+      # `laurus_err` maps to `ArgumentError` (Issue #1730).
+      err = assert_raises(ArgumentError) do
         Laurus::Index.new(path: index_dir, schema: bad_schema)
       end
       assert_match(/Failed to resolve analyzer for field 'body'/, err.message)
@@ -152,7 +152,7 @@ class TestIndexDirLayout < Minitest::Test
       File.write(File.join(dir, "README.txt"), "keep me")
 
       bad_schema = Laurus::Schema.from_toml(MALFORMED_REGEX_SCHEMA_TOML)
-      err = assert_raises(RuntimeError) do
+      err = assert_raises(ArgumentError) do
         Laurus::Index.new(path: dir, schema: bad_schema)
       end
       assert_match(/Failed to resolve analyzer for field 'body'/, err.message)

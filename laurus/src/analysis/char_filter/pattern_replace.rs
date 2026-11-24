@@ -1,6 +1,7 @@
 use regex::Regex;
 
 use super::{CharFilter, Transformation};
+use crate::error::LaurusError;
 
 /// A char filter that replaces characters matching a regex pattern.
 pub struct PatternReplaceCharFilter {
@@ -10,10 +11,16 @@ pub struct PatternReplaceCharFilter {
 
 impl PatternReplaceCharFilter {
     /// Create a new pattern replace char filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if `pattern` is not a valid
+    /// regular expression.
     pub fn new(pattern: &str, replacement: &str) -> crate::error::Result<Self> {
         Ok(Self {
-            pattern: Regex::new(pattern)
-                .map_err(|e| crate::error::LaurusError::Anyhow(anyhow::Error::from(e)))?,
+            pattern: Regex::new(pattern).map_err(|e| {
+                LaurusError::invalid_argument(format!("Invalid regex pattern: {e}"))
+            })?,
             replacement: replacement.to_string(),
         })
     }

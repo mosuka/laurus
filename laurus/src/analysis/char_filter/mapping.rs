@@ -2,6 +2,7 @@ use aho_corasick::{AhoCorasick, MatchKind};
 use std::collections::BTreeMap;
 
 use super::{CharFilter, Transformation};
+use crate::error::LaurusError;
 
 pub struct MappingCharFilter {
     ac: AhoCorasick,
@@ -9,6 +10,13 @@ pub struct MappingCharFilter {
 }
 
 impl MappingCharFilter {
+    /// Create a char filter that replaces each key of `mapping` with its
+    /// value, the longest key first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if the keys are too large to
+    /// search for.
     pub fn new(mapping: BTreeMap<String, String>) -> crate::error::Result<Self> {
         let mut keys = Vec::new();
         let mut replacements = Vec::new();
@@ -23,7 +31,7 @@ impl MappingCharFilter {
         let ac = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
             .build(&keys)
-            .map_err(|e| crate::error::LaurusError::Anyhow(anyhow::Error::from(e)))?;
+            .map_err(|e| LaurusError::invalid_argument(format!("Invalid mapping: {e}")))?;
 
         Ok(Self { ac, replacements })
     }

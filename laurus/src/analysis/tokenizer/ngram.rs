@@ -79,17 +79,17 @@ impl NgramTokenizer {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
+    /// Returns [`LaurusError::InvalidArgument`] if:
     /// - `min_gram` is 0
     /// - `max_gram` is less than `min_gram`
     pub fn new(min_gram: usize, max_gram: usize) -> Result<Self> {
         if min_gram == 0 {
-            return Err(LaurusError::analysis(
+            return Err(LaurusError::invalid_argument(
                 "min_gram must be at least 1".to_string(),
             ));
         }
         if max_gram < min_gram {
-            return Err(LaurusError::analysis(format!(
+            return Err(LaurusError::invalid_argument(format!(
                 "max_gram ({}) must be >= min_gram ({})",
                 max_gram, min_gram
             )));

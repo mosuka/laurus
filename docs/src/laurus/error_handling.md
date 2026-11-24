@@ -13,11 +13,11 @@ All Laurus operations return `Result<T>`, which is an alias for `std::result::Re
 | `Io` | I/O errors | File not found, permission denied, disk full |
 | `Index` | Index operation errors | Corrupt index, segment read failure |
 | `Schema` | Schema-related errors | Unknown field name, type mismatch |
-| `Analysis` | Text analysis errors | Tokenizer failure, invalid filter config |
+| `Analysis` | Text analysis errors | Tokenizer failure, a Lindera dictionary that cannot be loaded |
 | `Query` | Query parsing/execution errors | Malformed Query DSL, a phrase or span query on a field without positions |
 | `Storage` | Storage backend errors | Failed to open storage, write failure |
 | `Field` | Field definition errors | Invalid field options, duplicate field name |
-| `InvalidArgument` | The caller passed an invalid argument | Unknown field in a DSL query, a lexical query or a `filter_query` (or a vector field in the latter two), wrong value type in a document, out-of-range value |
+| `InvalidArgument` | The caller passed an invalid argument | Unknown field in a DSL query, a lexical query or a `filter_query` (or a vector field in the latter two), wrong value type in a document, out-of-range value, an analyzer that is not defined or has a wrong setting (such as a malformed regular expression) |
 | `BenchmarkFailed` | Benchmark errors | Benchmark execution failure |
 | `ThreadJoinError` | Thread join errors | Panic in a worker thread |
 | `Json` | JSON serialization errors | Malformed document JSON |

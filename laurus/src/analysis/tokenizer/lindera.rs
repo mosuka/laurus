@@ -120,8 +120,9 @@ impl LinderaTokenizer {
     /// // ).unwrap();
     /// ```
     pub fn new(mode_str: &str, dict_uri: &str, user_dict_uri: Option<&str>) -> Result<Self> {
-        let mode = Mode::from_str(mode_str)
-            .map_err(|e| LaurusError::analysis(format!("Invalid mode '{}': {}", mode_str, e)))?;
+        let mode = Mode::from_str(mode_str).map_err(|e| {
+            LaurusError::invalid_argument(format!("Invalid mode '{}': {}", mode_str, e))
+        })?;
         let dict = load_dictionary(dict_uri)
             .map_err(|e| LaurusError::analysis(format!("Failed to load dictionary: {}", e)))?;
         let metadata = &dict.metadata;
@@ -191,8 +192,9 @@ impl LinderaTokenizer {
         use lindera_dictionary::dictionary::prefix_dictionary::PrefixDictionary;
         use lindera_dictionary::dictionary::unknown_dictionary::UnknownDictionary;
 
-        let mode = Mode::from_str(mode_str)
-            .map_err(|e| LaurusError::analysis(format!("Invalid mode '{}': {}", mode_str, e)))?;
+        let mode = Mode::from_str(mode_str).map_err(|e| {
+            LaurusError::invalid_argument(format!("Invalid mode '{}': {}", mode_str, e))
+        })?;
         let meta = Metadata::load(metadata)
             .map_err(|e| LaurusError::analysis(format!("Failed to load metadata: {}", e)))?;
         // `PrefixDictionary::load` validates the trie header and the
@@ -500,8 +502,14 @@ mod tests {
             empty,
             empty,
         );
-        assert!(result.is_err());
-        let msg = format!("{}", result.err().unwrap());
-        assert!(msg.contains("mode"), "expected mode error, got: {msg}");
+        // The caller's mistake (Issue #1730).
+        let result = result.map(|_| ());
+        assert!(
+            matches!(
+                &result,
+                Err(LaurusError::InvalidArgument(m)) if m.starts_with("Invalid mode 'not-a-mode': ")
+            ),
+            "expected mode error, got: {result:?}"
+        );
     }
 }

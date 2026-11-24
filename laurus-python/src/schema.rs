@@ -865,7 +865,8 @@ impl PySchema {
     ///     Semantic validity (e.g. a malformed regex pattern, or
     ///     ``min_gram > max_gram``) is not checked here; it is validated
     ///     when the analyzer is compiled, which happens when a
-    ///     ``laurus.Index`` is built from this schema.
+    ///     ``laurus.Index`` is built from this schema, and raises
+    ///     ``ValueError`` there.
     ///
     /// Example:
     ///     ```python

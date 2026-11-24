@@ -98,9 +98,14 @@ impl RegexTokenizer {
     }
 
     /// Create a new regex tokenizer with a custom pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if `pattern` is not a valid
+    /// regular expression.
     pub fn with_pattern(pattern: &str) -> Result<Self> {
         let regex = Regex::new(pattern)
-            .map_err(|e| LaurusError::analysis(format!("Invalid regex pattern: {e}")))?;
+            .map_err(|e| LaurusError::invalid_argument(format!("Invalid regex pattern: {e}")))?;
 
         Ok(RegexTokenizer {
             pattern: Arc::new(regex),
@@ -109,9 +114,14 @@ impl RegexTokenizer {
     }
 
     /// Create a tokenizer that extracts gaps (text between matches) instead of matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if `pattern` is not a valid
+    /// regular expression.
     pub fn with_gaps(pattern: &str) -> Result<Self> {
         let regex = Regex::new(pattern)
-            .map_err(|e| LaurusError::analysis(format!("Invalid regex pattern: {e}")))?;
+            .map_err(|e| LaurusError::invalid_argument(format!("Invalid regex pattern: {e}")))?;
 
         Ok(RegexTokenizer {
             pattern: Arc::new(regex),

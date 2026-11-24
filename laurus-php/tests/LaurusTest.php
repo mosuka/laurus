@@ -2527,7 +2527,8 @@ class LaurusTest extends TestCase
         try {
             new Laurus\Index($dir, $badSchema);
             $this->fail("a malformed regex analyzer was accepted");
-        } catch (\Exception $e) {
+        } catch (\ValueError $e) {
+            // The caller's mistake (Issue #1730).
             $this->assertStringContainsString(
                 "Failed to resolve analyzer for field 'body'",
                 $e->getMessage()
@@ -2550,7 +2551,8 @@ class LaurusTest extends TestCase
         try {
             new Laurus\Index($dir, $badSchema);
             $this->fail("a malformed regex analyzer was accepted");
-        } catch (\Exception $e) {
+        } catch (\ValueError $e) {
+            // The caller's mistake (Issue #1730).
             $this->assertStringContainsString(
                 "Failed to resolve analyzer for field 'body'",
                 $e->getMessage()
@@ -2582,7 +2584,8 @@ class LaurusTest extends TestCase
         try {
             new Laurus\Index($dir, $badSchema);
             $this->fail("a malformed regex analyzer was accepted");
-        } catch (\Exception $e) {
+        } catch (\ValueError $e) {
+            // The caller's mistake (Issue #1730).
             $this->assertStringContainsString(
                 "Failed to resolve analyzer for field 'body'",
                 $e->getMessage()
