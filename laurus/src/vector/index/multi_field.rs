@@ -305,6 +305,14 @@ impl MultiFieldVectorIndex {
             let field_storage: Arc<dyn Storage> =
                 Arc::new(PrefixedStorage::new(name.clone(), storage.clone()));
             let index = open_field_index(field_storage, name, config.clone())?;
+            let others = index.segments_of_other_kinds();
+            if others > 0 {
+                log::warn!(
+                    "vector field '{name}' has {others} segments that were written as another \
+                     index kind; a search scans them exactly, until a merge or an update of the \
+                     field that rebuilds it rewrites them"
+                );
+            }
             fields.insert(name.clone(), FieldEntry::new(index, config));
         }
 
@@ -439,6 +447,14 @@ impl VectorIndex for MultiFieldVectorIndex {
             );
         }
         Ok(Box::new(MultiFieldFanoutSearcher::new(searchers)))
+    }
+
+    fn segments_of_other_kinds(&self) -> usize {
+        self.fields
+            .read()
+            .values()
+            .map(|f| f.index.segments_of_other_kinds())
+            .sum()
     }
 
     fn embedder(&self) -> Arc<dyn Embedder> {
@@ -578,9 +594,10 @@ impl VectorIndex for MultiFieldVectorIndex {
         // does not move or lose any data, it only changes which config the
         // existing segments are read/merged under. The segmented index picks
         // up the existing segment manifest as-is, and refuses a config whose
-        // kind, dimension or distance the segments were not written with
-        // (Issue #1547): a Reindex keeps all three, since a change of any of
-        // them is Destructive (Issue #1536 for the kind).
+        // dimension or distance the segments were not written with, or whose
+        // kind does not read theirs (Issue #1547): a Reindex keeps the first
+        // two, and the kind or a kind of the same family (Issue #1579), since
+        // any other change of them is Destructive.
         let field_storage: Arc<dyn Storage> =
             Arc::new(PrefixedStorage::new(name.to_string(), self.storage.clone()));
         let index = open_field_index(field_storage, name, new_config.clone())?;
@@ -2062,7 +2079,8 @@ mod tests {
     /// their readers nor the deletion marks, so the read loads both from
     /// storage: the sources' files must still be there, and the marks must
     /// still name the documents the merge dropped. Once the rebuild returns,
-    /// the sources' files are gone.
+    /// the sources' files are gone. So it is when the field is rebuilt as
+    /// another kind (Issue #1579), whose index reads the sources too.
     #[test]
     fn a_read_before_a_rebuild_swaps_the_field_sees_the_field_as_it_was() {
         use std::cell::{Cell, RefCell};
@@ -2105,9 +2123,23 @@ mod tests {
                 }),
             ),
         ];
+        // Every kind as itself, and the three that read each other as one
+        // another.
+        let rebuilds: Vec<_> = cases
+            .iter()
+            .flat_map(|(name, before)| {
+                cases
+                    .iter()
+                    .filter(move |(after, _)| {
+                        after == name || (*after != "tokens" && *name != "tokens")
+                    })
+                    .map(move |(_, after)| (*name, before.clone(), after.clone()))
+            })
+            .collect();
+        assert_eq!(rebuilds.len(), 10);
         let embedder = MultiVectorIndexConfig::default().embedder;
         let failures = Rc::new(RefCell::new(Vec::new()));
-        for (name, config) in cases {
+        for (name, config, rebuilt_as) in rebuilds {
             let storage: Arc<dyn Storage> =
                 Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
             let configs = BTreeMap::from([(name.to_string(), config.clone())]);
@@ -2181,7 +2213,7 @@ mod tests {
                     }
                 });
             }
-            if let Err(e) = index.rebuild_field(name, config.clone()) {
+            if let Err(e) = index.rebuild_field(name, rebuilt_as) {
                 failures
                     .borrow_mut()
                     .push(format!("{name}: the rebuild failed: {e}"));

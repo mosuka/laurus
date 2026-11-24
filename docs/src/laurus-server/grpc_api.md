@@ -271,8 +271,8 @@ rpc UpdateField(UpdateFieldRequest) returns (UpdateFieldResponse);
 | Value | Meaning |
 | :--- | :--- |
 | `FIELD_CHANGE_KIND_METADATA_ONLY` | No existing data is affected, and the change is always applied (e.g. an HNSW field's `default_ef_search`) |
-| `FIELD_CHANGE_KIND_REINDEX` | The field is rebuilt from the data already in the index (e.g. an HNSW field's `m` or `ef_construction`) |
-| `FIELD_CHANGE_KIND_DESTRUCTIVE` | The field's existing data is discarded (e.g. a vector field's `dimension`, `distance` or `embedder`), and the field is added to `Schema.pending_reindex` |
+| `FIELD_CHANGE_KIND_REINDEX` | The field is rebuilt from the data already in the index (e.g. an HNSW field's `m` or `ef_construction`, or a vector field's index kind among HNSW, Flat and IVF) |
+| `FIELD_CHANGE_KIND_DESTRUCTIVE` | The field's existing data is discarded (e.g. a vector field's `dimension`, `distance` or `embedder`, or its index kind to or from MultiVector), and the field is added to `Schema.pending_reindex` |
 
 See [Changing a Field](../concepts/schema_and_fields.md#changing-a-field) for the full rules. A `REINDEX` or `DESTRUCTIVE` change sent without `reindex` is rejected as `INVALID_ARGUMENT`, and nothing is applied.
 

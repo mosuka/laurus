@@ -421,8 +421,8 @@ for the full rules):
 | Classification | What happens to the field's data | Example | Applied |
 | :--- | :--- | :--- | :--- |
 | `MetadataOnly` | Nothing | An Hnsw field's `default_ef_search` | Always |
-| `Reindex` | Rebuilt from the data already in the index | An Hnsw field's `m` or `ef_construction`, a Text field's `analyzer` | Only with `--reindex` |
-| `Destructive` | Discarded | A vector field's `dimension`, `distance`, `embedder` or index kind (e.g. Hnsw to Flat) | Only with `--reindex` |
+| `Reindex` | Rebuilt from the data already in the index | An Hnsw field's `m` or `ef_construction`, a vector field's index kind among Hnsw, Flat and Ivf, a Text field's `analyzer` | Only with `--reindex` |
+| `Destructive` | Discarded | A vector field's `dimension`, `distance` or `embedder`, or its index kind to or from MultiVector | Only with `--reindex` |
 
 Applying a `Destructive` change also adds the field to the schema's
 `pending_reindex` list, which `laurus get schema` shows, so you can find the

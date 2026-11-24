@@ -198,6 +198,18 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Returns the embedder used to convert documents to vectors.
     fn embedder(&self) -> Arc<dyn Embedder>;
 
+    /// How many sealed segments were written as another index kind than
+    /// this index's (Issue #1579).
+    ///
+    /// A search scans them exactly, until a merge rewrites them as the
+    /// index's kind. They come from a change of the kind in a schema that
+    /// was not applied through `update_field`, or from a crash between its
+    /// rebuild and saving the schema. An index that holds segments of its
+    /// own kind only returns 0, as the default does.
+    fn segments_of_other_kinds(&self) -> usize {
+        0
+    }
+
     /// Get the last processed WAL sequence number.
     fn last_wal_seq(&self) -> u64 {
         0
@@ -386,11 +398,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// whole call.
     ///
     /// Only valid for parameters that do not change the meaning of
-    /// already-written vectors or how they are stored (dimension, distance
-    /// metric, embedder and index kind must be unchanged -- callers gate
-    /// this via `laurus::engine::schema::classify_change`). Rebuilding under
-    /// a different `dimension`/`distance`/`embedder`, or as another index
-    /// kind (Issue #1536), is a
+    /// already-written vectors (dimension, distance metric and embedder must
+    /// be unchanged), under an index kind that reads them: HNSW, Flat and IVF
+    /// read each other's, so a field can be rebuilt as another of the three
+    /// (Issue #1579), and MultiVector reads only its own. Callers gate this
+    /// via `laurus::engine::schema::classify_change`. Rebuilding under a
+    /// different `dimension`/`distance`/`embedder`, or to or from
+    /// MultiVector, is a
     /// [`crate::engine::schema::FieldChangeKind::Destructive`] change
     /// instead, handled by the caller as remove-then-add.
     ///

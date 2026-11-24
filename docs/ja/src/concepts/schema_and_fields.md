@@ -680,8 +680,8 @@ let outcome = engine.update_field(
 変更内容は次の3種類に分類され、`outcome.classification` で確認できます。
 
 - **`MetadataOnly`**（メタデータのみ）: 既存データへの影響がなく、常に適用されます（例: HNSW の `default_ef_search`）。
-- **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、保存するフィールドの型の変更（`Text` から `Integer` など）、HNSW の `m`/`ef_construction` 変更）。
-- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` やインデックスの種類の変更、`stored: false` フィールドの型変更、`stored: false` なフィールドの `multi_valued` を無効にする変更（lexical のどの型でも））。lexical フィールドは保存された値だけから作り直すので、`stored: false` の lexical フィールドの作り直しが要る変更は、すべて `Destructive` です（[#1685](https://github.com/mosuka/laurus/issues/1685)）。
+- **`Reindex`**（再構築が必要）: 保存済みの元データから再構築が可能です（例: text フィールドの `analyzer` 変更、`term_vectors` が有効な text フィールドの `position_increment_gap` 変更、`indexed: false → true`、保存するフィールドの型の変更（`Text` から `Integer` など）、HNSW の `m`/`ef_construction` 変更、ベクトルフィールドの `Hnsw`・`Flat`・`Ivf` の間でのインデックスの種類の変更）。
+- **`Destructive`**（破壊的変更）: 元データから再構築できず、既存データを破棄します（例: ベクトルフィールドの `dimension`/`embedder`/`distance` の変更や、インデックスの種類の `MultiVector` との間の変更、`stored: false` フィールドの型変更、`stored: false` なフィールドの `multi_valued` を無効にする変更（lexical のどの型でも））。lexical フィールドは保存された値だけから作り直すので、`stored: false` の lexical フィールドの作り直しが要る変更は、すべて `Destructive` です（[#1685](https://github.com/mosuka/laurus/issues/1685)）。
 
 `Reindex` と `Destructive` は、明示的に `UpdateFieldOptions { reindex: true, .. }` を指定しない限り拒否されます（再構築に時間がかかる、あるいはデータを失うため、意図しない実行を防ぐオプトイン方式です）。
 
@@ -705,7 +705,12 @@ lexical の `Reindex` は、各ドキュメントのそのフィールドの保�
 
 `UpdateFieldOptions { dry_run: true, .. }` を指定すると、実際には何も適用せずに分類結果だけを確認できます。
 
-ベクトルフィールドのセグメントの manifest は、ファイルを書いたときのインデックスの種類・`dimension`・`distance` を記録します。インデックスは、スキーマがフィールドに同じ 3 つを指定するときだけ開けます（[#1547](https://github.com/mosuka/laurus/issues/1547)）。この 3 つは、インデックスを開くときのスキーマではなく、`update_field` で変えてください。3 つのどれを変えても `Destructive` です。HNSW から Flat のような種類の変更では、フィールドを新しい種類で空から作り直します。種類ごとに、自分のセグメントのファイルしか読めないためです（[#1536](https://github.com/mosuka/laurus/issues/1536)。種類を変えてもベクトルを保つ件は [#1579](https://github.com/mosuka/laurus/issues/1579)）。`schema.toml` で変えてよい項目は、[既存のベクトルフィールドを編集する](../laurus-cli/schema_format.md#既存のベクトルフィールドを編集する)を参照してください。
+ベクトルフィールドのセグメントの manifest は、ファイルを書いたときの `dimension` と `distance`、セグメントごとのインデックスの種類を記録します。インデックスは、スキーマがフィールドに同じ `dimension` と `distance` を指定し（[#1547](https://github.com/mosuka/laurus/issues/1547)）、種類がセグメントを読めるものであるときだけ開けます。`Hnsw`・`Flat`・`Ivf` は互いのセグメントを読めます。`MultiVector` は自分のセグメントだけを読めます（[#1579](https://github.com/mosuka/laurus/issues/1579)）。これらは、インデックスを開くときのスキーマではなく、`update_field` で変えてください。
+
+- `Hnsw`・`Flat`・`Ivf` の間の変更は `Reindex` です。ほかのベクトルの `Reindex` と同じく、セグメントが持つベクトルから、新しい種類でフィールドを作り直します。ベクトルは、フィールドに `rerank_storage` があればその値、なければ `quantizer` から復元した値です。
+- `dimension` か `distance` の変更と、`MultiVector` との間の種類の変更は `Destructive` です。
+
+セグメントは、merge かフィールドの作り直しで書き直されるまで、書いたときの種類のままです（quantizer と同じです）。スキーマと違う種類のセグメントは、作り直しとスキーマの保存の間でクラッシュしたときや、インデックスを開くときのスキーマで種類を変えたときに残ります。検索は、そのセグメントを全件走査して正確に調べます。大きなセグメントでは、スキーマが指定するインデックスより遅くなります。laurus は、そうしたフィールドを開くときに警告をログに出します。`schema.toml` で変えてよい項目は、[既存のベクトルフィールドを編集する](../laurus-cli/schema_format.md#既存のベクトルフィールドを編集する)を参照してください。
 
 ### 共通の注意事項
 

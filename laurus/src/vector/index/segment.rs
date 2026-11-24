@@ -15,6 +15,7 @@
 
 pub mod fanout;
 pub(crate) mod field_record;
+pub(crate) mod kind;
 pub mod manager;
 pub mod merge;
 pub mod merge_policy;

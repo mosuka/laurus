@@ -459,11 +459,19 @@ the others without restructuring anything on disk; see each binding's
 semantics (in particular, reopening an existing index only needs the
 directory path — the persisted schema is loaded automatically).
 
-A vector field's `segments.json` also records the index kind, dimension and
-distance its segments are written with, and opening the field under a
-schema that gives another one fails, since the segments cannot be read
-under it ([#1547](https://github.com/mosuka/laurus/issues/1547)). A
-manifest written before the record existed is checked against what the
+A vector field's `segments.json` also records the dimension and distance its
+segments are written with, and the index kind of each segment. Opening the
+field fails under a schema that gives another dimension or distance, since
+the segments cannot be read under it
+([#1547](https://github.com/mosuka/laurus/issues/1547)), or a kind that does
+not read the segments: `Hnsw`, `Flat` and `Ivf` read each other's, and
+`MultiVector` only its own
+([#1579](https://github.com/mosuka/laurus/issues/1579)). An `update_field`
+that changes the kind publishes the rebuilt segments in `segments.json`
+before the schema is saved. A crash in between leaves segments of another
+kind than the schema's, which the field reads like its own, and the next open
+removes the segment files that `segments.json` does not list, of either kind.
+A manifest written before the record existed is checked against what the
 segment files show (their kind and dimension), and the next manifest write
 adds the record. A build older than the record drops it when it rewrites
 the manifest, so after such a build has written to the field, the check

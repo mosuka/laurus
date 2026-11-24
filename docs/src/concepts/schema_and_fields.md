@@ -813,12 +813,13 @@ The requested change is classified into one of three kinds, reported as
 - **`Reindex`** — can be rebuilt from the field's already-stored values
   (e.g. a text field's `analyzer` or — while `term_vectors` is on — its
   `position_increment_gap`, `indexed: false → true`, a stored field's type,
-  such as `Text` to `Integer`, or an HNSW field's `m`/`ef_construction`).
+  such as `Text` to `Integer`, an HNSW field's `m`/`ef_construction`, or a
+  vector field's index kind among `Hnsw`, `Flat` and `Ivf`).
 - **`Destructive`** — cannot be rebuilt from existing data; applying it
   discards the field's data (e.g. a vector field's `dimension`/`embedder`/
-  `distance` or its index kind, a type change on a `stored: false` field,
-  or turning `multi_valued` off on a `stored: false` field of any lexical
-  type). A lexical field is rebuilt from its stored values only, so every
+  `distance` or its index kind to or from `MultiVector`, a type change on a
+  `stored: false` field, or turning `multi_valued` off on a `stored: false`
+  field of any lexical type). A lexical field is rebuilt from its stored values only, so every
   change that needs a rebuild of a `stored: false` lexical field is
   `Destructive` ([#1685](https://github.com/mosuka/laurus/issues/1685)).
 
@@ -898,17 +899,27 @@ embedder registered directly through `EngineBuilder::embedder` in place.
 Pass `UpdateFieldOptions { dry_run: true, .. }` to see how a change would
 be classified without applying anything.
 
-A vector field's segment manifest records the index kind, `dimension` and
-`distance` its files are written with, and the index opens only under a
-schema that gives the field the same three
-([#1547](https://github.com/mosuka/laurus/issues/1547)). Change them with
-`update_field` rather than in the schema the index is opened with. A
-change of any of the three is `Destructive`: a change of kind, such as
-HNSW to Flat, recreates the field empty under the new kind, since each
-kind reads only its own segment files
-([#1536](https://github.com/mosuka/laurus/issues/1536); keeping the
-vectors through a change of kind is
-[#1579](https://github.com/mosuka/laurus/issues/1579)). See
+A vector field's segment manifest records the `dimension` and `distance` its
+files are written with, and the index kind of each segment. The index opens
+only under a schema that gives the field the same `dimension` and `distance`
+([#1547](https://github.com/mosuka/laurus/issues/1547)) and a kind that reads
+its segments: `Hnsw`, `Flat` and `Ivf` read each other's, and `MultiVector`
+only its own ([#1579](https://github.com/mosuka/laurus/issues/1579)). Change
+them with `update_field` rather than in the schema the index is opened with:
+
+- A change between `Hnsw`, `Flat` and `Ivf` is a `Reindex`. The field is
+  rebuilt as the new kind from the vectors its segments hold, as any vector
+  `Reindex` is: those of its `rerank_storage` when it has one, and otherwise
+  those decoded from its `quantizer`.
+- A change of `dimension` or `distance`, or of the kind to or from
+  `MultiVector`, is `Destructive`.
+
+A segment keeps the kind it was written as, as it keeps its quantizer, until a
+merge or a rebuild of the field rewrites it. Segments of another kind than the
+schema's are left by a crash between the rebuild and saving the schema, or by
+a kind changed in the schema the index is opened with. A search scans them
+exactly, which is slower than the index the schema names when they are large,
+and laurus logs a warning when it opens such a field. See
 [Editing an existing vector field](../laurus-cli/schema_format.md#editing-an-existing-vector-field)
 for what may still change in `schema.toml`.
 
