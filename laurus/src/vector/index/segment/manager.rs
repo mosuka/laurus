@@ -16,6 +16,7 @@
 //! that varies by on-disk file suffix.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +27,7 @@ use crate::storage::Storage;
 use crate::storage::manifest as manifest_io;
 
 use super::field_record::FieldRecord;
+use super::kind::{kind_of_layout, layouts_read_with};
 use super::merge_policy::MergePolicy;
 
 /// Manifest file name for the segment registry.
@@ -61,29 +63,46 @@ pub struct SegmentFileLayout {
 }
 
 impl SegmentFileLayout {
-    /// All suffixes this layout recognizes for a segment's own files, plus
-    /// the layout-independent `.delmap` suffix, ordered **longest first**.
-    ///
-    /// A segment's own files include each sidecar's staging file, the
-    /// sidecar suffix plus `.tmp` (e.g. `.hnsw.f32.tmp`), which a write that
-    /// fails or crashes before its rename leaves (Issue #1532).
-    ///
-    /// A shorter suffix that is itself the tail of a longer one (e.g.
-    /// `.hnsw` is the tail of `.hnsw.tmp`) must be tried last, or the longer
-    /// file gets mis-stemmed (`foo.hnsw.tmp` stripped of `.hnsw` leaves
-    /// `foo` + a dangling `.tmp`, not the segment id `foo`).
-    fn ordered_suffixes(&self) -> Vec<String> {
-        let mut suffixes: Vec<String> = self
-            .sidecars
-            .iter()
-            .flat_map(|sidecar| [sidecar.to_string(), format!("{sidecar}.tmp")])
-            .collect();
-        suffixes.push(self.primary.to_string());
-        suffixes.push(self.tmp.to_string());
-        suffixes.push(".delmap".to_string());
-        suffixes.sort_by_key(|s| std::cmp::Reverse(s.len()));
-        suffixes
+    /// The suffixes of the files a segment of this layout consists of: its
+    /// primary file and its sidecars.
+    fn file_suffixes(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.primary).chain(self.sidecars.iter().copied())
     }
+
+    /// All suffixes this layout recognizes for a segment's own files.
+    ///
+    /// They include each sidecar's staging file, the sidecar suffix plus
+    /// `.tmp` (e.g. `.hnsw.f32.tmp`), which a write that fails or crashes
+    /// before its rename leaves (Issue #1532).
+    fn own_suffixes(&self) -> impl Iterator<Item = String> {
+        let sidecars = self.sidecars.iter();
+        sidecars
+            .flat_map(|sidecar| [sidecar.to_string(), format!("{sidecar}.tmp")])
+            .chain([self.primary.to_string(), self.tmp.to_string()])
+    }
+}
+
+/// The suffixes the files of a segment of any of `layouts` can have, each
+/// with the kind of its layout, plus the layout-independent `.delmap`
+/// suffix, ordered **longest first**.
+///
+/// A shorter suffix that is itself the tail of a longer one (e.g. `.hnsw`
+/// is the tail of `.hnsw.tmp`) must be tried last, or the longer file gets
+/// mis-stemmed (`foo.hnsw.tmp` stripped of `.hnsw` leaves `foo` + a dangling
+/// `.tmp`, not the segment id `foo`).
+fn ordered_suffixes(layouts: &[SegmentFileLayout]) -> Vec<(String, Option<&'static str>)> {
+    let mut suffixes: Vec<(String, Option<&'static str>)> = layouts
+        .iter()
+        .flat_map(|layout| {
+            let kind = kind_of_layout(layout);
+            layout
+                .own_suffixes()
+                .map(move |suffix| (suffix, Some(kind)))
+        })
+        .collect();
+    suffixes.push((".delmap".to_string(), None));
+    suffixes.sort_by_key(|(suffix, _)| std::cmp::Reverse(suffix.len()));
+    suffixes
 }
 
 /// Versioned payload of the `segments.json` manifest (#634 PR-1 / #879).
@@ -169,6 +188,16 @@ pub struct ManagedSegmentInfo {
 
     /// Size of the segment in bytes.
     pub size_bytes: u64,
+
+    /// The index kind the segment was written as, as the suffix of its
+    /// primary file without the dot: `flat`, `hnsw`, `ivf` or `mv` (Issue
+    /// #1579).
+    ///
+    /// `None` until a [`SegmentManager`] takes the segment, which then is of
+    /// the manager's own kind. Absent in a manifest written before, whose
+    /// segments are given one when it is loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 impl ManagedSegmentInfo {
@@ -180,6 +209,7 @@ impl ManagedSegmentInfo {
             vector_offset,
             generation,
             size_bytes: 0,
+            kind: None,
         }
     }
 
@@ -222,7 +252,9 @@ pub struct SegmentManagerStats {
 #[derive(Debug)]
 pub struct SegmentManager {
     config: SegmentManagerConfig,
-    layout: SegmentFileLayout,
+    /// The layout of every kind whose segments the index can hold (Issue
+    /// #1579), the layout of its own kind first.
+    layouts: Vec<SegmentFileLayout>,
     storage: Arc<dyn Storage>,
     segments: Arc<RwLock<Vec<ManagedSegmentInfo>>>,
     next_segment_id: Arc<RwLock<u64>>,
@@ -277,6 +309,11 @@ impl SegmentManager {
     /// that never made it into the manifest — its documents are covered by
     /// WAL replay, so the file is garbage).
     ///
+    /// `layout` is the one of the index's own kind, which the segments the
+    /// manager takes are of. A Flat, HNSW or IVF index can also hold segments
+    /// of the other two kinds (Issue #1579), and the sweep covers the files
+    /// of all three.
+    ///
     /// # Errors
     ///
     /// Returns an error if an existing manifest fails to load or fails its
@@ -290,7 +327,7 @@ impl SegmentManager {
     ) -> Result<Self> {
         let manager = Self {
             config,
-            layout,
+            layouts: layouts_read_with(&layout),
             storage,
             segments: Arc::new(RwLock::new(Vec::new())),
             next_segment_id: Arc::new(RwLock::new(0)),
@@ -299,13 +336,64 @@ impl SegmentManager {
             build_gate: RwLock::new(()),
         };
 
-        manager.load_state()?;
-        manager.cleanup_orphans();
+        let inferred = manager.load_state()?;
+        manager.cleanup_orphans(&inferred);
 
         Ok(manager)
     }
 
-    fn load_state(&self) -> Result<()> {
+    /// The name of the index's own kind, which the segments it writes are
+    /// of.
+    fn own_kind(&self) -> &'static str {
+        kind_of_layout(&self.layouts[0])
+    }
+
+    /// The name of the kind `segment` was written as, which is the index's
+    /// own when it does not say.
+    pub(crate) fn kind_of<'a>(&self, segment: &'a ManagedSegmentInfo) -> &'a str {
+        segment.kind.as_deref().unwrap_or(self.own_kind())
+    }
+
+    /// How many of the segments were written as another kind than the
+    /// index's own (Issue #1579).
+    pub(crate) fn segments_of_other_kinds(&self) -> usize {
+        let own = self.own_kind();
+        self.segments
+            .read()
+            .iter()
+            .filter(|segment| self.kind_of(segment) != own)
+            .count()
+    }
+
+    /// The kind of segment `segment_id`, listed by a manifest that records
+    /// none for it (written before Issue #1579, or saved again by a build
+    /// that does not know the key): the first of the kind `recorded` for the
+    /// field, the index's own and the others it can hold whose primary file
+    /// exists.
+    fn infer_kind(&self, segment_id: &str, recorded: Option<&str>) -> String {
+        let preferred = recorded.unwrap_or(self.own_kind());
+        std::iter::once(preferred)
+            .chain(
+                self.layouts
+                    .iter()
+                    .map(|layout| -> &str { kind_of_layout(layout) }),
+            )
+            .find(|kind| self.storage.file_exists(&format!("{segment_id}.{kind}")))
+            .unwrap_or(preferred)
+            .to_string()
+    }
+
+    /// Load the manifest, when there is one.
+    ///
+    /// # Returns
+    ///
+    /// The ids of the segments whose kind it does not record, which
+    /// [`Self::infer_kind`] gave them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be read.
+    fn load_state(&self) -> Result<HashSet<String>> {
         // The versioned form is length-prefixed JSON with a CRC-32 trailer;
         // the legacy form is a bare pretty-printed JSON array written in
         // place, with no framing and no checksum. The loader tells them apart
@@ -314,7 +402,7 @@ impl SegmentManager {
         let Some((payload, format)) =
             manifest_io::load_checksummed(self.storage.as_ref(), MANIFEST_FILE, None)?
         else {
-            return Ok(());
+            return Ok(HashSet::new());
         };
 
         let (segments_info, next_id, wal_seq, field) = match format {
@@ -344,6 +432,13 @@ impl SegmentManager {
 
         let mut segments = self.segments.write();
         *segments = segments_info;
+
+        let mut inferred = HashSet::new();
+        let recorded = self.field_record.read().as_ref().map(|r| r.kind.clone());
+        for segment in segments.iter_mut().filter(|s| s.kind.is_none()) {
+            segment.kind = Some(self.infer_kind(&segment.segment_id, recorded.as_deref()));
+            inferred.insert(segment.segment_id.clone());
+        }
 
         // Zero generations in a loaded manifest need stamping, or the
         // newest-generation-wins dedup ordering is meaningless (Issue #880).
@@ -389,7 +484,7 @@ impl SegmentManager {
         *self.next_segment_id.write() = next_id.max(max_id);
         self.last_wal_seq.store(wal_seq, Ordering::Release);
 
-        Ok(())
+        Ok(inferred)
     }
 
     /// Persist the manifest atomically: temp file + length-prefixed JSON +
@@ -507,18 +602,25 @@ impl SegmentManager {
 
     /// Best-effort sweep of files that belong to no registered segment.
     ///
-    /// Only touches names this manager itself generates (`segment_NNNNNN`
-    /// plus its [`SegmentFileLayout`] suffixes, the staging files of the
-    /// primary and of each sidecar among them) and the manifest temp file,
-    /// so foreign files — e.g. a monolithic `vector_index.hnsw` in the same
-    /// directory — are never affected. Runs only after a successful
-    /// manifest load.
-    fn cleanup_orphans(&self) {
+    /// Only touches names a manager of one of the kinds the index can hold
+    /// generates (`segment_NNNNNN` plus the suffixes of its
+    /// [`SegmentFileLayout`], the staging files of the primary and of each
+    /// sidecar among them) and the manifest temp file, so foreign files —
+    /// e.g. a monolithic `vector_index.hnsw` in the same directory, or a
+    /// MultiVector segment — are never affected. Runs only after a
+    /// successful manifest load.
+    ///
+    /// A file of a registered segment's id belongs to the segment only when
+    /// it is of the segment's kind (Issue #1579): a rebuild as another kind
+    /// that failed leaves its file under the id that the next segment of the
+    /// field takes. It stays when the kind of the segment is among the ones
+    /// `inferred` from the files.
+    fn cleanup_orphans(&self, inferred: &HashSet<String>) {
         let Ok(files) = self.storage.list_files() else {
             return;
         };
         let segments = self.segments.read();
-        let suffixes = self.layout.ordered_suffixes();
+        let suffixes = ordered_suffixes(&self.layouts);
         for file in files {
             if file == MANIFEST_TMP_FILE {
                 let _ = self.storage.delete_file(&file);
@@ -526,10 +628,9 @@ impl SegmentManager {
             }
             // Strip a known suffix (longest first); skip files that are not
             // segment-shaped.
-            let Some(stem) = suffixes
-                .iter()
-                .find_map(|suffix| file.strip_suffix(suffix.as_str()))
-            else {
+            let Some((stem, kind)) = suffixes.iter().find_map(|(suffix, kind)| {
+                file.strip_suffix(suffix.as_str()).map(|stem| (stem, *kind))
+            }) else {
                 continue;
             };
             let Some(ordinal) = stem.strip_prefix("segment_") else {
@@ -538,7 +639,13 @@ impl SegmentManager {
             if ordinal.is_empty() || !ordinal.bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
-            if !segments.iter().any(|s| s.segment_id == stem) {
+            let keep = segments
+                .iter()
+                .find(|segment| segment.segment_id == stem)
+                .is_some_and(|segment| {
+                    inferred.contains(stem) || kind.is_none_or(|kind| kind == self.kind_of(segment))
+                });
+            if !keep {
                 let _ = self.storage.delete_file(&file);
             }
         }
@@ -550,7 +657,8 @@ impl SegmentManager {
     /// a zero `size_bytes` is replaced by the on-storage size of the segment
     /// file plus its sidecars, and a zero `generation` is stamped with the
     /// next generation after the currently registered maximum — both feed
-    /// the metadata-driven merge policy.
+    /// the metadata-driven merge policy. A segment with no `kind` is of the
+    /// index's own (Issue #1579).
     ///
     /// The segment joins the in-memory list only once the manifest that
     /// lists it is saved in full, so a commit retried after a failed save
@@ -562,8 +670,9 @@ impl SegmentManager {
     /// list is then unchanged; see `Self::publish_locked` for a save that
     /// published the manifest but failed to sync it.
     pub fn add_segment(&self, mut info: ManagedSegmentInfo) -> Result<()> {
+        self.stamp_kind(&mut info);
         if info.size_bytes == 0 {
-            info.size_bytes = self.measure_segment_size(&info.segment_id);
+            info.size_bytes = self.measure_segment_size(&info);
         }
         let mut segments = self.segments.write();
         if info.generation == 0 {
@@ -574,16 +683,26 @@ impl SegmentManager {
         self.publish_locked(&mut segments, next)
     }
 
-    /// Sum the on-storage sizes of a segment's primary file and sidecars.
+    /// Make a segment that says no kind one of the index's own (Issue
+    /// #1579).
+    fn stamp_kind(&self, info: &mut ManagedSegmentInfo) {
+        info.kind.get_or_insert_with(|| self.own_kind().to_string());
+    }
+
+    /// Sum the on-storage sizes of a segment's primary file and sidecars,
+    /// of the segment's kind.
     ///
     /// `.delmap` is deliberately excluded (#882): per-segment deletion
     /// bitmaps do not exist — the bitmap is index-level — and for a
     /// legacy-migrated segment (whose id equals the index name) including
     /// it would misattribute the index bitmap's size to the segment.
-    fn measure_segment_size(&self, segment_id: &str) -> u64 {
-        std::iter::once(self.layout.primary)
-            .chain(self.layout.sidecars.iter().copied())
-            .map(|suffix| format!("{segment_id}{suffix}"))
+    fn measure_segment_size(&self, segment: &ManagedSegmentInfo) -> u64 {
+        let kind = self.kind_of(segment);
+        self.layouts
+            .iter()
+            .filter(|layout| kind_of_layout(layout) == kind)
+            .flat_map(SegmentFileLayout::file_suffixes)
+            .map(|suffix| format!("{}{suffix}", segment.segment_id))
             .filter_map(|name| self.storage.file_size(&name).ok())
             .sum()
     }
@@ -613,6 +732,9 @@ impl SegmentManager {
     /// sidecars — leaving them behind orphans storage after every merge
     /// (#879).
     ///
+    /// The caller has published a manifest that does not list the segment,
+    /// so its files are deleted whatever kind they are of (Issue #1579).
+    ///
     /// Deliberately does NOT touch `{segment_id}.delmap` (#882): the
     /// segmented index keeps ONE index-level deletion bitmap named
     /// `{index_name}.delmap` — per-segment bitmaps do not exist — and a
@@ -634,8 +756,10 @@ impl SegmentManager {
             }
         };
         // Best effort deletion - ignore if a file doesn't exist
-        for suffix in
-            std::iter::once(self.layout.primary).chain(self.layout.sidecars.iter().copied())
+        for suffix in self
+            .layouts
+            .iter()
+            .flat_map(SegmentFileLayout::file_suffixes)
         {
             let _ = self.storage.delete_file(&format!("{segment_id}{suffix}"));
         }
@@ -646,17 +770,19 @@ impl SegmentManager {
     ///
     /// The new info replaces the listed one in memory only once the
     /// manifest with it is saved in full (Issue #1583). An id that is not
-    /// listed changes nothing, but the manifest is still saved.
+    /// listed changes nothing, but the manifest is still saved. An info with
+    /// no `kind` keeps the listed one's.
     ///
     /// # Errors
     ///
     /// Returns an error if persisting the manifest fails. The in-memory
     /// list then keeps the previous info.
-    pub fn update_segment(&self, info: ManagedSegmentInfo) -> Result<()> {
+    pub fn update_segment(&self, mut info: ManagedSegmentInfo) -> Result<()> {
         let mut segments = self.segments.write();
         let mut next = segments.clone();
-        if let Some(idx) = next.iter().position(|s| s.segment_id == info.segment_id) {
-            next[idx] = info;
+        if let Some(listed) = next.iter_mut().find(|s| s.segment_id == info.segment_id) {
+            info.kind = info.kind.or_else(|| listed.kind.take());
+            *listed = info;
         }
         self.publish_locked(&mut segments, next)
     }
@@ -794,13 +920,13 @@ impl SegmentManager {
     ) -> Result<Option<LaurusError>> {
         // Replace the engine's estimated size with the on-storage size of
         // the merged segment file + sidecars (mirrors `add_segment`, #879).
-        merged_segment.size_bytes = self.measure_segment_size(&merged_segment.segment_id);
+        self.stamp_kind(&mut merged_segment);
+        merged_segment.size_bytes = self.measure_segment_size(&merged_segment);
         let mut segments_lock = self.segments.write();
 
         // 1. Replace the sources with the merged segment, on a copy until
         //    the manifest is published.
-        let ids_to_remove: std::collections::HashSet<_> =
-            candidate.segments.iter().map(|s| &s.segment_id).collect();
+        let ids_to_remove: HashSet<_> = candidate.segments.iter().map(|s| &s.segment_id).collect();
         let mut merged_list = segments_lock.clone();
         merged_list.retain(|s| !ids_to_remove.contains(&s.segment_id));
         merged_list.push(merged_segment);
@@ -926,6 +1052,7 @@ mod tests {
             vector_offset: 0,
             generation: 1,
             size_bytes: count * 100,
+            kind: None,
         }
     }
 
@@ -1263,54 +1390,296 @@ mod tests {
         assert!(storage.file_exists("not_a_segment.hnsw"), "foreign spared");
     }
 
-    /// #889: a distinct layout (no sidecars, a different primary/tmp
-    /// suffix) sweeps its own orphans and spares foreign/HNSW files —
-    /// proving the layout parameterization, not just the HNSW default,
-    /// actually drives the sweep. This is a synthetic no-sidecar layout,
-    /// not `flat::segment::LAYOUT` itself: since Issue #1348, Flat's real
-    /// layout has a `.flat.f32` sidecar like HNSW's.
+    /// #889: a distinct layout sweeps its own orphans and spares foreign
+    /// files — proving the layout parameterization, not just the HNSW
+    /// default, actually drives the sweep. This is a synthetic no-sidecar
+    /// layout, of a kind no other reads.
     #[test]
     fn test_cleanup_orphans_respects_a_different_layout() {
-        const FLAT_LAYOUT: SegmentFileLayout = SegmentFileLayout {
-            primary: ".flat",
+        const OTHER_LAYOUT: SegmentFileLayout = SegmentFileLayout {
+            primary: ".other",
             sidecars: &[],
-            tmp: ".flat.tmp",
+            tmp: ".other.tmp",
         };
-        let config = SegmentManagerConfig::default();
         let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        register(&storage, OTHER_LAYOUT, "segment_000000");
+        let spared = [
+            // Registered segment's file.
+            "segment_000000.other",
+            // Foreign files, also of the numbering shape.
+            "segment_000099.hnsw",
+            "segment_000099.mv",
+            "vector_index.other",
+        ];
+        // An orphan (a torn flush).
+        let swept = ["segment_000042.other", "segment_000042.other.tmp"];
+        check_sweep(&storage, OTHER_LAYOUT, &spared, &swept);
+    }
 
-        let write = |name: &str| {
-            let mut out = storage.create_output(name).unwrap();
-            std::io::Write::write_all(&mut out, b"x").unwrap();
-            out.close().unwrap();
-        };
+    /// Register segment `id`, which says no kind, with a manager for
+    /// `layout`.
+    fn register(storage: &Arc<MemoryStorage>, layout: SegmentFileLayout, id: &str) {
+        let config = SegmentManagerConfig::default();
+        let manager = SegmentManager::new(config, storage.clone(), layout).unwrap();
+        manager.add_segment(create_info(id, 100)).unwrap();
+    }
 
-        {
-            let manager =
-                SegmentManager::new(config.clone(), storage.clone(), FLAT_LAYOUT).unwrap();
+    fn saved_manifest(storage: &Arc<MemoryStorage>) -> serde_json::Value {
+        manifest_io::load_checksummed_json(storage.as_ref(), MANIFEST_FILE, None)
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    fn write(storage: &Arc<MemoryStorage>, name: &str, bytes: &[u8]) {
+        let mut out = storage.create_output(name).unwrap();
+        std::io::Write::write_all(&mut out, bytes).unwrap();
+        out.close().unwrap();
+    }
+
+    /// Write `spared` and `swept`, open a manager for `layout`, and check
+    /// that it removes exactly the latter.
+    fn check_sweep(
+        storage: &Arc<MemoryStorage>,
+        layout: SegmentFileLayout,
+        spared: &[&str],
+        swept: &[&str],
+    ) {
+        for name in spared.iter().chain(swept) {
+            write(storage, name, b"x");
+        }
+        let config = SegmentManagerConfig::default();
+        let _manager = SegmentManager::new(config, storage.clone(), layout).unwrap();
+        let wrong: Vec<&&str> = spared
+            .iter()
+            .filter(|name| !storage.file_exists(name))
+            .chain(swept.iter().filter(|name| storage.file_exists(name)))
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: {wrong:?}", layout.primary);
+    }
+
+    const FAMILY: [SegmentFileLayout; 3] = [
+        crate::vector::index::flat::segment::LAYOUT,
+        crate::vector::index::hnsw::segment::LAYOUT,
+        crate::vector::index::ivf::segment::LAYOUT,
+    ];
+
+    /// Issue #1579: a manager of one of the three kinds sweeps the files of
+    /// all three that its manifest does not list, under an id of no segment
+    /// and under the id of a segment of another kind, with the sidecars and
+    /// the staging files. It spares MultiVector files, the deletion bitmap,
+    /// a codebook, the directory of a nested field and the single-file
+    /// layout of every kind.
+    #[test]
+    fn the_sweep_covers_the_files_of_every_kind_the_index_can_hold() {
+        for layout in FAMILY {
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            register(&storage, layout, "segment_000000");
+            // The second segment is of another kind than the index's own.
+            let other = FAMILY
+                .into_iter()
+                .find(|other| other.primary != layout.primary)
+                .unwrap();
+            {
+                let config = SegmentManagerConfig::default();
+                let manager = SegmentManager::new(config, storage.clone(), layout).unwrap();
+                let mut info = create_info("segment_000001", 100);
+                info.kind = Some(kind_of_layout(&other).to_string());
+                manager.add_segment(info).unwrap();
+            }
+            let mut spared = vec![
+                "segment_000042.mv".to_string(),
+                "index.delmap".to_string(),
+                "codebook.pqcb".to_string(),
+                "b/segment_000042.hnsw".to_string(),
+            ];
+            let mut swept = vec![
+                "segment_000042.delmap".to_string(),
+                "segments.json.tmp".to_string(),
+            ];
+            for kind in FAMILY {
+                let primary = kind.primary;
+                spared.push(format!("index{primary}"));
+                for suffix in ["", ".f32"] {
+                    for (id, of_kind) in [("segment_000000", layout), ("segment_000001", other)] {
+                        let file = format!("{id}{primary}{suffix}");
+                        if primary == of_kind.primary {
+                            spared.push(file);
+                        } else {
+                            swept.push(file);
+                        }
+                    }
+                    swept.push(format!("segment_000042{primary}{suffix}"));
+                    swept.push(format!("segment_000042{primary}{suffix}.tmp"));
+                }
+            }
+            check_sweep(
+                &storage,
+                layout,
+                &spared.iter().map(String::as_str).collect::<Vec<_>>(),
+                &swept.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// Issue #1579: a segment that joins a manager and says no kind is of
+    /// the manager's, also one a merge wrote; one that says another keeps
+    /// it, also when it is updated with an info that says none. The manifest
+    /// records it.
+    #[test]
+    fn a_segment_is_recorded_with_its_kind() {
+        for layout in FAMILY {
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let config = SegmentManagerConfig::default();
+            let manager = SegmentManager::new(config, storage.clone(), layout).unwrap();
+            let own = kind_of_layout(&layout);
+            let other = if own == "hnsw" { "ivf" } else { "hnsw" };
             manager
                 .add_segment(create_info("segment_000000", 100))
                 .unwrap();
-        }
-        // Registered segment's file: must survive.
-        write("segment_000000.flat");
-        // An orphaned Flat segment (a torn flush): must be swept.
-        write("segment_000042.flat");
-        write("segment_000042.flat.tmp");
-        // Foreign / other-index-type files: must never be touched, even
-        // though they share the `segment_NNNNNN` numbering shape.
-        write("segment_000099.hnsw");
-        write("vector_index.flat");
+            let mut info = create_info("segment_000001", 100);
+            info.kind = Some(other.to_string());
+            manager.add_segment(info).unwrap();
+            assert_eq!(manager.segments_of_other_kinds(), 1);
+            manager
+                .update_segment(create_info("segment_000001", 50))
+                .unwrap();
+            let kinds = |manager: &SegmentManager| -> Vec<(String, Option<String>)> {
+                manager
+                    .list_segments()
+                    .into_iter()
+                    .map(|segment| (segment.segment_id, segment.kind))
+                    .collect()
+            };
+            let expected = vec![
+                ("segment_000000".to_string(), Some(own.to_string())),
+                ("segment_000001".to_string(), Some(other.to_string())),
+            ];
+            assert_eq!(kinds(&manager), expected);
+            let saved = saved_manifest(&storage);
+            assert_eq!(saved["segments"][0]["kind"], own);
+            assert_eq!(saved["segments"][1]["kind"], other);
+            let config = SegmentManagerConfig::default();
+            let reopened = SegmentManager::new(config, storage.clone(), layout).unwrap();
+            assert_eq!(kinds(&reopened), expected);
 
-        let _manager = SegmentManager::new(config, storage.clone(), FLAT_LAYOUT).unwrap();
-        assert!(storage.file_exists("segment_000000.flat"));
-        assert!(!storage.file_exists("segment_000042.flat"), "orphan swept");
-        assert!(!storage.file_exists("segment_000042.flat.tmp"));
-        assert!(
-            storage.file_exists("segment_000099.hnsw"),
-            "a different index type's segment file must never be swept by this layout"
-        );
-        assert!(storage.file_exists("vector_index.flat"), "foreign spared");
+            let candidate = MergeCandidate {
+                segments: reopened.list_segments(),
+                total_vectors: 150,
+                total_size: 0,
+            };
+            reopened
+                .publish_merge(candidate, create_info("segment_000002", 150))
+                .unwrap();
+            assert_eq!(
+                kinds(&reopened),
+                [("segment_000002".to_string(), Some(own.to_string()))]
+            );
+            assert_eq!(reopened.segments_of_other_kinds(), 0);
+        }
+    }
+
+    /// Issue #1579: a manifest written before it records no kind of its
+    /// segments. Each is of the kind recorded for the field, the index's own
+    /// or another it can hold, the first whose primary file exists, and of
+    /// the recorded or the own one when none does. A file of another kind
+    /// under such an id stays at that load. The next save records the kind.
+    #[test]
+    fn a_segment_without_a_kind_is_given_one_by_its_files() {
+        let hnsw = crate::vector::index::hnsw::segment::LAYOUT;
+        // (recorded for the field, files of the segment, expected kind).
+        let cases: [(Option<&str>, &[&str], &str); 8] = [
+            (None, &[], "hnsw"),
+            (None, &["hnsw"], "hnsw"),
+            (None, &["flat"], "flat"),
+            (None, &["ivf"], "ivf"),
+            (None, &["flat", "hnsw"], "hnsw"),
+            (Some("flat"), &["flat", "hnsw"], "flat"),
+            (Some("flat"), &["hnsw"], "hnsw"),
+            (Some("ivf"), &[], "ivf"),
+        ];
+        for (recorded, files, expected) in cases {
+            let what = format!("recorded {recorded:?}, files {files:?}");
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            register(&storage, hnsw, "segment_000000");
+            let mut old = saved_manifest(&storage);
+            old["segments"][0].as_object_mut().unwrap().remove("kind");
+            if let Some(kind) = recorded {
+                old["field"] =
+                    serde_json::json!({"kind": kind, "dimension": 8, "distance": "Cosine"});
+            }
+            manifest_io::save_checksummed_json(storage.as_ref(), MANIFEST_FILE, None, &old)
+                .unwrap();
+            let files: Vec<String> = files
+                .iter()
+                .map(|kind| format!("segment_000000.{kind}"))
+                .collect();
+            for file in &files {
+                write(&storage, file, b"x");
+            }
+
+            let config = SegmentManagerConfig::default();
+            let manager = SegmentManager::new(config, storage.clone(), hnsw).unwrap();
+            let segment = &manager.list_segments()[0];
+            assert_eq!(segment.kind.as_deref(), Some(expected), "{what}");
+            for file in &files {
+                assert!(storage.file_exists(file), "{what}: {file} must stay");
+            }
+            manager.save_state().unwrap();
+            assert_eq!(
+                saved_manifest(&storage)["segments"][0]["kind"],
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    /// Issue #1579: the size of a segment is that of the files of its kind,
+    /// and its deletion removes the files of every kind under its id.
+    #[test]
+    fn a_segments_size_is_of_its_kind_and_its_deletion_of_every_kind() {
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let manager = SegmentManager::new(
+            SegmentManagerConfig::default(),
+            storage.clone(),
+            crate::vector::index::hnsw::segment::LAYOUT,
+        )
+        .unwrap();
+        for (file, bytes) in [
+            ("segment_000000.hnsw", 1),
+            ("segment_000000.hnsw.f32", 2),
+            ("segment_000000.flat", 4),
+            ("segment_000000.flat.f32", 8),
+            ("segment_000000.ivf", 16),
+            ("segment_000000.mv", 32),
+        ] {
+            write(&storage, file, &vec![0; bytes]);
+        }
+        for (kind, size) in [(None, 3), (Some("flat"), 12), (Some("ivf"), 16)] {
+            let mut info = create_info("segment_000000", 1);
+            info.size_bytes = 0;
+            info.kind = kind.map(str::to_string);
+            manager.add_segment(info).unwrap();
+            let listed = manager.get_segment("segment_000000").unwrap();
+            assert_eq!(listed.size_bytes, size, "{kind:?}");
+
+            // A merge's segment is measured when it is published.
+            let candidate = MergeCandidate {
+                segments: vec![listed],
+                total_vectors: 1,
+                total_size: 0,
+            };
+            let mut merged = create_info("segment_000000", 1);
+            merged.kind = kind.map(str::to_string);
+            manager.publish_merge(candidate, merged).unwrap();
+            let listed = manager.get_segment("segment_000000").unwrap();
+            assert_eq!(listed.size_bytes, size, "merged, {kind:?}");
+            manager.remove_segment("segment_000000").unwrap();
+        }
+        manager.delete_segment_files("segment_000000").unwrap();
+        let mut left = storage.list_files().unwrap();
+        left.retain(|file| file.starts_with("segment_"));
+        assert_eq!(left, ["segment_000000.mv"]);
     }
 
     /// Issue #1532: the Flat, HNSW and IVF writers stage a rerank sidecar as

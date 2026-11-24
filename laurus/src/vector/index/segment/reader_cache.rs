@@ -8,13 +8,13 @@
 //! multi-segment index the per-query I/O often dominated the actual search
 //! cost.
 //!
-//! This cache holds an `Arc<R>` per `segment_id` (`R` is the index type's
-//! concrete reader — `HnswIndexReader`, `FlatVectorIndexReader`,
-//! `IvfIndexReader`) so that the second and subsequent searches against the
-//! same segment hit memory only. Entries are invalidated by the owning
-//! index's merge path immediately after the segment manager removes a
-//! source segment as part of a merge, and dropped all at once when the
-//! index's deletion bitmap is created (see
+//! This cache holds an `Arc<R>` per `segment_id` (`R` is the reader —
+//! `dyn VectorIndexReader` for a Flat, HNSW or IVF index, which can hold
+//! segments of all three kinds (Issue #1579)) so that the second and
+//! subsequent searches against the same segment hit memory only. Entries are
+//! invalidated by the owning index's merge path immediately after the segment
+//! manager removes a source segment as part of a merge, and dropped all at
+//! once when the index's deletion bitmap is created (see
 //! `SegmentedReaderCache::sealed_readers_newest_first`).
 //!
 //! Issue [#660](https://github.com/mosuka/laurus/issues/660). Reuses the
@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 
 use crate::error::Result;
 use crate::maintenance::deletion::DeletionBitmap;
+use crate::vector::index::segment::manager::ManagedSegmentInfo;
 use crate::vector::index::segment::segmented_core::SegmentedCore;
 
 /// Sealed segment readers, and the deletion bitmap they were loaded with
@@ -44,7 +45,7 @@ pub(crate) type ReadersWithBitmap<R> = (Vec<Arc<R>>, Option<Arc<DeletionBitmap>>
 /// budget). A future change can swap the inner map for an LRU-backed
 /// implementation without touching call sites.
 #[derive(Debug)]
-pub struct SegmentedReaderCache<R> {
+pub struct SegmentedReaderCache<R: ?Sized> {
     inner: RwLock<AHashMap<String, Arc<R>>>,
 
     /// The [`SegmentedCore::bitmap_epoch`] the cached readers were loaded
@@ -52,7 +53,7 @@ pub struct SegmentedReaderCache<R> {
     bitmap_epoch: AtomicU64,
 }
 
-impl<R> Default for SegmentedReaderCache<R> {
+impl<R: ?Sized> Default for SegmentedReaderCache<R> {
     // Not derived: `#[derive(Default)]` on a generic struct adds an `R:
     // Default` bound, but `R` here is only ever stored behind an `Arc` and
     // never itself defaulted.
@@ -65,11 +66,6 @@ impl<R> Default for SegmentedReaderCache<R> {
 }
 
 impl<R> SegmentedReaderCache<R> {
-    /// Create an empty cache.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Return the cached reader for `segment_id`, invoking `loader` on miss.
     ///
     /// Concurrent callers requesting the same `segment_id` may race; the
@@ -90,6 +86,23 @@ impl<R> SegmentedReaderCache<R> {
     where
         F: FnOnce() -> Result<R>,
     {
+        self.get_or_load_shared(segment_id, || loader().map(Arc::new))
+    }
+}
+
+impl<R: ?Sized> SegmentedReaderCache<R> {
+    /// Create an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`Self::get_or_load`] for a reader `loader` has put behind an `Arc`,
+    /// as one whose type is not known must be.
+    fn get_or_load_shared(
+        &self,
+        segment_id: &str,
+        loader: impl FnOnce() -> Result<Arc<R>>,
+    ) -> Result<Arc<R>> {
         if let Some(reader) = self.inner.read().get(segment_id) {
             return Ok(Arc::clone(reader));
         }
@@ -101,7 +114,7 @@ impl<R> SegmentedReaderCache<R> {
             return Ok(Arc::clone(reader));
         }
 
-        let reader = Arc::new(loader()?);
+        let reader = loader()?;
         guard.insert(segment_id.to_string(), Arc::clone(&reader));
         Ok(reader)
     }
@@ -146,7 +159,7 @@ impl<R> SegmentedReaderCache<R> {
     pub(crate) fn sealed_readers_newest_first(
         &self,
         core: &SegmentedCore,
-        load: impl Fn(&str, Option<Arc<DeletionBitmap>>) -> Result<R>,
+        load: impl Fn(&ManagedSegmentInfo, Option<Arc<DeletionBitmap>>) -> Result<Arc<R>>,
     ) -> Result<ReadersWithBitmap<R>> {
         let mut segments = core.manager().pinned_segments();
         #[cfg(test)]
@@ -168,7 +181,7 @@ impl<R> SegmentedReaderCache<R> {
             let readers = segments
                 .iter()
                 .map(|info| {
-                    self.get_or_load(&info.segment_id, || load(&info.segment_id, bitmap.clone()))
+                    self.get_or_load_shared(&info.segment_id, || load(info, bitmap.clone()))
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -342,7 +355,7 @@ mod tests {
             cache
                 .sealed_readers_newest_first(core, |_, bitmap| {
                     loads.fetch_add(1, Ordering::SeqCst);
-                    Ok(bitmap.is_some())
+                    Ok(Arc::new(bitmap.is_some()))
                 })
                 .unwrap()
                 .0
@@ -356,7 +369,7 @@ mod tests {
             let (core, ids) = core_with_segments(3);
             let cache: SegmentedReaderCache<String> = SegmentedReaderCache::new();
             let (readers, _) = cache
-                .sealed_readers_newest_first(&core, |id, _| Ok(id.to_string()))
+                .sealed_readers_newest_first(&core, |info, _| Ok(Arc::new(info.segment_id.clone())))
                 .unwrap();
             let order: Vec<String> = readers.iter().map(|r| r.to_string()).collect();
             let expected: Vec<String> = ids.into_iter().rev().collect();
@@ -393,7 +406,7 @@ mod tests {
                 SegmentedReaderCache::new();
             let attached = || {
                 let (readers, _) = cache
-                    .sealed_readers_newest_first(&core, |_, bitmap| Ok(bitmap))
+                    .sealed_readers_newest_first(&core, |_, bitmap| Ok(Arc::new(bitmap)))
                     .unwrap();
                 readers[0].as_ref().clone().unwrap()
             };
@@ -425,7 +438,7 @@ mod tests {
                     if !created.swap(true, Ordering::SeqCst) {
                         core.mark_deleted(1).unwrap();
                     }
-                    Ok(bitmap.is_some())
+                    Ok(Arc::new(bitmap.is_some()))
                 })
                 .unwrap();
             assert!(readers.iter().all(|reader| **reader));

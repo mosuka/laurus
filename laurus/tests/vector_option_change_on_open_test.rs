@@ -1,5 +1,5 @@
-//! Issue #1547: a vector field opens only under the index kind, dimension
-//! and distance its files were written with.
+//! Issue #1547: a vector field opens only under the dimension and distance
+//! its files were written with, and an index kind that reads them.
 //!
 //! The CLI, the server and the bindings read the schema from `schema.toml`,
 //! which a user can edit while the index is closed, and `Engine::new` opens
@@ -11,8 +11,13 @@
 //! `segments.json` now records the three, and the open fails instead.
 //! Every other option, such as the quantizer, may still change.
 //!
-//! Issue #1536: `update_field` changes any of the three as a Destructive
-//! change, which recreates the field empty, also for a change of kind.
+//! Issue #1579: HNSW, Flat and IVF read each other's segments, so a field
+//! opens under another of the three; `engine_update_field_kind_test.rs`
+//! tests what it then holds. MultiVector reads only its own.
+//!
+//! Issue #1536: `update_field` changes the dimension, the distance, and the
+//! kind to or from MultiVector as a Destructive change, which recreates the
+//! field empty.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -174,9 +179,9 @@ fn assert_rejected(result: laurus::Result<Engine>, reason: &str) {
     }
 }
 
-/// Each change of the kind, the dimension or the distance fails the open,
-/// changes none of the field's files, and the index still opens under the
-/// option it was written with.
+/// Each change of the dimension or the distance, or of the kind to or from
+/// MultiVector, fails the open, changes none of the field's files, and the
+/// index still opens under the option it was written with.
 #[tokio::test(flavor = "multi_thread")]
 async fn reopening_with_another_kind_dimension_or_distance_fails_at_the_open() {
     let cosine = |kind_and_dimension: &str| {
@@ -185,26 +190,10 @@ async fn reopening_with_another_kind_dimension_or_distance_fails_at_the_open() {
     let cases: Vec<(FieldOption, FieldOption, String)> = vec![
         (
             FieldOption::Flat(flat(DIM)),
-            FieldOption::Hnsw(hnsw(DIM)),
+            FieldOption::MultiVector(multi_vector(DIM)),
             format!(
-                "{}, so it cannot be opened with kind Hnsw",
+                "{}, so it cannot be opened with kind MultiVector",
                 cosine("kind Flat, dimension 8")
-            ),
-        ),
-        (
-            FieldOption::Hnsw(hnsw(DIM)),
-            FieldOption::Flat(flat(DIM)),
-            format!(
-                "{}, so it cannot be opened with kind Flat",
-                cosine("kind Hnsw, dimension 8")
-            ),
-        ),
-        (
-            FieldOption::Ivf(ivf(DIM)),
-            FieldOption::Flat(flat(DIM)),
-            format!(
-                "{}, so it cannot be opened with kind Flat",
-                cosine("kind Ivf, dimension 8")
             ),
         ),
         (
@@ -213,6 +202,48 @@ async fn reopening_with_another_kind_dimension_or_distance_fails_at_the_open() {
             format!(
                 "{}, so it cannot be opened with kind MultiVector",
                 cosine("kind Hnsw, dimension 8")
+            ),
+        ),
+        (
+            FieldOption::Ivf(ivf(DIM)),
+            FieldOption::MultiVector(multi_vector(DIM)),
+            format!(
+                "{}, so it cannot be opened with kind MultiVector",
+                cosine("kind Ivf, dimension 8")
+            ),
+        ),
+        (
+            FieldOption::MultiVector(multi_vector(DIM)),
+            FieldOption::Flat(flat(DIM)),
+            format!(
+                "{}, so it cannot be opened with kind Flat",
+                cosine("kind MultiVector, dimension 8")
+            ),
+        ),
+        (
+            FieldOption::MultiVector(multi_vector(DIM)),
+            FieldOption::Hnsw(hnsw(DIM)),
+            format!(
+                "{}, so it cannot be opened with kind Hnsw",
+                cosine("kind MultiVector, dimension 8")
+            ),
+        ),
+        (
+            FieldOption::MultiVector(multi_vector(DIM)),
+            FieldOption::Ivf(ivf(DIM)),
+            format!(
+                "{}, so it cannot be opened with kind Ivf",
+                cosine("kind MultiVector, dimension 8")
+            ),
+        ),
+        // Another of the three kinds that read each other does not count
+        // among what the open rejects.
+        (
+            FieldOption::Ivf(ivf(DIM)),
+            FieldOption::Hnsw(hnsw(4)),
+            format!(
+                "{}, so it cannot be opened with dimension 4",
+                cosine("kind Ivf, dimension 8")
             ),
         ),
         (
@@ -283,7 +314,16 @@ async fn reopening_with_another_kind_dimension_or_distance_fails_at_the_open() {
             FieldOption::Flat(flat(DIM)),
             FieldOption::Hnsw(hnsw(4).distance(DistanceMetric::Euclidean)),
             format!(
-                "{}, so it cannot be opened with kind Hnsw, dimension 4 and distance Euclidean",
+                "{}, so it cannot be opened with dimension 4 and distance Euclidean",
+                cosine("kind Flat, dimension 8")
+            ),
+        ),
+        (
+            FieldOption::Flat(flat(DIM)),
+            FieldOption::MultiVector(multi_vector(4).distance(DistanceMetric::DotProduct)),
+            format!(
+                "{}, so it cannot be opened with kind MultiVector, dimension 4 and distance \
+                 DotProduct",
                 cosine("kind Flat, dimension 8")
             ),
         ),
@@ -454,13 +494,20 @@ async fn an_index_without_a_record_is_checked_against_its_files() {
         Engine::new(open_storage(&dir), schema_with(FieldOption::Hnsw(hnsw(4)))).await,
         "its files were written with dimension 8, so it cannot be opened with dimension 4",
     );
+    // The dimension is read from the header of the kind that was written.
+    for other in [FieldOption::Flat(flat(4)), FieldOption::Ivf(ivf(4))] {
+        assert_rejected(
+            Engine::new(open_storage(&dir), schema_with(other)).await,
+            "its files were written with dimension 8, so it cannot be opened with dimension 4",
+        );
+    }
     assert_rejected(
         Engine::new(
             open_storage(&dir),
-            schema_with(FieldOption::Flat(flat(DIM))),
+            schema_with(FieldOption::MultiVector(multi_vector(DIM))),
         )
         .await,
-        "its files were written with kind Hnsw, so it cannot be opened with kind Flat",
+        "its files were written with kind Hnsw, so it cannot be opened with kind MultiVector",
     );
     // No file records the distance, so a change of it opens.
     let euclidean = FieldOption::Hnsw(hnsw(DIM).distance(DistanceMetric::Euclidean));
@@ -545,17 +592,6 @@ async fn an_index_with_segments_of_two_dimensions_needs_the_field_added_again() 
     assert_eq!(search(&engine, 4).await.len(), 1);
 }
 
-/// The primary file suffix, without the dot, of a single-vector kind's
-/// segments.
-fn kind_suffix(option: &FieldOption) -> &'static str {
-    match option {
-        FieldOption::Flat(_) => "flat",
-        FieldOption::Hnsw(_) => "hnsw",
-        FieldOption::Ivf(_) => "ivf",
-        other => panic!("not a single-vector kind: {other:?}"),
-    }
-}
-
 /// The ids, sorted, of the hits of [`try_search`].
 async fn found_ids(engine: &Engine) -> Result<Vec<String>, String> {
     let mut ids: Vec<String> = try_search(engine, DIM)
@@ -568,18 +604,65 @@ async fn found_ids(engine: &Engine) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
-/// Change field `vec` from `written` to `changed` with `update_field` and
-/// check each step, returning the first that went wrong.
+/// A change between the three kinds that read each other keeps the field's
+/// vectors (Issue #1579), on disk too: the index opens under the new schema
+/// and under the old one, and no file of the old kind is left once it was
+/// opened again. On Windows a file that a reader has mapped cannot be
+/// deleted before.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_field_between_the_three_kinds_keeps_the_vectors_on_disk() {
+    let kinds = [
+        ("flat", FieldOption::Flat(flat(DIM))),
+        ("hnsw", FieldOption::Hnsw(hnsw(DIM))),
+        ("ivf", FieldOption::Ivf(ivf(DIM))),
+    ];
+    for (old_suffix, written) in &kinds {
+        for (new_suffix, changed) in &kinds {
+            if old_suffix == new_suffix {
+                continue;
+            }
+            let label = format!("{old_suffix} -> {new_suffix}");
+            let dir = TempDir::new().unwrap();
+            create_index(&dir, written).await;
+            let engine = Engine::new(open_storage(&dir), schema_with(written.clone()))
+                .await
+                .unwrap();
+            let before = found_ids(&engine).await.unwrap();
+            assert_eq!(before.len(), 8, "{label}");
+            let outcome = engine
+                .update_field("vec", changed.clone(), REINDEX)
+                .await
+                .unwrap();
+            assert_eq!(outcome.classification, FieldChangeKind::Reindex, "{label}");
+            assert_eq!(found_ids(&engine).await.unwrap(), before, "{label}");
+            drop(engine);
+
+            for schema in [changed, written] {
+                let engine = Engine::new(open_storage(&dir), schema_with(schema.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(found_ids(&engine).await.unwrap(), before, "{label}");
+                drop(engine);
+                let left: Vec<String> = field_files(&dir)
+                    .into_keys()
+                    .filter(|name| name.contains(&format!(".{old_suffix}")))
+                    .collect();
+                assert!(left.is_empty(), "{label}: {left:?}");
+            }
+        }
+    }
+}
+
+/// Change field `vec` from `written` to `changed`, one of which is
+/// MultiVector, with `update_field` and check each step, returning the
+/// first that went wrong.
 async fn change_kind(written: &FieldOption, changed: &FieldOption) -> Result<(), String> {
     let dir = TempDir::new().unwrap();
     create_index(&dir, written).await;
+    let files = field_files(&dir);
     let engine = Engine::new(open_storage(&dir), schema_with(written.clone()))
         .await
         .map_err(|e| format!("open: {e}"))?;
-    let before = found_ids(&engine).await?;
-    if before.is_empty() {
-        return Err("the search found nothing before the change".to_string());
-    }
 
     // The dry run reports the classification and changes nothing.
     let outcome = engine
@@ -595,11 +678,11 @@ async fn change_kind(written: &FieldOption, changed: &FieldOption) -> Result<(),
     if format!("{:?}", engine.schema().fields["vec"]) != format!("{written:?}") {
         return Err("the dry run changed the schema".to_string());
     }
-    if found_ids(&engine).await? != before {
-        return Err("the dry run changed the search results".to_string());
+    if field_files(&dir) != files {
+        return Err("the dry run changed the field's files".to_string());
     }
 
-    // Applying it discards the field's vectors.
+    // Applying it discards the field's data.
     let outcome = engine
         .update_field("vec", changed.clone(), REINDEX)
         .await
@@ -614,13 +697,16 @@ async fn change_kind(written: &FieldOption, changed: &FieldOption) -> Result<(),
     if !schema.pending_reindex.contains("vec") {
         return Err("pending_reindex does not name the field".to_string());
     }
-    let after = found_ids(&engine).await?;
-    if !after.is_empty() {
-        return Err(format!("the search still found {after:?}"));
+    let left: Vec<String> = field_files(&dir)
+        .into_keys()
+        .filter(|name| name.contains("segment_"))
+        .collect();
+    if !left.is_empty() {
+        return Err(format!("segment files are left: {left:?}"));
     }
 
     // Documents put afterwards are indexed and searched under the new kind,
-    // and the old kind's segment files are gone.
+    // also after a reopen. Only a single-vector field is searched.
     for i in 10..13 {
         engine
             .put_document(&format!("n{i}"), doc(changed, i))
@@ -628,55 +714,36 @@ async fn change_kind(written: &FieldOption, changed: &FieldOption) -> Result<(),
             .map_err(|e| format!("put: {e}"))?;
     }
     engine.commit().await.map_err(|e| format!("commit: {e}"))?;
-    let expected = vec!["n10".to_string(), "n11".to_string(), "n12".to_string()];
-    let found = found_ids(&engine).await?;
-    if found != expected {
-        return Err(format!("the search after the put found {found:?}"));
-    }
-    let old_suffix = format!(".{}", kind_suffix(written));
-    let left: Vec<String> = field_files(&dir)
-        .into_keys()
-        .filter(|name| name.contains(&old_suffix))
-        .collect();
-    if !left.is_empty() {
-        return Err(format!("files of the old kind are left: {left:?}"));
-    }
-
     drop(engine);
     let engine = Engine::new(open_storage(&dir), schema_with(changed.clone()))
         .await
         .map_err(|e| format!("reopen: {e}"))?;
-    let found = found_ids(&engine).await?;
-    if found != expected {
-        return Err(format!("the search after the reopen found {found:?}"));
+    if !matches!(changed, FieldOption::MultiVector(_)) {
+        let found = found_ids(&engine).await?;
+        if found != ["n10", "n11", "n12"] {
+            return Err(format!("the search after the reopen found {found:?}"));
+        }
     }
     Ok(())
 }
 
-/// A change between single-vector kinds is Destructive, since each kind
-/// reads only its own segment files (Issue #1536). The dry run says so,
-/// and applying it discards the field's vectors and recreates the field
+/// A change between MultiVector and a single-vector kind is Destructive,
+/// since they read only their own segments (Issue #1536). The dry run says
+/// so, and applying it discards the field's data and recreates the field
 /// empty under the new kind, marked in `pending_reindex`. Documents put
 /// afterwards are searched under the new kind, also after a reopen.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_kind_changing_update_field_recreates_the_field_empty_under_the_new_kind() {
-    let kinds = [
+async fn an_update_field_to_or_from_multi_vector_recreates_the_field_empty() {
+    let multi_vector = FieldOption::MultiVector(multi_vector(DIM));
+    let mut failures = Vec::new();
+    for single in [
         FieldOption::Flat(flat(DIM)),
         FieldOption::Hnsw(hnsw(DIM)),
         FieldOption::Ivf(ivf(DIM)),
-    ];
-    let mut failures = Vec::new();
-    for written in &kinds {
-        for changed in &kinds {
-            if kind_suffix(written) == kind_suffix(changed) {
-                continue;
-            }
+    ] {
+        for (written, changed) in [(&single, &multi_vector), (&multi_vector, &single)] {
             if let Err(failure) = change_kind(written, changed).await {
-                failures.push(format!(
-                    "{} -> {}: {failure}",
-                    kind_suffix(written),
-                    kind_suffix(changed)
-                ));
+                failures.push(format!("{written:?} -> {changed:?}: {failure}"));
             }
         }
     }

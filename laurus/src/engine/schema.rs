@@ -493,15 +493,14 @@ pub enum FieldChangeKind {
 /// stored, it is [`FieldChangeKind::Destructive`]: a lexical rebuild
 /// re-derives the field from its stored values only, so nothing of the
 /// field is left (Issue #1685). Changing
-/// between two vector variants (e.g. `Hnsw` ->
-/// `Flat`) is always [`FieldChangeKind::Destructive`]: each index kind reads
-/// only its own segment files, so applying the change discards the field's
-/// vectors and recreates it empty under the new kind (Issue #1536).
-/// Rebuilding the field as another kind from its decoded vectors, which
-/// would make a change between `Hnsw`, `Flat` and `Ivf` a
-/// [`FieldChangeKind::Reindex`], is Issue #1579. Between
-/// [`FieldOption::MultiVector`] and any other vector variant there is
-/// nothing to rebuild from at all: per-document token vectors and one
+/// between `Hnsw`, `Flat` and `Ivf` is a [`FieldChangeKind::Reindex`]: the
+/// field is rebuilt as the new kind from the vectors its segments hold,
+/// whichever of the three kinds they were written as (Issue #1579); it is
+/// [`FieldChangeKind::Destructive`] together with a change of `dimension`,
+/// `distance` or `embedder`, as within one variant. Between
+/// [`FieldOption::MultiVector`] and any other vector variant a change is
+/// always [`FieldChangeKind::Destructive`], since there is nothing to
+/// rebuild from: per-document token vectors and one
 /// searchable vector per document share no on-disk layout. Changing between
 /// a lexical and a vector variant is always
 /// [`FieldChangeKind::Destructive`]: the two subsystems have no shared
@@ -582,10 +581,14 @@ pub fn classify_change(old: &FieldOption, new: &FieldOption) -> FieldChangeKind 
         (FieldOption::MultiVector(o), FieldOption::MultiVector(n)) => {
             classify_vector_common(old, new).max(classify_multi_vector_specific(o, n))
         }
-        // Each index kind reads only its own segment files, so a field cannot
-        // be rebuilt as another kind from them (Issue #1536, and #1579 for
-        // a rebuild that would). Token vectors and a single searchable
-        // vector share no on-disk layout either.
+        // The three kinds read each other's segments, so a field is rebuilt
+        // as another of them from its own (Issue #1579).
+        (
+            FieldOption::Hnsw(_) | FieldOption::Flat(_) | FieldOption::Ivf(_),
+            FieldOption::Hnsw(_) | FieldOption::Flat(_) | FieldOption::Ivf(_),
+        ) => classify_vector_common(old, new).max(FieldChangeKind::Reindex),
+        // Token vectors and a single searchable vector share no on-disk
+        // layout.
         (o, n) if o.is_vector() && n.is_vector() => FieldChangeKind::Destructive,
 
         // A lexical rebuild re-derives the field from its stored values
@@ -2029,12 +2032,12 @@ mod tests {
                 Destructive,
             ),
             // ---- Cross-variant: vector <-> vector ----
-            // Each kind reads only its own segment files (Issue #1536).
+            // The three kinds read each other's segments (Issue #1579).
             (
-                "hnsw -> flat with identical dimension/distance/embedder is destructive",
+                "hnsw -> flat with identical dimension/distance/embedder requires reindex",
                 hnsw(|o| o),
                 flat(|o| o),
-                Destructive,
+                Reindex,
             ),
             (
                 "hnsw -> flat with a dimension change is destructive",
@@ -2046,33 +2049,186 @@ mod tests {
                 Destructive,
             ),
             (
-                "hnsw -> ivf with identical dimension/distance/embedder is destructive",
+                "hnsw -> flat with a distance change is destructive",
+                hnsw(|o| o),
+                flat(|mut o| {
+                    o.distance = DistanceMetric::Euclidean;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "hnsw -> flat with an embedder change is destructive",
+                hnsw(|o| o),
+                flat(|mut o| {
+                    o.embedder = Some("other".to_string());
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "hnsw -> ivf with identical dimension/distance/embedder requires reindex",
                 hnsw(|o| o),
                 ivf(|o| o),
+                Reindex,
+            ),
+            (
+                "hnsw -> ivf with a dimension change is destructive",
+                hnsw(|o| o),
+                ivf(|mut o| {
+                    o.dimension = 256;
+                    o
+                }),
                 Destructive,
             ),
             (
-                "flat -> hnsw with identical dimension/distance/embedder is destructive",
+                "hnsw -> ivf with a distance change is destructive",
+                hnsw(|o| o),
+                ivf(|mut o| {
+                    o.distance = DistanceMetric::Euclidean;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "hnsw -> ivf with an embedder change is destructive",
+                hnsw(|o| o),
+                ivf(|mut o| {
+                    o.embedder = Some("other".to_string());
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "flat -> hnsw with identical dimension/distance/embedder requires reindex",
                 flat(|o| o),
                 hnsw(|o| o),
+                Reindex,
+            ),
+            (
+                "flat -> hnsw with a dimension change is destructive",
+                flat(|o| o),
+                hnsw(|mut o| {
+                    o.dimension = 256;
+                    o
+                }),
                 Destructive,
             ),
             (
-                "flat -> ivf with identical dimension/distance/embedder is destructive",
+                "flat -> hnsw with a distance change is destructive",
+                flat(|o| o),
+                hnsw(|mut o| {
+                    o.distance = DistanceMetric::Euclidean;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "flat -> hnsw with an embedder change is destructive",
+                flat(|o| o),
+                hnsw(|mut o| {
+                    o.embedder = Some("other".to_string());
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "flat -> ivf with identical dimension/distance/embedder requires reindex",
                 flat(|o| o),
                 ivf(|o| o),
+                Reindex,
+            ),
+            (
+                "flat -> ivf with a dimension change is destructive",
+                flat(|o| o),
+                ivf(|mut o| {
+                    o.dimension = 256;
+                    o
+                }),
                 Destructive,
             ),
             (
-                "ivf -> hnsw with identical dimension/distance/embedder is destructive",
+                "flat -> ivf with a distance change is destructive",
+                flat(|o| o),
+                ivf(|mut o| {
+                    o.distance = DistanceMetric::Euclidean;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "flat -> ivf with an embedder change is destructive",
+                flat(|o| o),
+                ivf(|mut o| {
+                    o.embedder = Some("other".to_string());
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "ivf -> hnsw with identical dimension/distance/embedder requires reindex",
                 ivf(|o| o),
                 hnsw(|o| o),
+                Reindex,
+            ),
+            (
+                "ivf -> hnsw with a dimension change is destructive",
+                ivf(|o| o),
+                hnsw(|mut o| {
+                    o.dimension = 256;
+                    o
+                }),
                 Destructive,
             ),
             (
-                "ivf -> flat with identical dimension/distance/embedder is destructive",
+                "ivf -> hnsw with a distance change is destructive",
+                ivf(|o| o),
+                hnsw(|mut o| {
+                    o.distance = DistanceMetric::Euclidean;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "ivf -> hnsw with an embedder change is destructive",
+                ivf(|o| o),
+                hnsw(|mut o| {
+                    o.embedder = Some("other".to_string());
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "ivf -> flat with identical dimension/distance/embedder requires reindex",
                 ivf(|o| o),
                 flat(|o| o),
+                Reindex,
+            ),
+            (
+                "ivf -> flat with a dimension change is destructive",
+                ivf(|o| o),
+                flat(|mut o| {
+                    o.dimension = 256;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "ivf -> flat with a distance change is destructive",
+                ivf(|o| o),
+                flat(|mut o| {
+                    o.distance = DistanceMetric::Euclidean;
+                    o
+                }),
+                Destructive,
+            ),
+            (
+                "ivf -> flat with an embedder change is destructive",
+                ivf(|o| o),
+                flat(|mut o| {
+                    o.embedder = Some("other".to_string());
+                    o
+                }),
                 Destructive,
             ),
             // ---- MultiVector ----
@@ -2185,9 +2341,33 @@ mod tests {
                 Destructive,
             ),
             (
+                "multi_vector -> hnsw with identical dimension/distance is destructive (different layout)",
+                multi_vector(|o| o),
+                hnsw(|o| o),
+                Destructive,
+            ),
+            (
+                "flat -> multi_vector with identical dimension/distance is destructive (different layout)",
+                flat(|o| o),
+                multi_vector(|o| o),
+                Destructive,
+            ),
+            (
                 "multi_vector -> flat with identical dimension/distance is destructive (different layout)",
                 multi_vector(|o| o),
                 flat(|o| o),
+                Destructive,
+            ),
+            (
+                "ivf -> multi_vector with identical dimension/distance is destructive (different layout)",
+                ivf(|o| o),
+                multi_vector(|o| o),
+                Destructive,
+            ),
+            (
+                "multi_vector -> ivf with identical dimension/distance is destructive (different layout)",
+                multi_vector(|o| o),
+                ivf(|o| o),
                 Destructive,
             ),
             (

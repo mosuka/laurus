@@ -2,20 +2,20 @@
 //!
 //! The merge is the one Flat, HNSW and IVF share, in
 //! [`crate::vector::index::segment::merge`]; this engine supplies Flat's
-//! segment reader and writer. Flat has no graph, so the merged segment is
-//! the live vectors of the sources and nothing more.
+//! segment writer. Flat has no graph, so the merged segment is the live
+//! vectors of the sources and nothing more.
 
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::storage::Storage;
 
+use crate::vector::index::segment::kind::SegmentKind;
 use crate::vector::index::segment::manager::ManagedSegmentInfo;
-use crate::vector::index::segment::merge::{self, MergeResult, MergeSource};
+use crate::vector::index::segment::merge::{self, MergeResult, MergeSources};
 
 use crate::maintenance::deletion::DeletionBitmap;
 use crate::vector::index::config::FlatIndexConfig;
-use crate::vector::index::flat::reader::FlatVectorIndexReader;
 use crate::vector::index::flat::writer::FlatIndexWriter;
 use crate::vector::writer::VectorIndexWriterConfig;
 
@@ -64,17 +64,10 @@ impl MergeEngine {
             segments,
             new_segment_id,
             self.deletion_bitmap.as_deref(),
-            |segment| {
-                let reader = FlatVectorIndexReader::load(
-                    self.storage.clone(),
-                    &segment.segment_id,
-                    self.index_config.distance_metric,
-                )?;
-                let rerank = reader.rerank_storage().cloned();
-                Ok(MergeSource {
-                    reader: Box::new(reader),
-                    rerank,
-                })
+            &MergeSources {
+                storage: &self.storage,
+                kind: SegmentKind::Flat,
+                distance: self.index_config.distance_metric,
             },
             |segment_id| {
                 FlatIndexWriter::with_storage(

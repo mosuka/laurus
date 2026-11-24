@@ -283,8 +283,8 @@ rpc UpdateField(UpdateFieldRequest) returns (UpdateFieldResponse);
 | 値 | 意味 |
 | :--- | :--- |
 | `FIELD_CHANGE_KIND_METADATA_ONLY` | 既存のデータに影響せず、常に適用されます（例: HNSW フィールドの `default_ef_search`） |
-| `FIELD_CHANGE_KIND_REINDEX` | フィールドを、インデックスにあるデータから作り直します（例: HNSW フィールドの `m`・`ef_construction`） |
-| `FIELD_CHANGE_KIND_DESTRUCTIVE` | フィールドの既存のデータを捨て（例: ベクトルフィールドの `dimension`・`distance`・`embedder`）、フィールドを `Schema.pending_reindex` に載せます |
+| `FIELD_CHANGE_KIND_REINDEX` | フィールドを、インデックスにあるデータから作り直します（例: HNSW フィールドの `m`・`ef_construction`、ベクトルフィールドの HNSW・Flat・IVF の間でのインデックスの種類） |
+| `FIELD_CHANGE_KIND_DESTRUCTIVE` | フィールドの既存のデータを捨て（例: ベクトルフィールドの `dimension`・`distance`・`embedder`、MultiVector との間でのインデックスの種類）、フィールドを `Schema.pending_reindex` に載せます |
 
 規則の全体は[フィールドの変更](../concepts/schema_and_fields.md#フィールドの変更)を参照してください。`reindex` なしで送った `REINDEX` か `DESTRUCTIVE` の変更は `INVALID_ARGUMENT` で拒否され、何も適用されません。
 

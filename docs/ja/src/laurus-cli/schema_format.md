@@ -365,7 +365,7 @@ pool_factor = 2   # 任意。省略（または 1）ですべてのトークン�
 
 #### 既存のベクトルフィールドを編集する
 
-ベクトルフィールドのファイルは、書いたときのインデックスの種類（`Hnsw`・`Flat`・`Ivf`・`MultiVector`）、`dimension`、`distance` でしか読めません。そのため、この 3 つは `schema.toml` の編集では変えられません。フィールドの `segments.json` がこの 3 つを記録しており、`schema.toml` が別の値を指定するインデックスは開けません（Issue #1547）。
+ベクトルフィールドのファイルは、書いたときの `dimension` と `distance` でしか読めません。また、`MultiVector` フィールドのファイルは、ほかのインデックスの種類では読めません。そのため、これらは `schema.toml` の編集では変えられません。フィールドの `segments.json` がこれらを記録しており、`schema.toml` が別の値を指定するインデックスは開けません（Issue #1547）。
 
 たとえば、文書を 1 件持つ `Hnsw` フィールド `embedding` の `dimension = 4` を `dimension = 8` に変えると、次のようになります。
 
@@ -374,15 +374,17 @@ $ laurus search "title:hello"
 Error: Invalid argument: vector field 'embedding': its files were written with kind Hnsw, dimension 4 and distance Cosine, so it cannot be opened with dimension 8
 ```
 
-インデックスを開くには、フィールドをメッセージに書かれた値に戻してください。値を変えるのは、開いたインデックスに対して行います。種類・`dimension`・`distance` は [`laurus update field`](commands.md#update-field) に `--reindex` を付けて変えられ、フィールドのベクトルは捨てられます（種類の変更は Issue #1536 から）。フィールドは空になるので、文書を put し直す必要があります。
+インデックスを開くには、フィールドをメッセージに書かれた値に戻してください。値を変えるのは、開いたインデックスに対して行います。`dimension`、`distance`、`MultiVector` との間の種類は、[`laurus update field`](commands.md#update-field) に `--reindex` を付けて変えられ、フィールドのベクトルは捨てられます。フィールドは空になるので、文書を put し直す必要があります。
+
+`Hnsw`・`Flat`・`Ivf` は互いのファイルを読めるので、この間の変更ではフィールドのベクトルが保たれます（Issue #1579）。[`laurus update field`](commands.md#update-field) に `--reindex` を付けると、その場で新しい種類に作り直します。`schema.toml` を編集したときは、インデックスは開き、書き込み済みのセグメントは、merge かフィールドの作り直しで書き直されるまで、書いたときの種類のままです。それまで、検索はそのセグメントを全件走査して正確に調べます。大きなセグメントでは、新しい種類のインデックスより遅くなります。laurus は、そうしたフィールドを開くときに警告をログに出します。
 
 ベクトルフィールドのそれ以外の option は、インデックスを閉じている間に `schema.toml` で変えられます。対象は `quantizer`、`m`、`ef_construction`、`n_clusters`、`n_probe`、`rerank_storage`、`pq_codebook_path`、`base_weight`、`embedder`、`MultiVector` フィールドの `storage` と `pool_factor` です。書き込み済みのセグメントは、reindex か merge で書き直されるまで、書いたときの値のままです。次にインデックスを開くとき、laurus は新しいスキーマで何かを書く前に、編集した `schema.toml` とインデックスディレクトリを sync するので、エディタが sync しなかった編集もクラッシュで失われません（Issue #1668。Windows については[インデックスディレクトリの耐久性](../laurus/persistence.md#インデックスディレクトリの耐久性)を参照）。
 
 例外があります。
 
 - ベクトルをまだ 1 つも持たないフィールドは、どの種類・`dimension`・`distance` でも開けます。
-- この検査より前に書かれたインデックスは、次にインデックスを変える commit があるまで、何も記録していません。変更がどのフィールドのものでも、その commit で記録されます。それまでは、セグメントのファイルから分かる種類と `dimension` の食い違いだけで開くのに失敗し、`distance` の変更は検出されません。
-- 以前の build で種類か `dimension` を変えて開き、そのまま文書を書き込んだインデックスには、両方のセグメントが混ざっています。そのため、どの option でも開けません。`schema.toml` からそのフィールドを外してインデックスを開き、`laurus add field` で足し直してください。フィールドは空から始まります。
+- この検査より前に書かれたインデックスは、次にインデックスを変える commit があるまで、何も記録していません。変更がどのフィールドのものでも、その commit で記録されます。それまでは、セグメントのファイルから分かること（`dimension` の食い違いと、`MultiVector` との間の種類の変更）だけで開くのに失敗し、`distance` の変更は検出されません。
+- 以前の build で `dimension` を変えて開き、そのまま文書を書き込んだインデックスには、両方のセグメントが混ざっています。そのため、どの option でも開けません。`schema.toml` からそのフィールドを外してインデックスを開き、`laurus add field` で足し直してください。フィールドは空から始まります。
 
 ## 距離メトリクス
 

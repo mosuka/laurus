@@ -194,6 +194,7 @@ mod tests {
             vector_offset: 0,
             generation: 1,
             size_bytes: count * 100,
+            kind: None,
         }
     }
 

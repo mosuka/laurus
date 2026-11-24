@@ -9,12 +9,18 @@
 //! header format and whether the inner writer's own pending-changes flag
 //! matters before a segment is sealed).
 //!
+//! The segments of one index can be of several of the three kinds (Issue
+//! #1579, see the `segment::kind` module): an index writes and merges into
+//! its own, searches a segment of its own through the backend's searcher,
+//! and scans one of another.
+//!
 //! `SegmentedCore` (deletion bitmap, WAL checkpoint, merge publish) and
 //! [`SegmentedReaderCache`] are unchanged by this generic layer — they are
 //! also used by the MultiVector index (out of scope for #1409), so their
 //! public signatures stay as they are.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -24,13 +30,15 @@ use crate::maintenance::deletion::DeletionBitmap;
 use crate::storage::Storage;
 use crate::vector::DistanceMetric;
 use crate::vector::index::config::VectorIndexTypeConfig;
+use crate::vector::index::flat::searcher::FlatVectorSearcher;
 use crate::vector::index::segment::fanout::{SegmentFanoutSearcher, SegmentedReaderFacade};
 use crate::vector::index::segment::field_record::{FieldRecord, check_field_record};
+use crate::vector::index::segment::kind::{SegmentKind, kind_of_layout};
 use crate::vector::index::segment::manager::{
     ManagedSegmentInfo, SegmentFileLayout, SegmentManager, SegmentManagerConfig,
 };
 use crate::vector::index::segment::merge_policy::TieredMergePolicy;
-use crate::vector::index::segment::reader_cache::SegmentedReaderCache;
+use crate::vector::index::segment::reader_cache::{ReadersWithBitmap, SegmentedReaderCache};
 use crate::vector::index::segment::segmented_core::{SegmentedCore, SourceFiles};
 use crate::vector::index::{MergeCleanup, VectorIndex, VectorIndexStats};
 use crate::vector::reader::VectorIndexReader;
@@ -76,8 +84,8 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
     /// for another kind of index (Issue #1494).
     fn config_from(config: VectorIndexTypeConfig) -> Option<Self::Config>;
 
-    /// Load one sealed segment's reader, with the deletion bitmap attached
-    /// when `bitmap` is `Some`.
+    /// Load the reader of one sealed segment of this backend's kind, with
+    /// the deletion bitmap attached when `bitmap` is `Some`.
     fn load_segment_reader(
         config: &Self::Config,
         storage: &Arc<dyn Storage>,
@@ -92,13 +100,15 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
         segment_id: &str,
     ) -> Result<Self::Writer>;
 
-    /// Build the per-segment searcher used by the multi-segment fan-out.
+    /// Build the per-segment searcher used by the multi-segment fan-out, for
+    /// a segment of this backend's kind.
     fn segment_searcher(
         config: &Self::Config,
         reader: Arc<dyn VectorIndexReader>,
     ) -> Result<Box<dyn VectorIndexSearcher>>;
 
-    /// Merge `segments` into one new segment named `new_segment_id`, filtered
+    /// Merge `segments`, each read as the kind it was written as, into one
+    /// new segment of this backend's kind named `new_segment_id`, filtered
     /// through `bitmap` when `Some`, and return its info.
     fn merge_segments(
         config: &Self::Config,
@@ -159,10 +169,6 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
     }
 }
 
-/// Sealed segment readers, and the deletion bitmap they were loaded with
-/// (see [`SegmentedReaderCache::sealed_readers_newest_first`]).
-type DynReadersWithBitmap = (Vec<Arc<dyn VectorIndexReader>>, Option<Arc<DeletionBitmap>>);
-
 /// State shared between the index handle, its writers, and its searchers.
 struct SegmentedShared<B: SegmentedBackend> {
     /// Segment manifest, index-level deletion bitmap (`{name}.delmap`) and
@@ -172,7 +178,10 @@ struct SegmentedShared<B: SegmentedBackend> {
 
     /// Per-segment reader cache; invalidated on merge, and rebuilt once the
     /// deletion bitmap is created.
-    reader_cache: SegmentedReaderCache<B::Reader>,
+    reader_cache: SegmentedReaderCache<dyn VectorIndexReader>,
+
+    /// The backend, which writes the segments and reads those of its kind.
+    backend: PhantomData<B>,
 }
 
 impl<B: SegmentedBackend> fmt::Debug for SegmentedShared<B> {
@@ -188,17 +197,38 @@ impl<B: SegmentedBackend> SegmentedShared<B> {
     /// Sealed segment readers, newest generation first, with the deletion
     /// bitmap attached, and that bitmap, which the caller pairs them with
     /// (see [`SegmentedReaderCache::sealed_readers_newest_first`]).
-    fn sealed_readers_newest_first(&self, config: &B::Config) -> Result<DynReadersWithBitmap> {
-        let (readers, bitmap) =
-            self.reader_cache
-                .sealed_readers_newest_first(&self.core, |segment_id, bitmap| {
-                    B::load_segment_reader(config, self.core.storage(), segment_id, bitmap)
-                })?;
-        let readers = readers
-            .into_iter()
-            .map(|r| r as Arc<dyn VectorIndexReader>)
-            .collect();
-        Ok((readers, bitmap))
+    fn sealed_readers_newest_first(
+        &self,
+        config: &B::Config,
+    ) -> Result<ReadersWithBitmap<dyn VectorIndexReader>> {
+        self.reader_cache
+            .sealed_readers_newest_first(&self.core, |segment, bitmap| {
+                self.load_segment_reader(config, segment, bitmap)
+            })
+    }
+
+    /// Load the reader of `segment` by the kind it was written as, with the
+    /// deletion bitmap attached when `bitmap` is `Some`.
+    fn load_segment_reader(
+        &self,
+        config: &B::Config,
+        segment: &ManagedSegmentInfo,
+        bitmap: Option<Arc<DeletionBitmap>>,
+    ) -> Result<Arc<dyn VectorIndexReader>> {
+        let storage = self.core.storage();
+        let segment_id = &segment.segment_id;
+        let kind = self.core.manager().kind_of(segment);
+        if kind == kind_of_layout(&B::LAYOUT) {
+            let reader = B::load_segment_reader(config, storage, segment_id, bitmap)?;
+            return Ok(Arc::new(reader));
+        }
+        let loaded = SegmentKind::of_segment(segment_id, kind)?.load(
+            storage,
+            segment_id,
+            B::distance_metric(config),
+            bitmap,
+        )?;
+        Ok(Arc::from(loaded.reader))
     }
 
     /// Merge `segments` into one new segment, dropping the documents
@@ -280,16 +310,18 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
     ///
     /// The manifest records the kind, dimension and distance the segments
     /// are written with, and an index that has segments only opens under
-    /// the same ones (Issue #1547; see `check_field_record`).
+    /// the same dimension and distance, and a kind that reads them (Issue
+    /// #1547; see `check_field_record`). Flat, HNSW and IVF read each
+    /// other's (Issue #1579).
     ///
     /// # Errors
     ///
     /// Returns an error when the manifest fails to load (corruption fails
     /// loudly), [`LaurusError::InvalidArgument`] when the segments were
-    /// written with another kind, dimension or distance than `config`'s,
-    /// and an error when reading the legacy file's header during migration
-    /// fails, or when the legacy file's persisted dimension does not match
-    /// `config`'s.
+    /// written with another dimension or distance than `config`'s, or with
+    /// a kind it cannot read, and an error when reading the legacy file's
+    /// header during migration fails, or when the legacy file's persisted
+    /// dimension does not match `config`'s.
     pub fn open_or_create(
         storage: Arc<dyn Storage>,
         name: &str,
@@ -330,7 +362,15 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
                 B::dimension(&config),
                 B::distance_metric(&config),
             ),
-            |file| B::read_segment_header(&storage, file).map(|(_, dimension)| dimension),
+            |kind, file| {
+                let header = match SegmentKind::from_name(kind) {
+                    Some(other) if kind != kind_of_layout(&B::LAYOUT) => {
+                        other.read_header(&storage, file)
+                    }
+                    _ => B::read_segment_header(&storage, file),
+                };
+                header.map(|(_, dimension)| dimension)
+            },
         )?;
 
         if migrate {
@@ -352,6 +392,7 @@ impl<B: SegmentedBackend> SegmentedIndex<B> {
             shared: Arc::new(SegmentedShared {
                 core: SegmentedCore::new(name, storage, manager),
                 reader_cache: SegmentedReaderCache::new(),
+                backend: PhantomData,
             }),
             config: parking_lot::RwLock::new(config),
             closed: AtomicBool::new(false),
@@ -558,8 +599,23 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
         Ok(Box::new(SegmentFanoutSearcher::new(
             readers,
             bitmap,
-            move |reader| B::segment_searcher(&config, reader),
+            move |reader| {
+                if reader.as_any().is::<B::Reader>() {
+                    B::segment_searcher(&config, reader)
+                } else {
+                    // A segment of another kind (Issue #1579), whose graph or
+                    // lists the backend's searcher cannot use: scan its
+                    // decoded vectors. The fan-out scores the hits of every
+                    // segment on that basis, unless the segment was reranked
+                    // from its sidecar, which a scan of another kind is not.
+                    Ok(Box::new(FlatVectorSearcher::new(reader)?) as Box<dyn VectorIndexSearcher>)
+                }
+            },
         )))
+    }
+
+    fn segments_of_other_kinds(&self) -> usize {
+        self.shared.core.manager().segments_of_other_kinds()
     }
 
     fn embedder(&self) -> Arc<dyn Embedder> {

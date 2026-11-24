@@ -550,7 +550,7 @@ impl MultiVectorIndex {
             &manager,
             storage.as_ref(),
             FieldRecord::new(&LAYOUT, config.dimension, config.distance_metric),
-            |file| format::read_dimension(storage.as_ref(), file),
+            |_, file| format::read_dimension(storage.as_ref(), file),
         )?;
         Ok(Self {
             shared: Arc::new(Shared {

@@ -1180,8 +1180,9 @@ impl Engine {
     /// Returns an error if storage initialization, index creation, or
     /// WAL recovery fails, and
     /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
-    /// if `schema` gives a vector field another index kind, dimension or
-    /// distance than its files were written with (Issue #1547); see
+    /// if `schema` gives a vector field another dimension or distance than
+    /// its files were written with, or an index kind that does not read them
+    /// (Issue #1547); see
     /// [`EngineBuilder::build`].
     pub async fn new(storage: Arc<dyn Storage>, schema: Schema) -> Result<Self> {
         EngineBuilder::new(storage, schema).build().await
@@ -2898,7 +2899,8 @@ impl Engine {
     /// - [`FieldChangeKind::Reindex`](schema::FieldChangeKind::Reindex):
     ///   rebuilt in place from the field's existing on-disk data. For a
     ///   **vector** field (e.g. HNSW `m`/`ef_construction`, any index
-    ///   kind's `quantizer`/`rerank_storage`, IVF `n_clusters`) this reads
+    ///   kind's `quantizer`/`rerank_storage`, IVF `n_clusters`, or the index
+    ///   kind among HNSW, Flat and IVF, Issue #1579) this reads
     ///   only the field's own segments, no document-store read. For a
     ///   **lexical** field (e.g. a text field's `analyzer`,
     ///   `indexed: false -> true`, a change between two lexical types, or
@@ -2920,7 +2922,7 @@ impl Engine {
     ///   the field's existing data is discarded rather than rebuilt (data
     ///   loss — "warn and proceed", see #1077's investigation). For a
     ///   **vector** field (`dimension`/`distance`/`embedder`, or the index
-    ///   kind, e.g. HNSW to Flat, Issue #1536) this physically deletes the
+    ///   kind to or from MultiVector) this physically deletes the
     ///   field's data and recreates it empty under the new option. For a
     ///   **lexical** field (any change on a `stored: false` field) there
     ///   is no separate purge step: the rebuild above naturally leaves the
@@ -5330,8 +5332,10 @@ impl EngineBuilder {
     /// opening, or recovery replay fails, or if a vector field names an
     /// embedder that [`Schema::embedders`] does not declare. Returns
     /// [`LaurusError::InvalidArgument`](crate::error::LaurusError::InvalidArgument)
-    /// if the schema gives a vector field another index kind, dimension or
-    /// distance than its files were written with (Issue #1547).
+    /// if the schema gives a vector field another dimension or distance than
+    /// its files were written with, or an index kind that does not read them
+    /// (Issue #1547): HNSW, Flat and IVF read each other's, and MultiVector
+    /// only its own (Issue #1579).
     pub async fn build(mut self) -> Result<Engine> {
         // Acquire an exclusive lock on the root storage before doing
         // anything else (Issue #1086): a second `Engine` built over the

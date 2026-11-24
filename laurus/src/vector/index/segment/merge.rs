@@ -1,11 +1,13 @@
 //! The merge of vector index segments that Flat, HNSW and IVF share (Issue
 //! #1579).
 //!
-//! A merge reads every live vector of its source segments and writes the
-//! survivors into one new segment. Only the reader of a segment and the
-//! writer of the new one depend on the index type, so each type's own merge
-//! engine (e.g. `hnsw::segment::merge_engine::MergeEngine`) supplies those
-//! two and leaves the rest to `merge_segments`. [`MergeStats`] and
+//! A merge reads every live vector of its source segments, each through the
+//! reader of the kind it was written as, and writes the survivors into one
+//! new segment. Only the writer of the new segment depends on the index
+//! type, so each type's own merge engine (e.g.
+//! `hnsw::segment::merge_engine::MergeEngine`) supplies it and leaves the
+//! rest to `merge_segments`. Merging every segment of a field as another
+//! kind is how `update_field` changes the kind. [`MergeStats`] and
 //! [`MergeResult`] are what a merge returns.
 
 use std::collections::HashSet;
@@ -15,10 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::maintenance::deletion::DeletionBitmap;
+use crate::storage::Storage;
+use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::vector::Vector;
-use crate::vector::index::rerank_storage::RerankStoragePool;
+use crate::vector::index::segment::kind::{LoadedSegment, SegmentKind};
 use crate::vector::index::segment::manager::ManagedSegmentInfo;
-use crate::vector::reader::VectorIndexReader;
 use crate::vector::writer::VectorIndexWriter;
 
 /// Statistics about a merge operation.
@@ -87,14 +90,28 @@ pub struct MergeResult {
     pub merged_segment_ids: Vec<String>,
 }
 
-/// One source segment of a merge, as `merge_segments` reads it.
-pub(crate) struct MergeSource {
-    /// The segment's reader.
-    pub(crate) reader: Box<dyn VectorIndexReader>,
+/// Where a merge reads its source segments, and as what.
+pub(crate) struct MergeSources<'a> {
+    /// The storage the segments are in.
+    pub(crate) storage: &'a Arc<dyn Storage>,
 
-    /// The segment's f32 rerank sidecar, when it has one. The reader has
-    /// loaded it already, in either loading mode, so it costs no extra I/O.
-    pub(crate) rerank: Option<Arc<RerankStoragePool>>,
+    /// The kind of a segment that does not say its own.
+    pub(crate) kind: SegmentKind,
+
+    /// The distance metric the vectors are read under.
+    pub(crate) distance: DistanceMetric,
+}
+
+impl MergeSources<'_> {
+    /// Load `segment` through the reader of its kind. The reader filters no
+    /// deletions, or the merge could not count them.
+    fn load(&self, segment: &ManagedSegmentInfo) -> Result<LoadedSegment> {
+        let kind = match segment.kind.as_deref() {
+            Some(name) => SegmentKind::of_segment(&segment.segment_id, name)?,
+            None => self.kind,
+        };
+        kind.load(self.storage, &segment.segment_id, self.distance, None)
+    }
 }
 
 /// The vectors of a merge's source segments that the merged segment holds.
@@ -120,7 +137,7 @@ struct LiveVectors {
 fn collect_live_vectors(
     segments: &[ManagedSegmentInfo],
     deletions: Option<&DeletionBitmap>,
-    load: impl Fn(&ManagedSegmentInfo) -> Result<MergeSource>,
+    sources: &MergeSources<'_>,
 ) -> Result<LiveVectors> {
     let mut live = LiveVectors {
         vectors: Vec::new(),
@@ -131,12 +148,12 @@ fn collect_live_vectors(
     // Newest generation FIRST, so the first occurrence of a
     // `(doc_id, field)` key is the authoritative (newest) copy and every
     // later one is a stale duplicate (Issue #880).
-    let mut sources: Vec<&ManagedSegmentInfo> = segments.iter().collect();
-    sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
+    let mut newest_first: Vec<&ManagedSegmentInfo> = segments.iter().collect();
+    newest_first.sort_by_key(|s| std::cmp::Reverse(s.generation));
     let mut seen: HashSet<(u64, String)> = HashSet::new();
 
-    for segment in sources {
-        let source = load(segment)?;
+    for segment in newest_first {
+        let source = sources.load(segment)?;
         let mut iterator = source.reader.vector_iterator()?;
         while let Some((doc_id, field, vector)) = iterator.next()? {
             if deletions.is_some_and(|bitmap| bitmap.is_deleted(doc_id)) {
@@ -170,8 +187,7 @@ fn collect_live_vectors(
 /// * `segments` - The source segments, in any order.
 /// * `new_segment_id` - The id of the merged segment.
 /// * `deletions` - The documents to leave out, if any.
-/// * `load` - Loads a source segment. Its reader must not filter deletions
-///   itself, or they are not counted.
+/// * `sources` - Where and as what to read the source segments.
 /// * `new_writer` - Creates the empty writer of the merged segment, called
 ///   once the sources have been read.
 ///
@@ -183,12 +199,12 @@ pub(crate) fn merge_segments<W: VectorIndexWriter>(
     segments: Vec<ManagedSegmentInfo>,
     new_segment_id: String,
     deletions: Option<&DeletionBitmap>,
-    load: impl Fn(&ManagedSegmentInfo) -> Result<MergeSource>,
+    sources: &MergeSources<'_>,
     new_writer: impl FnOnce(&str) -> Result<W>,
 ) -> Result<MergeResult> {
     let start_time = crate::util::time::Timer::now();
 
-    let live = collect_live_vectors(&segments, deletions, load)?;
+    let live = collect_live_vectors(&segments, deletions, sources)?;
     let vectors_merged = live.vectors.len() as u64;
     let total_size = vectors_merged * 128; // Dummy estimate; measured from storage by `add_segment`.
 
@@ -223,6 +239,8 @@ pub(crate) fn merge_segments<W: VectorIndexWriter>(
         // inheriting the maximum cannot collide with a live segment.
         generation: segments.iter().map(|s| s.generation).max().unwrap_or(0),
         size_bytes: total_size,
+        // The manager that publishes the merge makes it one of its own kind.
+        kind: None,
     };
 
     Ok(MergeResult {
@@ -235,9 +253,7 @@ pub(crate) fn merge_segments<W: VectorIndexWriter>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
-    use crate::vector::core::distance::DistanceMetric;
     use crate::vector::core::rerank::RerankStorageKind;
     use crate::vector::index::config::FlatIndexConfig;
     use crate::vector::index::flat::reader::FlatVectorIndexReader;
