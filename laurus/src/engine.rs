@@ -1614,8 +1614,8 @@ impl Engine {
     /// any, is untouched; a failure at or after its WAL append stops
     /// writes, and reopening the index applies it whole or not at all,
     /// exactly as for a singular put. Once writes stopped, the first
-    /// document fails with
-    /// [`LaurusError::WritesStopped`] as its `source`.
+    /// document fails the batch, with [`LaurusError::WritesStopped`] in the
+    /// error's `source` field.
     pub async fn put_documents(&self, docs: Vec<(String, Document)>) -> Result<()> {
         self.index_batch_internal(docs, false).await
     }
@@ -5104,7 +5104,7 @@ impl Engine {
     /// in-flight requests are dropped per
     /// [`futures::future::try_join_all`] semantics. The error is
     /// [`LaurusError::BatchSearch`], which carries the failing request's
-    /// position and, as its `source`, the error that request's
+    /// position and, in its `source` field, the error that request's
     /// [`Self::search`] returned (Issue #1553).
     ///
     /// Issue [#715](https://github.com/mosuka/laurus/issues/715)

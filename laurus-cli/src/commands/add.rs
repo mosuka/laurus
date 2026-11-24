@@ -80,6 +80,33 @@ mod tests {
     use super::*;
     use laurus::Schema;
 
+    /// Issue #1726: an `add field` that cannot write `schema.toml` says why.
+    /// What it printed used to end at `Failed to write schema file`.
+    #[tokio::test]
+    async fn run_field_says_why_it_cannot_write_schema_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Schema::from_toml("[fields.body.Text]\n").unwrap();
+        context::create_index_from_schema(dir.path(), schema)
+            .await
+            .unwrap();
+        // The temporary file that replaces schema.toml cannot be created.
+        std::fs::create_dir(dir.path().join(laurus::index_dir::SCHEMA_TMP_FILE)).unwrap();
+
+        let error = run_field("n", r#"{"Integer": {}}"#, dir.path())
+            .await
+            .unwrap_err();
+
+        let printed = format!("{error:?}");
+        let schema_path = dir.path().join("schema.toml").display().to_string();
+        assert!(
+            printed.starts_with(&format!(
+                "Anyhow error: Failed to write schema file: {schema_path}: "
+            )),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("os error").count(), 1, "{printed}");
+    }
+
     /// Issue #1700: an unknown key in `--field-option` is an error naming
     /// it, instead of a field whose `indexed` silently keeps its default,
     /// and no field is added.

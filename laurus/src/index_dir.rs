@@ -1342,6 +1342,23 @@ mod tests {
         }
     }
 
+    /// Issue #1726: `IndexDirError::Core` prints its `LaurusError` and
+    /// returns that error's source, which is none, so it too names what the
+    /// `LaurusError` holds once.
+    #[test]
+    fn a_core_error_names_what_it_holds_once() {
+        let core = LaurusError::from(std::io::Error::other("the disk is full"));
+        let err = IndexDirError::from(core);
+        assert!(std::error::Error::source(&err).is_none());
+
+        let alone = err.to_string();
+        assert_eq!(alone, "I/O error: the disk is full");
+        let chained = anyhow::Error::new(err).context("Failed to open the index");
+        for printed in [format!("{chained:#}"), format!("{chained:?}")] {
+            assert_eq!(printed.matches("the disk is full").count(), 1, "{printed}");
+        }
+    }
+
     /// Issue #1587: a write that fails removes its temporary file and leaves
     /// what was at `schema.toml` (here a directory, so the rename fails on
     /// every platform).
