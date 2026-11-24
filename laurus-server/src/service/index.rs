@@ -388,6 +388,67 @@ mod tests {
         assert_eq!(message.matches("os error").count(), 1, "{message}");
     }
 
+    /// Issue #1726: a `CreateIndex` whose analyzer cannot be built says why
+    /// once. The message is the whole chain of causes, and the regular
+    /// expression's error was in it twice.
+    #[tokio::test]
+    async fn create_index_names_a_malformed_regex_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_without_index(&dir.path().join("data"));
+        let schema = Schema::from_toml(
+            r#"
+            [analyzers.a]
+            char_filters = [{ type = "pattern_replace", pattern = "(", replacement = "" }]
+            tokenizer = { type = "whitespace" }
+
+            [fields.body.Text]
+            analyzer = "a"
+            "#,
+        )
+        .unwrap();
+
+        let status = service
+            .create_index(Request::new(CreateIndexRequest {
+                schema: Some(schema_convert::to_proto(&schema)),
+            }))
+            .await
+            .unwrap_err();
+
+        let message = status.message();
+        assert_eq!(message.matches("unclosed group").count(), 1, "{message}");
+    }
+
+    /// Issue #1726: an `AddField` that cannot write `schema.toml` says why.
+    /// The message used to end at `Failed to write schema file`.
+    #[tokio::test]
+    async fn add_field_says_why_it_cannot_write_schema_toml() {
+        let (dir, service) = service_with_index("[fields.body.Text]\n").await;
+        let data_dir = dir.path().join("data");
+        // The temporary file that replaces schema.toml cannot be created.
+        std::fs::create_dir(data_dir.join(laurus::index_dir::SCHEMA_TMP_FILE)).unwrap();
+        let schema = Schema::from_toml("[fields.n.Integer]\n").unwrap();
+        let field_option = schema_convert::to_proto(&schema).fields.remove("n");
+        assert!(field_option.is_some());
+
+        let status = service
+            .add_field(Request::new(AddFieldRequest {
+                name: "n".to_string(),
+                field_option,
+            }))
+            .await
+            .unwrap_err();
+
+        let message = status.message();
+        let schema_path = data_dir.join("schema.toml").display().to_string();
+        assert!(
+            message.starts_with(&format!(
+                "Anyhow error: Failed to write schema file: {schema_path}: "
+            )),
+            "{message}"
+        );
+        assert_eq!(message.matches("os error").count(), 1, "{message}");
+    }
+
     /// The schema `GetSchema` returns, which is read back from disk.
     async fn schema_of(service: &IndexService) -> v1::Schema {
         service

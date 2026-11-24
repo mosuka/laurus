@@ -90,6 +90,26 @@ fn is_retriable(error: &LaurusError) -> bool {
 }
 ```
 
+### Printing Errors
+
+`Display` (`{}`) is the whole message of a `LaurusError`. The variants that hold another error (`Io`, `Json`, `Anyhow`, and `BatchIngest` and `BatchSearch`, which a failed batch returns) include it, and `Anyhow` includes all its causes. So `std::error::Error::source` is `None` for every variant, and an error printed with its chain, such as `{:#}` or `{:?}` of an `anyhow::Error`, names the error it holds once (Issue #1726).
+
+To get at the error a variant holds, match the variant:
+
+```rust
+use laurus::LaurusError;
+
+fn io_error(error: &LaurusError) -> Option<&std::io::Error> {
+    match error {
+        LaurusError::Io(e) => Some(e),
+        LaurusError::BatchIngest { source, .. } | LaurusError::BatchSearch { source, .. } => {
+            io_error(source)
+        }
+        _ => None,
+    }
+}
+```
+
 ## Common Error Scenarios
 
 ### Schema Mismatch

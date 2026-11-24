@@ -565,6 +565,34 @@ mod tests {
         );
     }
 
+    /// Issue #1726: the error of a char filter whose regular expression does
+    /// not parse is named once in what `laurus create index` prints (the
+    /// error and its `Caused by:`), which used to name it twice.
+    #[tokio::test]
+    async fn create_index_names_a_malformed_char_filter_regex_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("bad.toml");
+        std::fs::write(
+            &schema_path,
+            r#"
+            [analyzers.bad]
+            char_filters = [{ type = "pattern_replace", pattern = "(", replacement = "" }]
+            tokenizer = { type = "whitespace" }
+
+            [fields.body.Text]
+            analyzer = "bad"
+            "#,
+        )
+        .unwrap();
+
+        let err = create_index(&dir.path().join("idx"), &schema_path)
+            .await
+            .unwrap_err();
+
+        let printed = format!("{err:?}");
+        assert_eq!(printed.matches("unclosed group").count(), 1, "{printed}");
+    }
+
     #[tokio::test]
     async fn create_index_build_failure_in_a_fresh_directory_leaves_nothing_and_retry_succeeds() {
         let dir = tempfile::tempdir().unwrap();

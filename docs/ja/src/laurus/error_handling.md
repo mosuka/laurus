@@ -90,6 +90,26 @@ fn is_retriable(error: &LaurusError) -> bool {
 }
 ```
 
+### エラーの表示
+
+`LaurusError` は `Display`（`{}`）だけで全文になります。別のエラーを持つバリアント（`Io`、`Json`、`Anyhow` と、失敗したバッチが返す `BatchIngest`・`BatchSearch`）はそのエラーを文に含み、`Anyhow` は原因をすべて含みます。そのため `std::error::Error::source` はどのバリアントでも `None` で、`anyhow::Error` の `{:#}` や `{:?}` のように原因の連なりごと表示しても、持っているエラーは 1 回だけ出ます（Issue #1726）。
+
+バリアントが持つエラーを取り出すには、バリアントでマッチします:
+
+```rust
+use laurus::LaurusError;
+
+fn io_error(error: &LaurusError) -> Option<&std::io::Error> {
+    match error {
+        LaurusError::Io(e) => Some(e),
+        LaurusError::BatchIngest { source, .. } | LaurusError::BatchSearch { source, .. } => {
+            io_error(source)
+        }
+        _ => None,
+    }
+}
+```
+
 ## よくあるエラーシナリオ
 
 ### スキーマの不一致

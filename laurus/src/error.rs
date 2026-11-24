@@ -29,11 +29,19 @@ use thiserror::Error;
 /// This enum represents all possible errors that can occur in the Laurus library.
 /// It uses the `thiserror` crate for automatic `Error` trait implementation and
 /// provides convenient constructor methods for creating specific error types.
+///
+/// `Display` is the whole message: a variant that holds another error
+/// ([`Io`](Self::Io), [`Json`](Self::Json), [`Anyhow`](Self::Anyhow),
+/// [`BatchIngest`](Self::BatchIngest) and [`BatchSearch`](Self::BatchSearch))
+/// includes it. So no variant returns it as its
+/// [`source`](std::error::Error::source) as well, and an error printed with
+/// its chain (`{:#}` or `{:?}` of an `anyhow::Error`) names it once (Issue
+/// #1726). To get at the error a variant holds, match the variant.
 #[derive(Error, Debug)]
 pub enum LaurusError {
     /// I/O errors (file operations, network, etc.)
     #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
+    Io(io::Error),
 
     /// Index-related errors
     #[error("Index error: {0}")]
@@ -136,8 +144,8 @@ pub enum LaurusError {
         /// Number of documents successfully applied before the failure.
         applied: usize,
         /// The underlying error that failed the document at `failed_index`.
-        #[source]
-        source: Box<LaurusError>,
+        // `r#`, or thiserror would take it as the error's source.
+        r#source: Box<LaurusError>,
     },
 
     /// A request of [`Engine::search_batch`](crate::Engine::search_batch)
@@ -147,27 +155,47 @@ pub enum LaurusError {
     /// whose search returns an error; when several would fail, this is the
     /// first to do so, not necessarily the one with the lowest position.
     /// Front ends name the request in their own terms (laurus-server says
-    /// `queries[i]`) and classify the error by its `source`.
+    /// `queries[i]`) and classify the error by its `source` field.
     #[error("search request {failed_index} failed: {source}")]
     BatchSearch {
         /// Zero-based position of the failing request in the batch.
         failed_index: usize,
         /// The error the request's search returned.
-        #[source]
-        source: Box<LaurusError>,
+        // `r#`, or thiserror would take it as the error's source.
+        r#source: Box<LaurusError>,
     },
 
     /// JSON serialization/deserialization errors
     #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(serde_json::Error),
 
     /// Generic error for other cases
     #[error("Error: {0}")]
     Other(String),
 
-    /// Generic anyhow error
-    #[error("Anyhow error: {0}")]
-    Anyhow(#[from] anyhow::Error),
+    /// Generic anyhow error, printed with all its causes
+    #[error("Anyhow error: {0:#}")]
+    Anyhow(anyhow::Error),
+}
+
+// Not `#[from]`, which would also make the error the variant's source.
+
+impl From<io::Error> for LaurusError {
+    fn from(err: io::Error) -> Self {
+        LaurusError::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for LaurusError {
+    fn from(err: serde_json::Error) -> Self {
+        LaurusError::Json(err)
+    }
+}
+
+impl From<anyhow::Error> for LaurusError {
+    fn from(err: anyhow::Error) -> Self {
+        LaurusError::Anyhow(err)
+    }
 }
 
 /// Result type alias for operations that may fail with LaurusError.
@@ -365,5 +393,87 @@ mod tests {
             LaurusError::Io(_) => {} // Expected
             _ => panic!("Expected IO error variant"),
         }
+    }
+
+    #[test]
+    fn test_json_and_anyhow_error_conversion() {
+        let json_error = serde_json::from_str::<u32>("x").unwrap_err();
+        let message = json_error.to_string();
+        let error = LaurusError::from(json_error);
+        assert!(
+            matches!(&error, LaurusError::Json(e) if e.to_string() == message),
+            "unexpected variant: {error:?}"
+        );
+
+        let error = LaurusError::from(anyhow::anyhow!("third-party failure"));
+        assert!(
+            matches!(&error, LaurusError::Anyhow(e) if e.to_string() == "third-party failure"),
+            "unexpected variant: {error:?}"
+        );
+    }
+
+    /// Issue #1726: a variant that holds another error names it once, alone
+    /// and printed with its chain, since `Display` includes it and the
+    /// variant does not return it as its source as well. `{:#}` and `{:?}`
+    /// of an `anyhow::Error` (the CLI's `Caused by:`) used to name it twice.
+    #[test]
+    fn a_variant_names_the_error_it_holds_once() {
+        const HELD: &str = "what went wrong";
+        let held = || Box::new(LaurusError::invalid_argument(HELD));
+        let json_error: serde_json::Error = serde::de::Error::custom(HELD);
+        let errors = [
+            ("Io", io::Error::other(HELD).into()),
+            ("Json", json_error.into()),
+            ("Anyhow", anyhow::anyhow!(HELD).into()),
+            (
+                "BatchIngest",
+                LaurusError::BatchIngest {
+                    failed_index: 1,
+                    failed_id: "b".to_string(),
+                    applied: 1,
+                    source: held(),
+                },
+            ),
+            (
+                "BatchSearch",
+                LaurusError::BatchSearch {
+                    failed_index: 1,
+                    source: held(),
+                },
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (variant, error) in errors {
+            if std::error::Error::source(&error).is_some() {
+                wrong.push(format!("{variant} has a source"));
+            }
+            let mut printed = vec![error.to_string()];
+            let error = anyhow::Error::new(error);
+            printed.extend([format!("{error:#}"), format!("{error:?}")]);
+            let error = error.context("a context");
+            printed.extend([format!("{error:#}"), format!("{error:?}")]);
+            for text in printed {
+                let count = text.matches(HELD).count();
+                if count != 1 {
+                    wrong.push(format!("{variant} names it {count} times: {text}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1726: an `Anyhow` error prints all its causes, not only its
+    /// outermost context, since most of what reports a `LaurusError` prints
+    /// `Display` alone.
+    #[test]
+    fn an_anyhow_error_prints_all_its_causes() {
+        let error = anyhow::Error::new(io::Error::other("the disk is full"))
+            .context("idx/schema.toml")
+            .context("Failed to write schema file");
+        assert_eq!(
+            LaurusError::from(error).to_string(),
+            "Anyhow error: Failed to write schema file: idx/schema.toml: the disk is full"
+        );
     }
 }
