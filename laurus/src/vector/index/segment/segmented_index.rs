@@ -84,6 +84,12 @@ pub trait SegmentedBackend: fmt::Debug + Send + Sync + 'static {
     /// for another kind of index (Issue #1494).
     fn config_from(config: VectorIndexTypeConfig) -> Option<Self::Config>;
 
+    /// Give `new`, which replaces the config of an index that stays open,
+    /// what `current` loaded when the index was opened (Issue #1735).
+    ///
+    /// The default does nothing, for a config that loads nothing.
+    fn keep_loaded_state(_new: &mut Self::Config, _current: &Self::Config) {}
+
     /// Load the reader of one sealed segment of this backend's kind, with
     /// the deletion bitmap attached when `bitmap` is `Some`.
     fn load_segment_reader(
@@ -626,10 +632,12 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
     /// use it; a searcher built before keeps the config it was built with,
     /// so the caller drops any it caches. The segments and the active
     /// writer are untouched: the caller passes only a metadata-only change,
-    /// whose parameters are read at search time.
+    /// whose parameters are read at search time. What the index loaded when
+    /// it was opened stays too, a shared PQ codebook in particular, which
+    /// later commits and merges encode with (Issue #1735).
     fn update_config(&self, new_config: VectorIndexTypeConfig) -> Result<()> {
         self.check_closed()?;
-        let Some(new_config) = B::config_from(new_config) else {
+        let Some(mut new_config) = B::config_from(new_config) else {
             return Err(LaurusError::invalid_argument(
                 "a config update cannot change the kind of index",
             ));
@@ -647,6 +655,7 @@ impl<B: SegmentedBackend> VectorIndex for SegmentedIndex<B> {
                 B::distance_metric(&new_config),
             )));
         }
+        B::keep_loaded_state(&mut new_config, &config);
         *config = new_config;
         Ok(())
     }
@@ -989,6 +998,63 @@ mod tests {
         .collect();
         assert!(accepted.is_empty(), "not refused: {accepted:?}");
         assert_eq!(index.config().default_ef_search, Some(300));
+    }
+
+    /// Issue #1735: an `update_config` keeps the shared PQ codebook the index
+    /// was opened with, under the same path. Under another, or none, it keeps
+    /// what the new config has.
+    #[test]
+    fn update_config_keeps_the_codebook_of_the_same_path() {
+        use crate::vector::core::quantization::PqParams;
+        use crate::vector::index::pq_codebook::SharedPqCodebook;
+
+        let codebook = |value: f32| {
+            let params = PqParams::from_dim_and_m(4, 2).unwrap();
+            Arc::new(SharedPqCodebook {
+                params,
+                codebook: vec![value; params.codebook_len()],
+            })
+        };
+        let config = |path: Option<&str>, loaded: Option<Arc<SharedPqCodebook>>| HnswIndexConfig {
+            pq_codebook_path: path.map(str::to_string),
+            pq_codebook: loaded,
+            ..hnsw(4, Some(16))
+        };
+        let opened = codebook(1.0);
+        // (path, codebook of the new config, whether the opened one stays).
+        let cases = [
+            (Some("a.pqcb"), None, true),
+            (Some("a.pqcb"), Some(codebook(2.0)), true),
+            (Some("b.pqcb"), None, false),
+            (Some("b.pqcb"), Some(codebook(2.0)), false),
+            (None, None, false),
+        ];
+        for (path, loaded, stays) in cases {
+            let storage: Arc<dyn Storage> =
+                Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let index = SegmentedHnswIndex::open_or_create(
+                storage,
+                "vec",
+                config(Some("a.pqcb"), Some(opened.clone())),
+            )
+            .unwrap();
+            let new = config(path, loaded.clone());
+            index
+                .update_config(VectorIndexTypeConfig::HNSW(new))
+                .unwrap();
+            let expected = if stays {
+                Some(&opened)
+            } else {
+                loaded.as_ref()
+            };
+            let current = index.config();
+            assert_eq!(current.pq_codebook_path.as_deref(), path);
+            assert_eq!(
+                current.pq_codebook.as_ref().map(Arc::as_ptr),
+                expected.map(Arc::as_ptr),
+                "path {path:?}"
+            );
+        }
     }
 
     /// What a merging thread reports to the build that waits for it.

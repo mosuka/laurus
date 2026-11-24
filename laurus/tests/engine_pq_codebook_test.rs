@@ -6,20 +6,29 @@
 //! writer through `Engine` → `VectorStore` → `from_hnsw_option` →
 //! `resolve_pq_codebook`, and `Engine::train_pq_codebook` must produce a
 //! codebook that a subsequently opened engine encodes with.
+//!
+//! Issue #1735: an open engine that rebuilds, adds or recreates the field
+//! loads the codebook too, and a change of its search-time parameters keeps
+//! the one in use. Each used to leave the field with no codebook.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use laurus::storage::file::FileStorageConfig;
 use laurus::storage::prefixed::PrefixedStorage;
 use laurus::storage::{Storage, StorageConfig, StorageFactory};
-use laurus::vector::HnswOption;
 use laurus::vector::Vector;
 use laurus::vector::core::distance::DistanceMetric;
 use laurus::vector::core::quantization::QuantizationMethod;
 use laurus::vector::index::hnsw::reader::HnswIndexReader;
-use laurus::vector::index::pq_codebook::read_pq_codebook;
+use laurus::vector::index::pq_codebook::{read_pq_codebook, train_and_write_pq_codebook};
 use laurus::vector::index::storage::VectorStorage;
-use laurus::{DataValue, Document, Engine, FieldOption, Schema};
+use laurus::vector::{FlatOption, HnswOption, IvfOption};
+use laurus::{
+    DataValue, Document, Engine, FieldChangeKind, FieldOption, QueryVector, Schema,
+    SearchRequestBuilder, TextOption, UpdateFieldOptions, VectorSearchQuery,
+};
 use tempfile::TempDir;
 
 const DIM: usize = 32;
@@ -232,4 +241,557 @@ async fn train_pq_codebook_honors_the_output_override() -> laurus::Result<()> {
     assert!(storage.file_exists("vector/embedding.v2.pqcb"));
 
     Ok(())
+}
+
+// --- Issue #1735: changes of an open engine ---
+
+const REINDEX: UpdateFieldOptions = UpdateFieldOptions {
+    reindex: true,
+    dry_run: false,
+};
+
+/// An HNSW option with product quantization and the shared codebook
+/// `embedding.pqcb`, changed by `change`.
+fn hnsw(change: impl Fn(&mut HnswOption)) -> FieldOption {
+    let mut option = HnswOption {
+        dimension: DIM,
+        distance: DistanceMetric::Euclidean,
+        quantizer: QuantizationMethod::ProductQuantization { subvector_count: M },
+        pq_codebook_path: Some("embedding.pqcb".to_string()),
+        ..HnswOption::default()
+    };
+    change(&mut option);
+    FieldOption::Hnsw(option)
+}
+
+fn flat() -> FieldOption {
+    FieldOption::Flat(FlatOption {
+        dimension: DIM,
+        distance: DistanceMetric::Euclidean,
+        ..FlatOption::default()
+    })
+}
+
+fn ivf() -> FieldOption {
+    FieldOption::Ivf(IvfOption {
+        dimension: DIM,
+        distance: DistanceMetric::Euclidean,
+        n_clusters: 2,
+        n_probe: 2,
+        ..IvfOption::default()
+    })
+}
+
+/// A schema with `option`, if any, as field `embedding`, and a text field.
+fn schema_with(option: Option<FieldOption>) -> Schema {
+    let mut schema = Schema::new();
+    schema.fields.insert(
+        "title".to_string(),
+        FieldOption::Text(TextOption::default()),
+    );
+    if let Some(option) = option {
+        schema.fields.insert("embedding".to_string(), option);
+    }
+    schema
+}
+
+fn file_storage(dir: &TempDir) -> Arc<dyn Storage> {
+    StorageFactory::create(StorageConfig::File(FileStorageConfig::new(dir.path()))).unwrap()
+}
+
+async fn open(storage: &Arc<dyn Storage>, option: Option<FieldOption>) -> Engine {
+    Engine::new(storage.clone(), schema_with(option))
+        .await
+        .unwrap()
+}
+
+/// The root of the vector storage, to which `pq_codebook_path` is relative.
+fn vector_root(storage: &Arc<dyn Storage>) -> Arc<dyn Storage> {
+    Arc::new(PrefixedStorage::new("vector", storage.clone()))
+}
+
+/// Train codebook `name` on `seed`'s vectors, and return its centroids.
+fn train(storage: &Arc<dyn Storage>, name: &str, seed: u64) -> Vec<f32> {
+    train_shape(storage, name, seed, DIM, M)
+}
+
+fn train_shape(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+    seed: u64,
+    dimension: usize,
+    subvectors: usize,
+) -> Vec<f32> {
+    let sample: Vec<Vector> = make_vectors(400, seed)
+        .into_iter()
+        .map(|v| Vector::new(v.data[..dimension].to_vec()))
+        .collect();
+    let root = vector_root(storage);
+    train_and_write_pq_codebook(
+        root.as_ref(),
+        name,
+        dimension,
+        subvectors,
+        256,
+        false,
+        &sample,
+    )
+    .unwrap();
+    read_pq_codebook(root.as_ref(), name).unwrap().codebook
+}
+
+/// Damage codebook `embedding.pqcb` on disk.
+fn damage(dir: &TempDir) {
+    let path = dir.path().join("vector/embedding.pqcb");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+}
+
+/// Put documents `ids`, each with a vector of its own.
+async fn put(engine: &Engine, ids: std::ops::Range<u64>) {
+    for id in ids {
+        let doc = Document::builder()
+            .add_vector("embedding", make_vectors(1, 1000 + id)[0].data.to_vec())
+            .build();
+        engine.put_document(&format!("d{id}"), doc).await.unwrap();
+    }
+}
+
+/// The ids a search for everything finds.
+async fn found(engine: &Engine) -> BTreeSet<String> {
+    let request = SearchRequestBuilder::new()
+        .vector_query(VectorSearchQuery::Vectors(vec![QueryVector {
+            vector: make_vectors(1, 1)[0].clone(),
+            weight: 1.0,
+            fields: Some(vec!["embedding".to_string()]),
+        }]))
+        .limit(200)
+        .build();
+    engine
+        .search(request)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.id)
+        .collect()
+}
+
+fn ids(numbers: impl IntoIterator<Item = u64>) -> BTreeSet<String> {
+    numbers.into_iter().map(|id| format!("d{id}")).collect()
+}
+
+/// The centroids each of the field's HNSW segments embeds, `None` for one
+/// that is not product-quantized, oldest first.
+fn segment_codebooks(storage: &Arc<dyn Storage>) -> Vec<Option<Vec<f32>>> {
+    let field: Arc<dyn Storage> = Arc::new(PrefixedStorage::new("embedding", vector_root(storage)));
+    let mut names: Vec<String> = field
+        .list_files()
+        .unwrap()
+        .into_iter()
+        .filter_map(|file| file.strip_suffix(".hnsw").map(str::to_string))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let reader =
+                HnswIndexReader::load(field.clone(), &name, DistanceMetric::Euclidean).unwrap();
+            match reader.vectors() {
+                VectorStorage::OwnedPq(pool) => Some(pool.codebook.clone()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Why the field does not hold exactly `expected` in segments that embed
+/// `codebook`, if it does not.
+async fn wrong(
+    engine: &Engine,
+    storage: &Arc<dyn Storage>,
+    expected: &BTreeSet<String>,
+    codebook: &[f32],
+) -> Option<String> {
+    let found = found(engine).await;
+    if found != *expected {
+        return Some(format!(
+            "{} of {} documents are found",
+            found.intersection(expected).count(),
+            expected.len()
+        ));
+    }
+    let embedded = segment_codebooks(storage);
+    if embedded.is_empty() || embedded.iter().any(|c| c.as_deref() != Some(codebook)) {
+        return Some(format!(
+            "segments with the codebook: {:?}",
+            embedded
+                .iter()
+                .map(|c| c.as_deref() == Some(codebook))
+                .collect::<Vec<_>>()
+        ));
+    }
+    None
+}
+
+fn report(failures: &mut Vec<String>, what: &str, failure: Option<String>) {
+    if let Some(failure) = failure {
+        failures.push(format!("{what}: {failure}"));
+    }
+}
+
+/// Every file of the field's directory, with its bytes.
+fn field_files(dir: &TempDir) -> BTreeMap<String, Vec<u8>> {
+    fn collect(dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.display().to_string();
+            files.insert(name, std::fs::read(&path).unwrap());
+        }
+    }
+    let mut files = BTreeMap::new();
+    collect(&dir.path().join("vector/embedding"), &mut files);
+    files
+}
+
+/// A rebuild of the field on an open engine writes its segments with the
+/// shared codebook, as do the commits after it, and the field opens again:
+/// within HNSW, from Flat and from IVF, with a path added, with another path,
+/// and with a codebook that was trained again under the same name, which the
+/// rebuild takes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_on_an_open_engine_takes_the_shared_codebook() {
+    let mut failures = Vec::new();
+    let cases = [
+        ("m", hnsw(|_| {}), hnsw(|o| o.m = 24)),
+        ("from flat", flat(), hnsw(|_| {})),
+        ("from ivf", ivf(), hnsw(|_| {})),
+        (
+            "a path added",
+            hnsw(|o| o.pq_codebook_path = None),
+            hnsw(|_| {}),
+        ),
+        (
+            "another path",
+            hnsw(|_| {}),
+            hnsw(|o| o.pq_codebook_path = Some("embedding.v2.pqcb".to_string())),
+        ),
+        ("trained again", hnsw(|_| {}), hnsw(|o| o.m = 24)),
+    ];
+    for (what, before, after) in cases {
+        let dir = TempDir::new().unwrap();
+        let storage = file_storage(&dir);
+        let first = train(&storage, "embedding.pqcb", 1);
+        let engine = open(&storage, Some(before)).await;
+        put(&engine, 0..20).await;
+        engine.commit().await.unwrap();
+        put(&engine, 20..25).await;
+        let codebook = match what {
+            "another path" => train(&storage, "embedding.v2.pqcb", 2),
+            "trained again" => train(&storage, "embedding.pqcb", 2),
+            _ => first,
+        };
+        match engine
+            .update_field("embedding", after.clone(), REINDEX)
+            .await
+        {
+            Ok(outcome) if outcome.classification == FieldChangeKind::Reindex => {}
+            other => {
+                failures.push(format!("{what}: {:?}", other.map(|o| o.classification)));
+                continue;
+            }
+        }
+        let expected = ids(0..25);
+        report(
+            &mut failures,
+            what,
+            wrong(&engine, &storage, &expected, &codebook).await,
+        );
+        put(&engine, 100..110).await;
+        engine.commit().await.unwrap();
+        let what = format!("{what}, after a commit");
+        let expected = ids((0..25).chain(100..110));
+        report(
+            &mut failures,
+            &what,
+            wrong(&engine, &storage, &expected, &codebook).await,
+        );
+        drop(engine);
+        let engine = open(&storage, Some(after)).await;
+        put(&engine, 200..201).await;
+        engine.commit().await.unwrap();
+        let what = format!("{what} and a reopen");
+        let expected = ids((0..25).chain(100..110).chain(200..201));
+        report(
+            &mut failures,
+            &what,
+            wrong(&engine, &storage, &expected, &codebook).await,
+        );
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A field that is added to an open engine, or added again after it was
+/// deleted, or recreated by a destructive change, commits with the shared
+/// codebook without a reopen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_added_to_an_open_engine_commits_with_the_shared_codebook() {
+    let mut failures = Vec::new();
+    for what in ["added", "added again", "recreated"] {
+        let dir = TempDir::new().unwrap();
+        let storage = file_storage(&dir);
+        let codebook = train(&storage, "embedding.pqcb", 1);
+        let after = match what {
+            "recreated" => hnsw(|o| o.distance = DistanceMetric::Cosine),
+            _ => hnsw(|_| {}),
+        };
+        let engine = match what {
+            "added" => {
+                let engine = open(&storage, None).await;
+                engine.add_field("embedding", after.clone()).await.unwrap();
+                engine
+            }
+            _ => {
+                let engine = open(&storage, Some(hnsw(|_| {}))).await;
+                put(&engine, 0..5).await;
+                engine.commit().await.unwrap();
+                if what == "added again" {
+                    engine.delete_field("embedding").await.unwrap();
+                    engine.add_field("embedding", after.clone()).await.unwrap();
+                } else {
+                    let outcome = engine
+                        .update_field("embedding", after.clone(), REINDEX)
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome.classification, FieldChangeKind::Destructive);
+                }
+                engine
+            }
+        };
+        for (from, to) in [(10, 30), (30, 31)] {
+            put(&engine, from..to).await;
+            if let Err(e) = engine.commit().await {
+                failures.push(format!("{what}: the commit failed: {e}"));
+            }
+        }
+        let expected = ids(10..31);
+        report(
+            &mut failures,
+            what,
+            wrong(&engine, &storage, &expected, &codebook).await,
+        );
+        drop(engine);
+        let engine = open(&storage, Some(after)).await;
+        let what = format!("{what}, reopened");
+        report(
+            &mut failures,
+            &what,
+            wrong(&engine, &storage, &expected, &codebook).await,
+        );
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A change of the field's search-time parameters keeps the codebook the
+/// engine was opened with: the commits after it and the merge they trigger
+/// use it, whatever happened to the file since. The file takes effect when
+/// the engine is opened again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_metadata_only_change_keeps_the_codebook_in_use() {
+    let mut failures = Vec::new();
+    let changes = [
+        (
+            "default_ef_search",
+            hnsw(|o| o.default_ef_search = Some(99)),
+        ),
+        ("base_weight", hnsw(|o| o.base_weight = 2.0)),
+    ];
+    for (change, after) in changes {
+        for file in ["as it was", "trained again", "damaged", "removed"] {
+            let what = format!("{change}, the file {file}");
+            let dir = TempDir::new().unwrap();
+            let storage = file_storage(&dir);
+            let codebook = train(&storage, "embedding.pqcb", 1);
+            let engine = open(&storage, Some(hnsw(|_| {}))).await;
+            put(&engine, 0..1).await;
+            engine.commit().await.unwrap();
+            let mut again = codebook.clone();
+            match file {
+                "trained again" => again = train(&storage, "embedding.pqcb", 2),
+                "damaged" => damage(&dir),
+                "removed" => storage.delete_file("vector/embedding.pqcb").unwrap(),
+                _ => {}
+            }
+            match engine
+                .update_field("embedding", after.clone(), UpdateFieldOptions::default())
+                .await
+            {
+                Ok(outcome) if outcome.classification == FieldChangeKind::MetadataOnly => {}
+                other => failures.push(format!("{what}: {:?}", other.map(|o| o.classification))),
+            }
+            // Ten segments of one document are one merge.
+            for id in 1..10 {
+                put(&engine, id..id + 1).await;
+                if let Err(e) = engine.commit().await {
+                    failures.push(format!("{what}: the commit failed: {e}"));
+                    break;
+                }
+            }
+            let expected = ids(0..10);
+            report(
+                &mut failures,
+                &what,
+                wrong(&engine, &storage, &expected, &codebook).await,
+            );
+            let segments = segment_codebooks(&storage).len();
+            if segments != 1 {
+                failures.push(format!("{what}: {segments} segments, expected one merge"));
+            }
+            drop(engine);
+
+            if file == "trained again" {
+                let engine = open(&storage, Some(after.clone())).await;
+                put(&engine, 20..21).await;
+                engine.commit().await.unwrap();
+                let last = segment_codebooks(&storage).pop().flatten();
+                if last.as_deref() != Some(again.as_slice()) {
+                    failures.push(format!("{what}: a reopen did not take the new file"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A codebook that cannot be read fails a change that needs it before
+/// anything changes: the documents, the schema and the field's files stay,
+/// also when the change would discard the field's data, and the engine goes
+/// on with the codebook it has. Once the file is trained again, the change
+/// succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_codebook_fails_a_change_before_anything_changes() {
+    let mut failures = Vec::new();
+    let cases = [
+        ("reindex", hnsw(|_| {}), hnsw(|o| o.m = 24)),
+        ("from flat", flat(), hnsw(|_| {})),
+        (
+            "destructive",
+            hnsw(|_| {}),
+            hnsw(|o| o.distance = DistanceMetric::Cosine),
+        ),
+    ];
+    for (what, before, after) in cases {
+        let dir = TempDir::new().unwrap();
+        let storage = file_storage(&dir);
+        let codebook = train(&storage, "embedding.pqcb", 1);
+        let engine = open(&storage, Some(before.clone())).await;
+        put(&engine, 0..20).await;
+        engine.commit().await.unwrap();
+        damage(&dir);
+        let files = field_files(&dir);
+        match engine
+            .update_field("embedding", after.clone(), REINDEX)
+            .await
+        {
+            Err(e) if e.to_string().contains("corrupted") => {}
+            other => failures.push(format!("{what}: {:?}", other.map(|o| o.classification))),
+        }
+        if format!("{:?}", engine.schema().fields["embedding"]) != format!("{before:?}") {
+            failures.push(format!("{what}: the schema changed"));
+        }
+        if engine.schema().pending_reindex.contains("embedding") {
+            failures.push(format!("{what}: pending_reindex names the field"));
+        }
+        if field_files(&dir) != files {
+            failures.push(format!("{what}: the field's files changed"));
+        }
+        if found(&engine).await != ids(0..20) {
+            failures.push(format!("{what}: documents are missing"));
+        }
+        put(&engine, 20..21).await;
+        if let Err(e) = engine.commit().await {
+            failures.push(format!("{what}: a later commit failed: {e}"));
+        }
+        if found(&engine).await != ids(0..21) {
+            failures.push(format!("{what}: a later document is missing"));
+        }
+
+        let again = train(&storage, "embedding.pqcb", 1);
+        assert_eq!(again, codebook);
+        if let Err(e) = engine.update_field("embedding", after, REINDEX).await {
+            failures.push(format!("{what}: tried again, it failed: {e}"));
+        }
+    }
+
+    let dir = TempDir::new().unwrap();
+    let storage = file_storage(&dir);
+    let codebook = train(&storage, "embedding.pqcb", 1);
+    damage(&dir);
+    let engine = open(&storage, None).await;
+    match engine.add_field("embedding", hnsw(|_| {})).await {
+        Err(e) if e.to_string().contains("corrupted") => {}
+        other => failures.push(format!("add_field: {:?}", other.map(|_| ()))),
+    }
+    if engine.schema().fields.contains_key("embedding") {
+        failures.push("add_field: the schema has the field".to_string());
+    }
+    train(&storage, "embedding.pqcb", 1);
+    engine.add_field("embedding", hnsw(|_| {})).await.unwrap();
+    put(&engine, 0..5).await;
+    engine.commit().await.unwrap();
+    report(
+        &mut failures,
+        "add_field, tried again",
+        wrong(&engine, &storage, &ids(0..5), &codebook).await,
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A codebook that is missing, or of another shape, is treated as when an
+/// engine is opened: it fails where a segment is written. A field is added
+/// and its commit fails, and a rebuild fails before it publishes, leaving
+/// the field as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_or_mismatched_codebook_fails_where_a_segment_is_written() {
+    let mut failures = Vec::new();
+    for (what, shape, message) in [
+        ("missing", None, "no codebook has been trained"),
+        ("another m", Some((DIM, 8)), "subvector_count 8"),
+        ("another dimension", Some((16, M)), "dimension 16"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let storage = file_storage(&dir);
+        if let Some((dimension, subvectors)) = shape {
+            train_shape(&storage, "embedding.pqcb", 1, dimension, subvectors);
+        }
+        let engine = open(&storage, Some(flat())).await;
+        put(&engine, 0..20).await;
+        engine.commit().await.unwrap();
+        match engine
+            .update_field("embedding", hnsw(|_| {}), REINDEX)
+            .await
+        {
+            Err(e) if e.to_string().contains(message) => {}
+            other => failures.push(format!("{what}: {:?}", other.map(|o| o.classification))),
+        }
+        if format!("{:?}", engine.schema().fields["embedding"]) != format!("{:?}", flat()) {
+            failures.push(format!("{what}: the schema changed"));
+        }
+        put(&engine, 20..21).await;
+        engine.commit().await.unwrap();
+        if found(&engine).await != ids(0..21) {
+            failures.push(format!("{what}: documents are missing"));
+        }
+        drop(engine);
+
+        let engine = open(&storage, None).await;
+        engine.add_field("embedding", hnsw(|_| {})).await.unwrap();
+        put(&engine, 30..31).await;
+        match engine.commit().await {
+            Err(e) if e.to_string().contains(message) => {}
+            other => failures.push(format!("{what}: the commit returned {other:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

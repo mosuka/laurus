@@ -1701,6 +1701,43 @@ impl VectorStore {
         let _ = self.index.set_last_wal_seq(seq);
     }
 
+    /// The index config of a field with `option`, as
+    /// [`VectorIndexConfig::field_index_configs`] builds it when the store is
+    /// opened. Its shared PQ codebook, if it names one, is not loaded yet.
+    fn field_index_config(
+        &self,
+        option: &crate::vector::core::field::FieldOption,
+    ) -> crate::vector::index::config::VectorIndexTypeConfig {
+        let deletion_config = self
+            .config
+            .as_ref()
+            .map(|c| c.deletion_config.clone())
+            .unwrap_or_default();
+        self::config::build_field_index_config(option, self.index.embedder(), &deletion_config)
+    }
+
+    /// [`Self::field_index_config`] for an index of the field that is to be
+    /// opened: its shared PQ codebook, if it names one, is loaded from the
+    /// root of the vector storage, as it is when the store is opened (Issue
+    /// #1735). The field's index sees only its own directory, where the file
+    /// is not.
+    ///
+    /// Call it before anything changes: a codebook that cannot be read must
+    /// not be found out once a field's data is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the codebook's file exists and cannot be read.
+    /// One that does not exist yet fails where a segment is written.
+    fn opened_field_config(
+        &self,
+        option: &crate::vector::core::field::FieldOption,
+    ) -> Result<crate::vector::index::config::VectorIndexTypeConfig> {
+        let mut config = self.field_index_config(option);
+        config.resolve_pq_codebook(self.index.storage().as_ref())?;
+        Ok(config)
+    }
+
     /// Add a dynamically-added vector field, creating its sub-index when
     /// needed and registering a field-specific embedder.
     ///
@@ -1737,16 +1774,24 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if committing the cached writer's pending changes
-    /// fails, leaving the index unchanged and the writer cached for the next
-    /// [`Self::commit`] to retry, or if creating the field's sub-index fails
-    /// (e.g. the field already exists, or a storage I/O error).
+    /// Returns an error if the shared PQ codebook the field names cannot be
+    /// read, before anything changes (Issue #1735), if committing the cached
+    /// writer's pending changes fails, leaving the index unchanged and the
+    /// writer cached for the next [`Self::commit`] to retry, or if creating
+    /// the field's sub-index fails (e.g. the field already exists, or a
+    /// storage I/O error).
     pub async fn add_field(
         &self,
         name: &str,
         vector_opt: &crate::vector::core::field::FieldOption,
         embedder: Option<Arc<dyn crate::embedding::embedder::Embedder>>,
     ) -> Result<()> {
+        let field_config = self
+            .index
+            .supports_dynamic_fields()
+            .then(|| self.opened_field_config(vector_opt))
+            .transpose()?;
+
         // Commit the cached writer before the index changes, and fail if
         // that fails, as `rebuild_field` does. The writer holds a sub-writer
         // for every field it was made for: one kept from a failed commit in
@@ -1771,20 +1816,9 @@ impl VectorStore {
         }
         *writer_guard = None;
 
-        let added = if self.index.supports_dynamic_fields() {
-            let deletion_config = self
-                .config
-                .as_ref()
-                .map(|c| c.deletion_config.clone())
-                .unwrap_or_default();
-            let field_config = self::config::build_field_index_config(
-                vector_opt,
-                self.index.embedder(),
-                &deletion_config,
-            );
-            self.index.add_field(name, field_config)
-        } else {
-            Ok(())
+        let added = match field_config {
+            Some(field_config) => self.index.add_field(name, field_config),
+            None => Ok(()),
         };
 
         if added.is_ok() {
@@ -1911,11 +1945,13 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing a cached writer's pending changes
-    /// fails, if the underlying rebuild (`purge: false`) fails before it
-    /// publishes the rewritten segments, which leaves the field as it was
-    /// (see [`VectorIndex::rebuild_field`]), or if the purge + recreate
-    /// (`purge: true`) fails. Unlike [`Self::add_field`]/
+    /// Returns an error if the shared PQ codebook the new option names cannot
+    /// be read, before anything changes (Issue #1735), if flushing a cached
+    /// writer's pending changes fails, if the underlying rebuild
+    /// (`purge: false`) fails before it publishes the rewritten segments,
+    /// which leaves the field as it was (see [`VectorIndex::rebuild_field`]),
+    /// or if the purge + recreate (`purge: true`) fails. Unlike
+    /// [`Self::add_field`]/
     /// [`Self::delete_field`], a flush failure is **propagated**, not
     /// cached for a later retry — the writer's buffered state is not a
     /// safe starting point for a rebuild, the same reasoning
@@ -1930,20 +1966,11 @@ impl VectorStore {
         embedder: FieldEmbedderChange,
         purge: bool,
     ) -> Result<()> {
-        let deletion_config = self
-            .config
-            .as_ref()
-            .map(|c| c.deletion_config.clone())
-            .unwrap_or_default();
-        let new_config = self::config::build_field_index_config(
-            new_option,
-            self.index.embedder(),
-            &deletion_config,
-        );
-
         // `purge` discards the field's data before re-creating it, so an
-        // option the new index would reject must fail before that.
+        // option the new index would reject, or a codebook that cannot be
+        // read, must fail before that.
         new_option.validate(name)?;
+        let new_config = self.opened_field_config(new_option)?;
 
         let mut writer_guard = self.writer_cache.lock().await;
         let flush_result = match writer_guard.as_mut() {
@@ -2020,17 +2047,9 @@ impl VectorStore {
         new_option: &crate::vector::core::field::FieldOption,
     ) -> Result<()> {
         new_option.validate(name)?;
-        let deletion_config = self
-            .config
-            .as_ref()
-            .map(|c| c.deletion_config.clone())
-            .unwrap_or_default();
-        let new_config = self::config::build_field_index_config(
-            new_option,
-            self.index.embedder(),
-            &deletion_config,
-        );
-        self.index.update_field_config(name, new_config)?;
+        // The index is not opened again, so it keeps the codebook it has.
+        self.index
+            .update_field_config(name, self.field_index_config(new_option))?;
         self.base_weights.write().insert(
             name.to_string(),
             Self::sanitize_base_weight(new_option.base_weight()),

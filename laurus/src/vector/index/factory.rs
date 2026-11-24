@@ -361,9 +361,7 @@ impl VectorIndexFactory {
         let mut resolved = BTreeMap::new();
         for (name, config) in field_configs {
             let mut config = config.clone();
-            if let VectorIndexTypeConfig::HNSW(hnsw_config) = &mut config {
-                hnsw_config.resolve_pq_codebook(storage.as_ref())?;
-            }
+            config.resolve_pq_codebook(storage.as_ref())?;
             resolved.insert(name.clone(), config);
         }
         MultiFieldVectorIndex::open_or_create(storage, &resolved, embedder)

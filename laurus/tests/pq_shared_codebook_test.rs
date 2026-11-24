@@ -18,13 +18,13 @@ use std::sync::Arc;
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use laurus::vector::core::quantization::QuantizationMethod;
-use laurus::vector::index::VectorIndex;
-use laurus::vector::index::config::HnswIndexConfig;
+use laurus::vector::index::config::{HnswIndexConfig, VectorIndexTypeConfig};
 use laurus::vector::index::hnsw::HnswIndex;
 use laurus::vector::index::hnsw::reader::HnswIndexReader;
 use laurus::vector::index::hnsw::segmented::SegmentedHnswIndex;
 use laurus::vector::index::pq_codebook::{default_codebook_name, train_and_write_pq_codebook};
 use laurus::vector::index::storage::VectorStorage;
+use laurus::vector::index::{ManagedVectorIndex, VectorIndex};
 use laurus::vector::search::searcher::{VectorIndexQuery, VectorIndexQueryParams};
 use laurus::vector::{DistanceMetric, Vector};
 
@@ -248,4 +248,38 @@ fn shared_codebook_survives_a_forced_merge() {
     let (doc_id, _, vector) = &make_corpus(20, 0xA5A5_0001, 20)[0];
     let hits = searcher.search(&query(vector, 1)).unwrap();
     assert_eq!(hits.results[0].doc_id, *doc_id);
+}
+
+/// A [`ManagedVectorIndex`] loads the shared codebook its config names. Ten
+/// vectors are too few to train one, and without the shared one the write
+/// fails (Issue #1735).
+#[test]
+fn a_managed_index_loads_the_shared_codebook() {
+    let storage = storage();
+    let sample: Vec<Vector> = make_corpus(400, 1, 0)
+        .into_iter()
+        .map(|(_, _, v)| v)
+        .collect();
+    let trained =
+        train_and_write_pq_codebook(storage.as_ref(), "v.pqcb", DIM, M, 256, false, &sample)
+            .unwrap();
+    let config = HnswIndexConfig {
+        pq_codebook_path: Some("v.pqcb".to_string()),
+        ..base_config()
+    };
+    let mut index = ManagedVectorIndex::new(
+        VectorIndexTypeConfig::HNSW(config),
+        storage.clone() as Arc<dyn Storage>,
+        "managed",
+    )
+    .unwrap();
+    index.add_vectors(make_corpus(10, 2, 0)).unwrap();
+    index.finalize().unwrap();
+    index.write().unwrap();
+
+    let reader = HnswIndexReader::load(storage, "managed", DistanceMetric::Euclidean).unwrap();
+    match reader.vectors() {
+        VectorStorage::OwnedPq(pool) => assert_eq!(pool.codebook, trained.codebook),
+        other => panic!("expected product quantization, got {other:?}"),
+    }
 }

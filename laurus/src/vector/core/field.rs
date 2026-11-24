@@ -342,6 +342,10 @@ pub struct HnswOption {
     /// training command to run — there is no silent fallback to
     /// per-segment training.
     ///
+    /// The file is read when the field's index is opened: with the engine,
+    /// by `Engine::add_field`, and when `Engine::update_field` rebuilds or
+    /// recreates the field (Issue #1735).
+    ///
     /// `None` (the default) keeps per-segment inline training.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pq_codebook_path: Option<String>,
