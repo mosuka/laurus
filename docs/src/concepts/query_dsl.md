@@ -116,6 +116,8 @@ te?t
 test*
 ```
 
+A wildcard matches every document that has a matching term, however many terms match, and each match scores the boost (`1.0` unless `^` sets another). It used to find only the documents of 50 of the matching terms, the least frequent ones (Issue #1740). The more terms match, the more a search costs, and a pattern that starts with `?` or `*` is compared with every term of the field.
+
 ### Range Query
 
 Inclusive `[]` or exclusive `{}` ranges, useful for numeric and date fields:

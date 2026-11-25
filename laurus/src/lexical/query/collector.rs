@@ -490,12 +490,13 @@ impl PartialOrd for ScoredDoc {
 }
 
 impl Ord for ScoredDoc {
+    /// `Less` ranks better: the higher score, and among equal scores the lower
+    /// doc id (Issue #1740). A `BinaryHeap` then has the worst document on top.
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: lower scores come first
         other
             .score
             .total_cmp(&self.score)
-            .then_with(|| other.doc_id.cmp(&self.doc_id))
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
     }
 }
 
@@ -553,9 +554,9 @@ impl Collector for TopDocsCollector {
             // We have space, just add it
             self.hits.push(scored_doc);
         } else {
-            // Check if this score is better than the worst score
+            // Check if this document ranks better than the worst one
             if let Some(worst) = self.hits.peek()
-                && score > worst.score
+                && scored_doc < *worst
             {
                 // Replace the worst document
                 self.hits.pop();
@@ -567,20 +568,16 @@ impl Collector for TopDocsCollector {
     }
 
     fn results(&self) -> Vec<SearchHit> {
-        let mut results: Vec<_> = self
-            .hits
-            .iter()
+        let mut ranked: Vec<&ScoredDoc> = self.hits.iter().collect();
+        ranked.sort_unstable();
+        ranked
+            .into_iter()
             .map(|doc| SearchHit {
                 doc_id: doc.doc_id,
                 score: doc.score,
                 document: None,
             })
-            .collect();
-
-        // Sort by score descending
-        results.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-
-        results
+            .collect()
     }
 
     fn total_hits(&self) -> u64 {
@@ -879,6 +876,38 @@ mod tests {
         assert!(results.iter().all(|hit| hit.doc_id != 1));
     }
 
+    /// Among equal scores the lower doc ids stay, and come first, in whatever
+    /// order the documents are collected (Issue #1740): the segments of a
+    /// fanout are merged in their own order, not in that of their doc ids.
+    #[test]
+    fn test_top_docs_collector_ranks_ties_by_doc_id() {
+        let collected = [
+            (8u64, 1.0f32),
+            (3, 1.0),
+            (9, 2.0),
+            (5, 1.0),
+            (1, 1.0),
+            (4, 2.0),
+            (7, 0.5),
+        ];
+        let ranked = [4u64, 9, 1, 3, 5, 8, 7];
+        for limit in 0..=8 {
+            for rotation in 0..collected.len() {
+                let mut collector = TopDocsCollector::new(limit);
+                for i in 0..collected.len() {
+                    let (doc_id, score) = collected[(i + rotation) % collected.len()];
+                    collector.collect(doc_id, score).unwrap();
+                }
+                let ids: Vec<u64> = collector.results().iter().map(|hit| hit.doc_id).collect();
+                assert_eq!(
+                    ids,
+                    ranked[..limit.min(ranked.len())],
+                    "limit {limit}, rotation {rotation}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_top_docs_collector_min_competitive() {
         // Validates the #403 PR-A `min_competitive` signal:
@@ -1022,8 +1051,8 @@ mod tests {
         // Higher score should be "less" (for min-heap)
         assert!(doc2 < doc1);
 
-        // Same score should compare by doc_id
-        assert!(doc3 < doc2);
+        // Among equal scores the lower doc_id ranks better (Issue #1740)
+        assert!(doc2 < doc3);
 
         // Test in heap
         let mut heap = BinaryHeap::new();

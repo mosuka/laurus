@@ -222,13 +222,16 @@ pub trait Query: Send + Sync + Debug {
     ///
     /// Called once by the searcher at the top of query execution,
     /// against the top-level reader — before the per-segment fanout and
-    /// BMW gates. Multi-term queries (prefix / wildcard / fuzzy /
-    /// regexp) override this to lower themselves into a `BooleanQuery`
-    /// of `TermQuery` clauses via one term-dictionary enumeration, so
-    /// the subsequent `matcher` + `scorer` construction (and every
-    /// per-segment execution) reuses the lowered form instead of
-    /// re-enumerating. [`crate::lexical::query::boolean::BooleanQuery`]
-    /// recurses into its scoring clauses.
+    /// BMW gates. A multi-term query (prefix / wildcard / fuzzy /
+    /// regexp) whose rewrite method scores its terms overrides this to
+    /// lower itself into a `BooleanQuery` of `TermQuery` clauses, whose
+    /// document frequencies are the index's, so the subsequent `matcher` +
+    /// `scorer` construction (and every per-segment execution) reuses the
+    /// lowered form instead of enumerating the terms again. A
+    /// constant-scored one, the default of all but the fuzzy query, has
+    /// nothing to rewrite (Issue #1740).
+    /// [`crate::lexical::query::boolean::BooleanQuery`] recurses into its
+    /// scoring clauses.
     ///
     /// # Arguments
     ///

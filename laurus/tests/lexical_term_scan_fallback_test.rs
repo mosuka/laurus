@@ -22,7 +22,7 @@ use std::sync::Arc;
 use laurus::Document;
 use laurus::analysis::analyzer::keyword::KeywordAnalyzer;
 use laurus::lexical::index::config::InvertedIndexConfig;
-use laurus::lexical::query::{PhraseQuery, TermQuery};
+use laurus::lexical::query::{PhraseQuery, PrefixQuery, TermQuery};
 use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore};
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
@@ -291,6 +291,26 @@ fn scan_fallback_uses_the_index_analyzer_end_to_end() {
     // `StandardAnalyzer` (the pre-#1196 behaviour) would have found the
     // multi-valued document here.
     assert!(hit_ids(&store, LexicalSearchRequest::new(term("rust")).limit(100)).is_empty());
+}
+
+/// A prefix query finds the documents of a segment without `.post` through
+/// the terms of its dictionary (Issue #1740). Without the dictionary too, the
+/// segment has no terms to enumerate.
+#[test]
+fn prefix_query_reaches_a_post_less_segment_through_its_dictionary() {
+    let prefix = |prefix: &str| {
+        LexicalSearchRequest::new(Box::new(PrefixQuery::new("body", prefix))).limit(100)
+    };
+    let (_storage, store) = keyword_store(false);
+    assert_eq!(
+        hit_ids(&store, prefix("rust ")),
+        vec![MULTI_VALUED_DOC, SCALAR_DOC]
+    );
+    assert_eq!(hit_ids(&store, prefix("f")), vec![MULTI_VALUED_DOC]);
+    assert!(hit_ids(&store, prefix("search")).is_empty());
+
+    let (_storage, store) = keyword_store(true);
+    assert_eq!(hit_ids(&store, prefix("rust ")), vec![SCALAR_DOC]);
 }
 
 #[test]

@@ -6,10 +6,11 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::error::Result;
-use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
-use crate::lexical::index::inverted::reader::InvertedIndexReader;
+use crate::lexical::index::inverted::core::automaton::{Automaton, RegexAutomaton};
 use crate::lexical::query::matcher::Matcher;
-use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
+use crate::lexical::query::multi_term::{
+    MultiTermQuery, RewriteMethod, multi_term_matcher, multi_term_scorer, rewrite_multi_term,
+};
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
@@ -151,52 +152,12 @@ impl MultiTermQuery for WildcardQuery {
         self.rewrite_method
     }
 
-    fn get_terms_enum(
-        &self,
-        reader: &dyn LexicalIndexReader,
-    ) -> Result<Option<Box<dyn TermsEnum>>> {
-        if let Some(inverted_reader) = reader.as_any().downcast_ref::<InvertedIndexReader>()
-            && let Some(terms) = inverted_reader.terms(&self.field)?
-        {
-            let regex_pattern = Self::compile_pattern(&self.pattern)?;
-            let regex_automaton =
-                crate::lexical::index::inverted::core::automaton::RegexAutomaton::new(
-                    &regex_pattern,
-                )?;
-
-            let terms_enum =
-                crate::lexical::index::inverted::core::automaton::AutomatonTermsEnum::new(
-                    terms.iterator()?,
-                    regex_automaton,
-                );
-
-            return Ok(Some(Box::new(terms_enum)));
-        }
-        Ok(None)
-    }
-
-    fn enumerate_terms(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<(String, u64, f32)>> {
-        // Now mostly a fallback, or could reuse rewrite logic if we exposed it differently.
-        // But the trait default implementation of rewrite() calls get_terms_enum().
-        // So enumerate_terms is only called if get_terms_enum returns None,
-        // OR if needed directly.
-        // Let's keep existing implementation for compatibility or use get_terms_enum manually.
-        if let Some(mut terms_enum) = self.get_terms_enum(reader)? {
-            let mut results = Vec::new();
-            let max = self.rewrite_method.max_expansions();
-
-            // Simple scan limited by max_expansions (arbitrary selection if not scoring)
-            while let Some(term_stats) = terms_enum.next()? {
-                results.push((term_stats.term.clone(), term_stats.doc_freq, 1.0));
-                if let Some(m) = max
-                    && results.len() >= m
-                {
-                    break;
-                }
-            }
-            return Ok(results);
-        }
-        Ok(Vec::new())
+    fn automaton(&self) -> Result<Box<dyn Automaton>> {
+        let pattern = Self::compile_pattern(&self.pattern)?;
+        Ok(Box::new(RegexAutomaton::from_regex(
+            self.regex.as_ref().clone(),
+            pattern,
+        )))
     }
 }
 
@@ -206,13 +167,11 @@ impl Query for WildcardQuery {
     }
 
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        let rewritten = MultiTermQuery::rewrite(self, reader)?;
-        rewritten.matcher(reader)
+        multi_term_matcher(self, reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        let rewritten = MultiTermQuery::rewrite(self, reader)?;
-        rewritten.scorer(reader)
+        multi_term_scorer(self, reader)
     }
 
     fn boost(&self) -> f32 {
@@ -244,18 +203,7 @@ impl Query for WildcardQuery {
     }
 
     fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Option<Box<dyn Query>>> {
-        // Lower once at the searcher level (Issue #613). When the reader
-        // cannot enumerate terms (e.g. the per-segment fanout view), keep
-        // the original query so the matcher/scorer fallback stays in
-        // charge; probing via the downcast costs nothing extra.
-        if reader
-            .as_any()
-            .downcast_ref::<InvertedIndexReader>()
-            .is_none()
-        {
-            return Ok(None);
-        }
-        Ok(Some(MultiTermQuery::rewrite(self, reader)?))
+        rewrite_multi_term(self, reader)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

@@ -1166,9 +1166,8 @@ fn bench_fuzzy_query(c: &mut Criterion) {
 }
 
 /// Wildcard search latency (Issue #613): like [`bench_fuzzy_query`],
-/// exercises the multi-term enumeration path — the query is lowered to a
-/// Boolean-of-TermQuery via one term-dictionary enumeration per request
-/// (previously two: matcher and scorer re-enumerated independently).
+/// exercises the multi-term enumeration path — here the set of the documents
+/// of every matching term, each scored with the boost (Issue #1740).
 fn bench_wildcard_query(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("lexical/wildcard_query");
