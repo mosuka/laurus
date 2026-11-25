@@ -282,6 +282,50 @@ fn count_matches_only(query: &dyn Query, reader: &dyn LexicalIndexReader) -> Res
     Ok(count)
 }
 
+/// What a clause of a `BooleanQuery` contributes to a parallel search.
+enum ClauseDocs {
+    /// The documents of a scored clause, with their scores.
+    Scored(Vec<SearchHit>),
+    /// The documents of a clause that is not scored.
+    Matched(RoaringTreemap),
+}
+
+/// The documents `query` matches, in every segment of `reader`.
+///
+/// # Arguments
+///
+/// * `query` - The query to match.
+/// * `reader` - The reader to match against.
+/// * `deadline` - The deadline of the search, checked as documents are read.
+///
+/// # Errors
+///
+/// Returns an error if the query cannot be matched or the deadline has passed.
+fn matched_docs(
+    query: &dyn Query,
+    reader: &dyn LexicalIndexReader,
+    deadline: Option<Deadline>,
+) -> Result<RoaringTreemap> {
+    let mut matcher = query.matcher(reader)?;
+    let mut docs = RoaringTreemap::new();
+    let mut scanned: u64 = 0;
+    while !matcher.is_exhausted() {
+        if let Some(deadline) = deadline {
+            deadline.check(scanned)?;
+        }
+        scanned = scanned.wrapping_add(1);
+        let doc_id = matcher.doc_id();
+        if doc_id == u64::MAX {
+            break;
+        }
+        docs.insert(doc_id);
+        if !matcher.next()? {
+            break;
+        }
+    }
+    Ok(docs)
+}
+
 /// A wall-clock deadline for cooperative search interruption (Issue #600).
 ///
 /// Threaded through every scan loop (the default matcher loop, the Block-Max
@@ -1016,9 +1060,10 @@ impl InvertedIndexSearcher {
         // Single clause: no need for parallel execution. The clause runs
         // standalone, bypassing `BooleanQuery::scorer` (which applies
         // `boolean_query.boost()` via `set_boost`), so the outer boost
-        // must be folded into the clause's own boost here (#1290).
+        // must be folded into the clause's own boost here (#1290). A lone
+        // Filter clause is not scored, so it is matched below.
         let outer_boost = boolean_query.boost();
-        if clauses.len() == 1 {
+        if clauses.len() == 1 && clauses[0].occur != Occur::Filter {
             let mut clause_query = clauses[0].query.clone_box();
             if outer_boost != 1.0 {
                 clause_query.set_boost(clause_query.boost() * outer_boost);
@@ -1032,19 +1077,26 @@ impl InvertedIndexSearcher {
         #[cfg(target_arch = "wasm32")]
         let iter = clauses.iter();
 
-        let clause_results: Vec<(Occur, Result<Vec<SearchHit>>)> = iter
+        let clause_results: Vec<(Occur, Result<ClauseDocs>)> = iter
             .map(|clause| {
-                // Boolean operations (intersection/union/exclusion) require the
-                // full result set from each clause, so we use an unbounded collector.
-                let temp_collector = TopDocsCollector::new(usize::MAX);
-                let result = self
-                    .search_with_collector_deadline(
-                        clause.query.clone_box(),
-                        temp_collector,
-                        false,
-                        deadline,
-                    )
-                    .map(|c| c.results());
+                let result = match clause.occur {
+                    // Boolean operations (intersection/union/exclusion) require the
+                    // full result set from each clause, so we use an unbounded collector.
+                    Occur::Must | Occur::Should => self
+                        .search_with_collector_deadline(
+                            clause.query.clone_box(),
+                            TopDocsCollector::new(usize::MAX),
+                            false,
+                            deadline,
+                        )
+                        .map(|c| ClauseDocs::Scored(c.results())),
+                    // The documents alone, which a search need not all score: a
+                    // multi-term query may limit the terms it scores (Issue #1740).
+                    Occur::Filter | Occur::MustNot => {
+                        matched_docs(clause.query.as_ref(), self.reader.as_ref(), deadline)
+                            .map(ClauseDocs::Matched)
+                    }
+                };
                 (clause.occur, result)
             })
             .collect();
@@ -1066,35 +1118,20 @@ impl InvertedIndexSearcher {
 
         for (occur, result) in clause_results {
             match result {
-                Ok(hits) => match occur {
-                    Occur::Must => {
-                        let mut bitmap = RoaringTreemap::new();
-                        for hit in hits {
-                            bitmap.insert(hit.doc_id);
-                            scored_hits.push((hit.doc_id, hit.score));
+                Ok(docs) => {
+                    let bitmap: RoaringTreemap = match docs {
+                        ClauseDocs::Scored(hits) => {
+                            scored_hits.extend(hits.iter().map(|hit| (hit.doc_id, hit.score)));
+                            hits.iter().map(|hit| hit.doc_id).collect()
                         }
-                        must_bitmaps.push(bitmap);
+                        ClauseDocs::Matched(docs) => docs,
+                    };
+                    match occur {
+                        Occur::Must | Occur::Filter => must_bitmaps.push(bitmap),
+                        Occur::Should => should_bitmap |= bitmap,
+                        Occur::MustNot => must_not_bitmap |= bitmap,
                     }
-                    Occur::Filter => {
-                        // Membership only — Filter does not contribute to score.
-                        let mut bitmap = RoaringTreemap::new();
-                        for hit in hits {
-                            bitmap.insert(hit.doc_id);
-                        }
-                        must_bitmaps.push(bitmap);
-                    }
-                    Occur::Should => {
-                        for hit in hits {
-                            should_bitmap.insert(hit.doc_id);
-                            scored_hits.push((hit.doc_id, hit.score));
-                        }
-                    }
-                    Occur::MustNot => {
-                        for hit in hits {
-                            must_not_bitmap.insert(hit.doc_id);
-                        }
-                    }
-                },
+                }
                 Err(e) => {
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -1783,6 +1820,44 @@ mod tests {
             err.to_string().contains("timeout"),
             "expected a timeout error, got: {err}"
         );
+    }
+
+    /// The documents of a clause that is not scored are read under the
+    /// deadline (Issue #1740).
+    #[test]
+    fn matched_docs_honours_the_deadline() {
+        let searcher = populated_searcher(2);
+        let reader = searcher.reader().as_ref();
+        let query = TermQuery::new("content", "hello");
+        let docs = matched_docs(&query, reader, None).unwrap();
+        assert_eq!(docs.len(), 400);
+
+        let spent = Deadline::new(Timer::now(), Duration::ZERO);
+        let err = matched_docs(&query, reader, Some(spent)).unwrap_err();
+        assert!(err.to_string().contains("timeout"), "{err}");
+    }
+
+    /// In a parallel search a lone Filter clause selects documents without a
+    /// score, as several do (Issue #1740).
+    #[test]
+    fn a_lone_filter_clause_in_parallel_gives_no_score() {
+        let searcher = populated_searcher(2);
+        for filters in 1..=2 {
+            let mut query = BooleanQueryBuilder::new();
+            for _ in 0..filters {
+                query = query.filter(Box::new(TermQuery::new("content", "hello")));
+            }
+            let collector = searcher
+                .search_with_collector_parallel(
+                    Box::new(query.build()),
+                    TopDocsCollector::new(1000),
+                    true,
+                )
+                .unwrap();
+            let hits = collector.results();
+            assert_eq!(hits.len(), 400, "{filters} filters");
+            assert!(hits.iter().all(|hit| hit.score == 0.0), "{filters} filters");
+        }
     }
 
     #[test]

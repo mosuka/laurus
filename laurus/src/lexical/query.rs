@@ -348,12 +348,14 @@ pub trait Query: Send + Sync + Debug {
     /// `tie_breaker` must be in `[0, 1]` (Issue #1570). So does a query
     /// parameter that would otherwise match nothing without an error:
     /// [`NumericRangeQuery`]
-    /// rejects a `NaN` bound (Issue #1601).
+    /// rejects a `NaN` bound (Issue #1601), and a multi-term query a limit of
+    /// no terms (Issue #1740).
     ///
     /// # Errors
     ///
     /// Returns [`LaurusError::InvalidArgument`] naming the first query (or
-    /// per-field boost, `tie_breaker` or range bound) found out of range.
+    /// per-field boost, `tie_breaker`, range bound or limit) found out of
+    /// range.
     fn validate_boosts(&self) -> Result<()> {
         check_query_boost(self.boost(), || self.description())
     }

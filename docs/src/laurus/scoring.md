@@ -24,6 +24,8 @@ The `(k1, b)` parameters are fixed at the implementation defaults today. The val
 
 A quoted or bare value whose analyzer stacks several alternatives at one position (synonyms) is scored as one blended term rather than as a sum of independent term scores, so a document is not rewarded for holding every alternative — see [Searching with synonyms](../concepts/analysis.md#searching-with-synonyms).
 
+A wildcard, prefix or regexp query is not scored with BM25: every match receives the query's boost. A fuzzy query scores its closest terms, and a closer term higher. See [Matches and scores of wildcard, prefix and regexp queries](../concepts/search/lexical_search.md#matches-and-scores-of-wildcard-prefix-and-regexp-queries) and [FuzzyQuery](../concepts/search/lexical_search.md#fuzzyquery).
+
 ### Field Boosts
 
 Per-field score multipliers are configured on the search request, not in a separate scoring struct:

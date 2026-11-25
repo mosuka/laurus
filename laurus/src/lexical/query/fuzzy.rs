@@ -9,12 +9,23 @@ use crate::lexical::index::inverted::core::automaton::{Automaton, LevenshteinAut
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{
     MultiTermQuery, RewriteMethod, multi_term_matcher, multi_term_scorer, rewrite_multi_term,
+    validate_multi_term,
 };
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A fuzzy query for approximate string matching.
+///
+/// It matches the terms within an edit distance of its own and scores the 50
+/// closest of them (Issue #1740): the exact term first, then those with the
+/// highest `1 - distance / length of the shorter term`, and among equally close
+/// ones the most frequent. That value is the factor of a term's score, and
+/// every term is scored with the frequency of the most frequent of them, so how
+/// rare a term is plays no part.
+///
+/// The limit is on the terms that are scored. A filter and an exclusion
+/// (`MustNot`) cover every matching term.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuzzyQuery {
     /// Field to search in
@@ -27,16 +38,16 @@ pub struct FuzzyQuery {
     prefix_length: u32,
     /// Whether transpositions count as single edits (Damerau-Levenshtein)
     transpositions: bool,
-    /// Maximum number of terms to expand to (default: 50, like Lucene)
-    /// This prevents queries from matching too many terms and consuming excessive resources.
-    max_expansions: usize,
     /// Boost factor for the query
     boost: f32,
-    /// Rewrite method for multi-term expansion
+    /// Rewrite method for multi-term expansion, with the limit on the terms
     rewrite_method: RewriteMethod,
 }
 
 impl FuzzyQuery {
+    /// The number of terms that are scored by default, as in Lucene.
+    const DEFAULT_MAX_EXPANSIONS: usize = 50;
+
     /// Create a new fuzzy query with default settings.
     pub fn new<F: Into<String>, T: Into<String>>(field: F, term: T) -> Self {
         FuzzyQuery {
@@ -45,10 +56,10 @@ impl FuzzyQuery {
             max_edits: 2,
             prefix_length: 0,
             transpositions: true,
-            max_expansions: 50, // Same default as Lucene
             boost: 1.0,
-            // Every matching term is scored; `max_expansions` is not read yet.
-            rewrite_method: RewriteMethod::BooleanQuery,
+            rewrite_method: RewriteMethod::TopTermsBlended {
+                max_expansions: Self::DEFAULT_MAX_EXPANSIONS,
+            },
         }
     }
 
@@ -70,11 +81,24 @@ impl FuzzyQuery {
         self
     }
 
-    /// Set the maximum number of terms to expand to.
-    /// This prevents queries from matching too many terms and consuming excessive resources.
-    /// Default is 50, same as Lucene.
+    /// Set the maximum number of terms that are scored, the closest ones.
+    /// The default is 50, as in Lucene; a search rejects `0`.
+    ///
+    /// The limit is part of the rewrite method, so of this and
+    /// [`with_rewrite_method`](Self::with_rewrite_method) the later call wins.
+    /// It turns [`RewriteMethod::BooleanQuery`] into
+    /// [`RewriteMethod::TopTermsScoring`], and has no effect on
+    /// [`RewriteMethod::ConstantScore`], which scores no term.
     pub fn max_expansions(mut self, max_expansions: usize) -> Self {
-        self.max_expansions = max_expansions;
+        self.rewrite_method = match self.rewrite_method {
+            RewriteMethod::TopTermsBlended { .. } => {
+                RewriteMethod::TopTermsBlended { max_expansions }
+            }
+            RewriteMethod::TopTermsScoring { .. } | RewriteMethod::BooleanQuery => {
+                RewriteMethod::TopTermsScoring { max_expansions }
+            }
+            RewriteMethod::ConstantScore => RewriteMethod::ConstantScore,
+        };
         self
     }
 
@@ -109,12 +133,13 @@ impl FuzzyQuery {
         self.transpositions
     }
 
-    /// Get the maximum number of terms to expand to.
-    pub fn get_max_expansions(&self) -> usize {
-        self.max_expansions
+    /// Get the maximum number of terms that are scored, or `None` if the
+    /// rewrite method has no limit.
+    pub fn get_max_expansions(&self) -> Option<usize> {
+        self.rewrite_method.max_expansions()
     }
 
-    /// Set the rewrite method.
+    /// Set the rewrite method, and with it the limit on the terms.
     pub fn with_rewrite_method(mut self, rewrite_method: RewriteMethod) -> Self {
         self.rewrite_method = rewrite_method;
         self
@@ -148,6 +173,19 @@ impl MultiTermQuery for FuzzyQuery {
 
     fn automaton(&self) -> Result<Box<dyn Automaton>> {
         Ok(Box::new(self.levenshtein()))
+    }
+
+    /// `1 - distance / length of the shorter term`, in characters, and at
+    /// least `0`, as in Lucene: `1` for the exact term.
+    fn term_boost(&self, term: &str) -> f32 {
+        if term == self.term {
+            return 1.0;
+        }
+        let shorter = self.term.chars().count().min(term.chars().count());
+        match self.levenshtein().distance(term) {
+            Some(distance) if distance < shorter => 1.0 - distance as f32 / shorter as f32,
+            _ => 0.0,
+        }
     }
 }
 
@@ -192,6 +230,10 @@ impl Query for FuzzyQuery {
         rewrite_multi_term(self, reader)
     }
 
+    fn validate_boosts(&self) -> Result<()> {
+        validate_multi_term(self)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -208,18 +250,12 @@ impl Query for FuzzyQuery {
 
     fn cache_key(&self) -> Option<String> {
         // Every field below affects which terms (and therefore which
-        // documents) match: edit distance, the untouched prefix length,
-        // transposition support, the expansion cap, and the rewrite method.
-        // Boost is score-only and excluded.
+        // documents) match: edit distance, the untouched prefix length and
+        // transposition support. The boost and the rewrite method with its
+        // limit are score-only and excluded.
         Some(format!(
-            "fuzzy|{:?}|{:?}|{}|{}|{}|{}|{:?}",
-            self.field,
-            self.term,
-            self.max_edits,
-            self.prefix_length,
-            self.transpositions,
-            self.max_expansions,
-            self.rewrite_method
+            "fuzzy|{:?}|{:?}|{}|{}|{}",
+            self.field, self.term, self.max_edits, self.prefix_length, self.transpositions
         ))
     }
 }
@@ -242,6 +278,113 @@ mod tests {
         assert_eq!(query.get_prefix_length(), 2);
         assert!(!query.get_transpositions());
         assert_eq!(query.boost(), 1.5);
+    }
+
+    /// The limit is part of the rewrite method, so the later call of the two
+    /// wins (Issue #1740).
+    #[test]
+    fn the_limit_is_part_of_the_rewrite_method() {
+        let query = || FuzzyQuery::new("title", "test");
+        let scoring = |max_expansions| RewriteMethod::TopTermsScoring { max_expansions };
+        let blended = |max_expansions| RewriteMethod::TopTermsBlended { max_expansions };
+        for (query, method, limit) in [
+            (query(), blended(50), Some(50)),
+            (query().max_expansions(7), blended(7), Some(7)),
+            (query().with_rewrite_method(scoring(3)), scoring(3), Some(3)),
+            (
+                query().with_rewrite_method(scoring(3)).max_expansions(7),
+                scoring(7),
+                Some(7),
+            ),
+            (
+                query().max_expansions(7).with_rewrite_method(scoring(3)),
+                scoring(3),
+                Some(3),
+            ),
+            (
+                query().with_rewrite_method(RewriteMethod::BooleanQuery),
+                RewriteMethod::BooleanQuery,
+                None,
+            ),
+            (
+                query()
+                    .with_rewrite_method(RewriteMethod::BooleanQuery)
+                    .max_expansions(7),
+                scoring(7),
+                Some(7),
+            ),
+            (
+                query()
+                    .with_rewrite_method(RewriteMethod::ConstantScore)
+                    .max_expansions(7),
+                RewriteMethod::ConstantScore,
+                None,
+            ),
+        ] {
+            assert_eq!(query.rewrite_method(), method);
+            assert_eq!(query.get_max_expansions(), limit, "{method:?}");
+        }
+    }
+
+    /// A term's factor is `1 - distance / length of the shorter term`, in
+    /// characters, and at least zero (Issue #1740).
+    #[test]
+    fn a_closer_term_has_a_higher_factor() {
+        for (own, term, expected) in [
+            ("hello", "hello", 1.0),
+            ("hello", "hallo", 0.8),
+            ("hello", "helloo", 0.8),
+            ("hello", "hell", 0.75),
+            ("hello", "halli", 0.6),
+            // Characters, not bytes.
+            ("über", "uber", 0.75),
+            ("über", "übel", 0.75),
+            ("ab", "abc", 0.5),
+            ("ab", "a", 0.0),
+            ("a", "ab", 0.0),
+            ("a", "b", 0.0),
+            ("a", "abc", 0.0),
+            ("", "", 1.0),
+            ("", "a", 0.0),
+            // Not within the distance.
+            ("hello", "world", 0.0),
+        ] {
+            let query = FuzzyQuery::new("title", own);
+            assert!(
+                (query.term_boost(term) - expected).abs() < 1e-6,
+                "{own}, {term}: {}",
+                query.term_boost(term)
+            );
+        }
+        // A transposition is one edit, or two.
+        let query = FuzzyQuery::new("title", "hello");
+        assert!((query.term_boost("ehllo") - 0.8).abs() < 1e-6);
+        let query = query.transpositions(false);
+        assert!((query.term_boost("ehllo") - 0.6).abs() < 1e-6);
+    }
+
+    /// The cache of filters is keyed by the matches, which the limit, the
+    /// rewrite method and the boost do not change (Issue #1740).
+    #[test]
+    fn the_cache_key_is_that_of_the_matches() {
+        let key = |query: FuzzyQuery| query.cache_key().unwrap();
+        let query = || FuzzyQuery::new("title", "test");
+        let own = key(query());
+        assert_eq!(key(query().max_expansions(7)), own);
+        assert_eq!(key(query().with_boost(2.0)), own);
+        assert_eq!(
+            key(query().with_rewrite_method(RewriteMethod::ConstantScore)),
+            own
+        );
+        for other in [
+            query().max_edits(1),
+            query().prefix_length(1),
+            query().transpositions(false),
+            FuzzyQuery::new("title", "tests"),
+            FuzzyQuery::new("body", "test"),
+        ] {
+            assert_ne!(key(other), own);
+        }
     }
 
     #[test]

@@ -13,14 +13,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{LaurusError, Result};
 use crate::lexical::index::inverted::core::automaton::Automaton;
 use crate::lexical::index::inverted::reader::InvertedIndexReader;
-use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::matcher::{EmptyMatcher, Matcher, PreComputedMatcher};
 use crate::lexical::query::scorer::{ConstantScorer, Scorer};
 use crate::lexical::query::term::TermQuery;
+use crate::lexical::query::{Query, check_query_boost};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches multiple terms based on some pattern or criteria.
@@ -67,6 +67,22 @@ pub trait MultiTermQuery: Query {
     /// Returns an error if the query's pattern is invalid.
     fn automaton(&self) -> Result<Box<dyn Automaton>>;
 
+    /// The factor of the score of a term that this query matches, in the
+    /// rewrite methods that score terms. The terms with the highest factors
+    /// are scored first. The default is the same for every term, `1.0`.
+    ///
+    /// # Arguments
+    ///
+    /// * `term` - A term the query's automaton matches.
+    ///
+    /// # Returns
+    ///
+    /// A finite factor of at least `0`.
+    fn term_boost(&self, term: &str) -> f32 {
+        let _ = term;
+        1.0
+    }
+
     /// Enumerate every term of the index that this query matches.
     ///
     /// # Arguments
@@ -78,7 +94,8 @@ pub trait MultiTermQuery: Query {
     /// A vector of tuples in ascending order of the terms, containing:
     /// - `term`: The matching term text
     /// - `doc_freq`: Number of documents containing this term
-    /// - `boost`: The factor of the term's score (1.0)
+    /// - `boost`: The factor of the term's score (see
+    ///   [`term_boost`](Self::term_boost))
     ///
     /// It is empty if the reader cannot enumerate terms.
     ///
@@ -93,7 +110,10 @@ pub trait MultiTermQuery: Query {
             .unwrap_or_default();
         Ok(terms
             .into_iter()
-            .map(|(term, doc_freq)| (term, doc_freq, 1.0))
+            .map(|(term, doc_freq)| {
+                let boost = self.term_boost(&term);
+                (term, doc_freq, boost)
+            })
             .collect())
     }
 
@@ -113,12 +133,21 @@ pub trait MultiTermQuery: Query {
         if let Some(limit) = self.rewrite_method().max_expansions() {
             keep_top_terms(&mut terms, limit);
         }
+        let blended = match self.rewrite_method() {
+            RewriteMethod::TopTermsBlended { .. } => {
+                terms.iter().map(|(_, doc_freq, _)| *doc_freq).max()
+            }
+            _ => None,
+        };
         // Without terms, the query produces an EmptyMatcher.
         let mut boolean_query = BooleanQuery::new();
         boolean_query.set_boost(self.boost());
         let field = MultiTermQuery::field(self);
         for (term, _, boost) in terms {
-            let term_query = TermQuery::new(field, term).with_boost(boost);
+            let mut term_query = TermQuery::new(field, term).with_boost(boost);
+            if let Some(doc_freq) = blended {
+                term_query = term_query.with_doc_freq(doc_freq);
+            }
             boolean_query.add_clause(BooleanClause::new(Box::new(term_query), Occur::Should));
         }
         Ok(Box::new(boolean_query))
@@ -211,6 +240,29 @@ pub(crate) fn rewrite_multi_term<Q: MultiTermQuery>(
     Ok(Some(MultiTermQuery::rewrite(query, reader)?))
 }
 
+/// What [`Query::validate_boosts`] checks for a multi-term query: its boost,
+/// and that its rewrite method scores any term.
+///
+/// # Arguments
+///
+/// * `query` - The multi-term query.
+///
+/// # Errors
+///
+/// Returns [`LaurusError::InvalidArgument`] for a boost that is not finite or
+/// is negative, or for a limit of no terms, which would find nothing without
+/// an error (Issue #1740).
+pub(crate) fn validate_multi_term<Q: MultiTermQuery>(query: &Q) -> Result<()> {
+    check_query_boost(query.boost(), || query.description())?;
+    if query.rewrite_method().max_expansions() == Some(0) {
+        return Err(LaurusError::invalid_argument(format!(
+            "max_expansions must be at least 1, got 0: {}",
+            query.description()
+        )));
+    }
+    Ok(())
+}
+
 /// Rewrite strategies for multi-term queries.
 ///
 /// Similar to Lucene's RewriteMethod, these strategies determine how the
@@ -218,23 +270,29 @@ pub(crate) fn rewrite_multi_term<Q: MultiTermQuery>(
 ///
 /// # Strategies
 ///
-/// - **ConstantScore** (default): every match scores the query's boost
+/// - **ConstantScore** (the default of a prefix, wildcard or regexp query):
+///   every match scores the query's boost
 /// - **TopTermsScoring** and **TopTermsBlended**: the top N terms are scored
 /// - **BooleanQuery**: every term is scored
 ///
 /// The choice affects the scores, the cost of a search, and with a limit the
-/// documents a search for the query returns. A filter uses the set of matches
-/// alone, which covers every term with each of them.
+/// documents a search for the query returns. A filter and an exclusion use the
+/// set of matches alone, which covers every term with each of them.
+///
+/// A limit of `0` is rejected by a search (see [`Query::validate_boosts`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewriteMethod {
-    /// Score the top N terms as the clauses of a BooleanQuery: the most
-    /// frequent ones, and among equally frequent ones the first.
+    /// Score the top N terms as the clauses of a BooleanQuery, each with its
+    /// factor (see [`MultiTermQuery::term_boost`]): the terms with the highest
+    /// factors, among equal ones the most frequent, and among equally frequent
+    /// ones the first.
     ///
     /// Similar to Lucene's TopTermsScoringBooleanQueryRewrite.
     TopTermsScoring { max_expansions: usize },
 
-    /// Score the top N terms as `TopTermsScoring` does. The document
-    /// frequencies of the terms are not blended.
+    /// Score the top N terms as `TopTermsScoring` does, but each as if it were
+    /// in as many documents as the most frequent of them. Otherwise the rarest
+    /// term typically ranks highest. The default of a fuzzy query, with 50.
     ///
     /// Similar to Lucene's TopTermsBlendedFreqScoringRewrite.
     TopTermsBlended { max_expansions: usize },
