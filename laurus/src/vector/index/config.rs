@@ -279,6 +279,28 @@ impl VectorIndexTypeConfig {
     pub fn is_multi_vector(&self) -> bool {
         matches!(self, VectorIndexTypeConfig::MultiVector(_))
     }
+
+    /// Load the shared PQ codebook an HNSW config names, if it names one;
+    /// a config for another kind of index has none (see
+    /// [`HnswIndexConfig::resolve_pq_codebook`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - The root of the vector storage, to which
+    ///   [`HnswIndexConfig::pq_codebook_path`] is relative, not the directory
+    ///   of one field.
+    ///
+    /// # Errors
+    ///
+    /// As [`HnswIndexConfig::resolve_pq_codebook`].
+    pub fn resolve_pq_codebook(&mut self, storage: &dyn crate::storage::Storage) -> Result<()> {
+        match self {
+            VectorIndexTypeConfig::HNSW(config) => config.resolve_pq_codebook(storage),
+            VectorIndexTypeConfig::Flat(_)
+            | VectorIndexTypeConfig::IVF(_)
+            | VectorIndexTypeConfig::MultiVector(_) => Ok(()),
+        }
+    }
 }
 
 /// Configuration specific to Flat index.
@@ -658,9 +680,10 @@ pub struct HnswIndexConfig {
     /// [`Self::pq_codebook_path`] by [`Self::resolve_pq_codebook`].
     ///
     /// Not serialized (mirrors [`Self::embedder`]): this is runtime
-    /// state resolved once per index instance, not part of the
-    /// persisted schema. Retraining the codebook file on disk does not
-    /// affect an already-open index; reopen to pick up the change.
+    /// state resolved when the index is opened, which adding or rebuilding
+    /// the field does too, not part of the persisted schema. Retraining the
+    /// codebook file on disk does not affect an already-open index; reopen
+    /// the engine or rebuild the field to pick up the change.
     #[serde(skip)]
     pub pq_codebook: Option<Arc<crate::vector::index::pq_codebook::SharedPqCodebook>>,
 
@@ -1018,6 +1041,45 @@ mod tests {
         assert_eq!(config.auto_compaction, defaults.auto_compaction);
         assert_eq!(config.max_segments, defaults.max_segments);
         assert_eq!(config.embedder.name(), defaults.embedder.name());
+    }
+
+    /// Issue #1735: an HNSW config loads the codebook it names, when there is
+    /// one, and reports a file it cannot read. A config for another kind of
+    /// index reads nothing.
+    #[test]
+    fn only_an_hnsw_config_resolves_a_codebook() {
+        use crate::storage::Storage;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use std::io::Write;
+
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let hnsw = |path: Option<&str>| {
+            VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                pq_codebook_path: path.map(str::to_string),
+                ..HnswIndexConfig::default()
+            })
+        };
+        let mut output = storage.create_output("bad.pqcb").unwrap();
+        output.write_all(b"not a codebook").unwrap();
+        output.close().unwrap();
+
+        for mut config in [
+            hnsw(None),
+            hnsw(Some("absent.pqcb")),
+            VectorIndexTypeConfig::Flat(FlatIndexConfig::default()),
+            VectorIndexTypeConfig::IVF(IvfIndexConfig::default()),
+            VectorIndexTypeConfig::MultiVector(MultiVectorIndexConfig::default()),
+        ] {
+            config.resolve_pq_codebook(&storage).unwrap();
+            if let VectorIndexTypeConfig::HNSW(config) = &config {
+                assert!(config.pq_codebook.is_none());
+            }
+        }
+        assert!(
+            hnsw(Some("bad.pqcb"))
+                .resolve_pq_codebook(&storage)
+                .is_err()
+        );
     }
 
     /// Issue #794: `from_hnsw_option` sets `normalize_vectors` from the

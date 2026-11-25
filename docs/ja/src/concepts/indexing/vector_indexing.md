@@ -535,15 +535,23 @@ train-before-first-commit の順序ハザードを完全に解消することも
   インライン学習の segment はマイグレーション無しで共存でき、生成
   される code は同一サンプルでインライン学習した場合と
   **byte-identical** です。
-- codebook ファイルは **index open 時に一度だけ**解決されます。
-  エンジンを開いたまま再学習しても mid-session で hot-swap されません
-  （意図的な仕様 — 1 セッションの commit 間で codebook が変わっては
-  ならないため）。新しいファイルは再オープンで反映されます。
+- codebook ファイルは、**フィールドの index を開くときに一度だけ**解決
+  されます。エンジンを開くとき、`add_field` でフィールドを足すとき、
+  `update_field` でフィールドを作り直すとき（`Reindex` と `Destructive` の
+  変更。Issue #1735）です。作り直すときは、その間に再学習したファイルを
+  読みます。それ以外では、エンジンを開いたまま再学習しても mid-session で
+  hot-swap されません（意図的な仕様 — 1 セッションの commit 間で codebook が
+  変わってはならないため）。`default_ef_search` などの `MetadataOnly` の変更
+  でも、使っている codebook のままです。新しいファイルは、再オープンか
+  フィールドの作り直しで反映されます。
 - **失敗ポリシー — 無言のフォールバック無し。** `pq_codebook_path` が
   設定済みで未学習の場合、 open は lenient（学習前にスキーマを作成
   できる）ですが、 encode が必要な commit は実行すべき学習コマンドを
-  示すエラーで失敗します。ファイルは存在するが破損・ジオメトリ不一致の
-  場合は open 時にエラーです。 laurus が per-segment 学習へ無言で
+  示すエラーで失敗します。ファイルは存在するが破損している場合は open 時に
+  エラーです。フィールドの index を開く `add_field`・`update_field` も、何も
+  変える前にエラーになります。ジオメトリ（次元・`subvector_count`）が違う
+  ファイルでは、両方の値を明示するエラーで commit が失敗し、作り直しは公開の
+  前に失敗します。 laurus が per-segment 学習へ無言で
   フォールバックすることはありません — 数秒オーダーの学習コストへの
   見えない回帰は本機能の意義を損なうためです。
 - Cosine メトリックのフィールドでは、 writer がインデックス時に行う

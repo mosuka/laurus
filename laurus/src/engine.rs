@@ -4157,7 +4157,9 @@ impl Engine {
     /// naming it — an engine instance that is already open does **not** hot-swap
     /// codebooks mid-flight (intentional: a codebook must not change between
     /// the commits of one session). Train first, then open the engine that
-    /// will ingest.
+    /// will ingest. [`Self::add_field`] and an [`Self::update_field`] that
+    /// rebuilds or recreates the field open the field's index, so they pick
+    /// the file up too (Issue #1735).
     ///
     /// When the field's distance metric is Cosine, the training set is
     /// L2-normalized before k-means so the codebook matches the normalized

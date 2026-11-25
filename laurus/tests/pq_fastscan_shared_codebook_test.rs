@@ -17,7 +17,7 @@ use laurus::vector::Vector;
 use laurus::vector::core::distance::DistanceMetric;
 use laurus::vector::core::quantization::QuantizationMethod;
 use laurus::vector::index::pq_codebook::read_pq_codebook;
-use laurus::{DataValue, Document, Engine, FieldOption, Schema};
+use laurus::{DataValue, Document, Engine, FieldOption, Schema, UpdateFieldOptions};
 use tempfile::TempDir;
 
 const DIM: usize = 32;
@@ -180,5 +180,69 @@ async fn k256_codebook_on_fastscan_field_fails_the_commit() -> laurus::Result<()
         "the k mismatch must be named: {message}"
     );
 
+    Ok(())
+}
+
+/// Issue #1735: an open engine keeps the shared codebook of a FastScan field
+/// through a change of its search-time parameters, and loads it when the
+/// field is rebuilt or added. Five documents are far below the count from
+/// which a segment trains a codebook of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_engine_keeps_the_shared_codebook() -> laurus::Result<()> {
+    let dir = TempDir::new().unwrap();
+    let storage = StorageFactory::create(StorageConfig::File(FileStorageConfig::new(dir.path())))?;
+    let schema = fastscan_schema(Some("embedding.pqcb"));
+    let trainer = Engine::new(storage.clone(), schema.clone()).await?;
+    trainer.train_pq_codebook("embedding", &make_vectors(400, 0x0F0F), None)?;
+    drop(trainer);
+
+    let engine = Engine::new(storage.clone(), schema.clone()).await?;
+    let FieldOption::Hnsw(option) = schema.fields["embedding"].clone() else {
+        panic!("an HNSW field");
+    };
+    let searched = FieldOption::Hnsw(HnswOption {
+        default_ef_search: Some(99),
+        ..option.clone()
+    });
+    let rebuilt = FieldOption::Hnsw(HnswOption {
+        default_ef_search: Some(99),
+        m: 12,
+        ..option.clone()
+    });
+    let reindex = UpdateFieldOptions {
+        reindex: true,
+        dry_run: false,
+    };
+    for (round, change) in [None, Some(searched), Some(rebuilt)]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(change) = change {
+            engine.update_field("embedding", change, reindex).await?;
+        }
+        for (i, v) in make_vectors(5, 0xBEEF + round as u64)
+            .into_iter()
+            .enumerate()
+        {
+            let doc = Document::builder()
+                .add_field("embedding", DataValue::Vector(v.data.to_vec()))
+                .build();
+            engine.put_document(&format!("d{round}-{i}"), doc).await?;
+        }
+        engine.commit().await?;
+    }
+    engine.delete_field("embedding").await?;
+    engine
+        .add_field("embedding", FieldOption::Hnsw(option))
+        .await?;
+    let doc = Document::builder()
+        .add_field(
+            "embedding",
+            DataValue::Vector(make_vectors(1, 7)[0].data.to_vec()),
+        )
+        .build();
+    engine.put_document("added", doc).await?;
+    engine.commit().await?;
+    assert_eq!(engine.stats()?.vector_fields["embedding"].vector_count, 1);
     Ok(())
 }

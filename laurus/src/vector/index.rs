@@ -607,9 +607,7 @@ impl ManagedVectorIndex {
         // `dispatch_hnsw` resolution point for the `VectorIndexFactory`
         // path; this constructor is the other (bench/direct-use) path
         // into an HNSW writer.
-        if let VectorIndexTypeConfig::HNSW(hnsw_config) = &mut config {
-            hnsw_config.resolve_pq_codebook(storage.as_ref())?;
-        }
+        config.resolve_pq_codebook(storage.as_ref())?;
         // Create builder based on config type
         let builder: Box<dyn VectorIndexWriter> = match &config {
             VectorIndexTypeConfig::Flat(flat_config) => {

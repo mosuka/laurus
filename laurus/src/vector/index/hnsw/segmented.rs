@@ -95,6 +95,13 @@ impl SegmentedBackend for HnswSegmentedBackend {
         }
     }
 
+    /// Keep the shared PQ codebook, unless `new` names another one.
+    fn keep_loaded_state(new: &mut Self::Config, current: &Self::Config) {
+        if new.pq_codebook_path == current.pq_codebook_path {
+            new.pq_codebook.clone_from(&current.pq_codebook);
+        }
+    }
+
     fn load_segment_reader(
         config: &Self::Config,
         storage: &Arc<dyn Storage>,

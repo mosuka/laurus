@@ -561,15 +561,23 @@ Semantics:
   inline-trained segments coexist with no migration, and the codes are
   **byte-identical** to what inline training on the same sample would
   produce.
-- The codebook file is resolved **once, at index open**. Retraining
-  while an engine is open does not hot-swap the codebook mid-session
-  (intentional — a codebook must not change between the commits of one
-  session); reopen the engine to pick up a new file.
+- The codebook file is resolved **once, when the field's index is
+  opened**: when the engine is opened, when `add_field` adds the field, and
+  when `update_field` rebuilds or recreates it (a `Reindex` or
+  `Destructive` change, Issue #1735), which takes a file that was retrained
+  meanwhile. Retraining while an engine is open does not otherwise hot-swap
+  the codebook mid-session (intentional — a codebook must not change between
+  the commits of one session), and a `MetadataOnly` change, such as of
+  `default_ef_search`, keeps the one in use; reopen the engine or rebuild
+  the field to pick up a new file.
 - **Failure policy — no silent fallback.** A configured but
   not-yet-trained `pq_codebook_path` is lenient at open (so a schema
   can be created before training), but a commit that needs to encode
   hard-errors with the training command to run. A present but
-  corrupt or geometry-mismatched file errors at open. Laurus never
+  corrupt file errors at open, and fails an `add_field` or `update_field`
+  that would open the field's index before anything changes. A file of
+  another geometry (dimension or `subvector_count`) fails the commit, or the
+  rebuild before it publishes, with both values named. Laurus never
   silently falls back to per-segment training — an invisible
   regression to the multi-second training cost would defeat the
   feature.

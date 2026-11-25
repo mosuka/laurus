@@ -48,7 +48,8 @@
 //! mixed-field data, crash-resumability) for a pre-1.0 project. Lexical
 //! and document data are unaffected either way.
 //!
-//! # PQ codebook namespacing caveat (for callers of [`MultiFieldVectorIndex::open_or_create`])
+//! # PQ codebook namespacing caveat (for callers of [`MultiFieldVectorIndex::open_or_create`],
+//! [`add_field`](VectorIndex::add_field) and [`rebuild_field`](VectorIndex::rebuild_field))
 //!
 //! [`crate::vector::index::config::HnswIndexConfig::pq_codebook_path`] is a
 //! path relative to the *root* storage (the one passed to `open_or_create`,
@@ -57,7 +58,11 @@
 //! a shared PQ codebook (Issue #631) MUST call
 //! [`HnswIndexConfig::resolve_pq_codebook`](crate::vector::index::config::HnswIndexConfig::resolve_pq_codebook)
 //! against the *root* storage before building the per-field config passed
-//! here. `VectorIndexFactory::open_or_create`'s own internal resolution
+//! here, as [`VectorStore`](crate::vector::store::VectorStore) does for all
+//! three (Issue #1735). A config passed to
+//! [`update_field_config`](VectorIndex::update_field_config) need not be: the
+//! index keeps the codebook it has.
+//! `VectorIndexFactory::open_or_create`'s own internal resolution
 //! attempt (against the field-scoped storage, where the codebook file does
 //! not exist) is a harmless no-op in that case —
 //! [`HnswIndexConfig::resolve_pq_codebook`](crate::vector::index::config::HnswIndexConfig::resolve_pq_codebook)
