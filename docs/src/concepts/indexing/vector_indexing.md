@@ -561,6 +561,12 @@ Semantics:
   inline-trained segments coexist with no migration, and the codes are
   **byte-identical** to what inline training on the same sample would
   produce.
+- `pq_codebook_path` is **relative to the root of the vector storage**,
+  which is where the training writes the file: `store/vector/` in the
+  index directory of the CLI and the server. The directory of the field
+  (`store/vector/<field>/`) is not searched. A file of that name there,
+  such as the codebook of a field `a/b` in the directory of a field `a`,
+  is not used, also when the field's own is missing (Issue #1738).
 - The codebook file is resolved **once, when the field's index is
   opened**: when the engine is opened, when `add_field` adds the field, and
   when `update_field` rebuilds or recreates it (a `Reindex` or

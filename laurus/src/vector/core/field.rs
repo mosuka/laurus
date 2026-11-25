@@ -323,7 +323,8 @@ pub struct HnswOption {
     /// When set, the engine automatically embeds input using the named embedder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedder: Option<String>,
-    /// Storage-relative file name of a shared PQ codebook (Issue #631).
+    /// File name of a shared PQ codebook (Issue #631), relative to the root
+    /// of the vector storage, not to the directory of the field.
     ///
     /// Only meaningful when [`Self::quantizer`] is
     /// [`quantization::QuantizationMethod::ProductQuantization`] (k=256)

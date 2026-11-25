@@ -57,6 +57,19 @@ impl VectorIndexFactory {
     /// A boxed trait object implementing `VectorIndex` trait.
     /// The concrete type is determined by the config variant.
     ///
+    /// # PQ codebook resolution
+    ///
+    /// The shared PQ codebook that an HNSW config names
+    /// ([`HnswIndexConfig::pq_codebook_path`](crate::vector::index::config::HnswIndexConfig::pq_codebook_path))
+    /// is loaded from `storage`, as [`Self::open`] and
+    /// [`Self::open_or_create`] do too. For an index with a storage of its
+    /// own, that is the root the path is relative to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be created, or when the file of
+    /// the codebook exists and cannot be read.
+    ///
     /// # Example
     ///
     /// ```
@@ -84,17 +97,45 @@ impl VectorIndexFactory {
     pub fn create(
         storage: Arc<dyn Storage>,
         name: &str,
+        mut config: VectorIndexTypeConfig,
+    ) -> Result<Box<dyn VectorIndex>> {
+        config.resolve_pq_codebook(storage.as_ref())?;
+        Self::dispatch(storage, name, config, false)
+    }
+
+    /// Open or create the index of `config`'s kind.
+    ///
+    /// The config is taken as it is: a shared PQ codebook must be in it
+    /// already (Issue #1738).
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage backend
+    /// * `name` - Index name
+    /// * `config` - Index configuration
+    /// * `open_only` - Whether a single-file index is opened (`true`) or
+    ///   created (`false`). The segmented layout takes the same path for both.
+    fn dispatch(
+        storage: Arc<dyn Storage>,
+        name: &str,
         config: VectorIndexTypeConfig,
+        open_only: bool,
     ) -> Result<Box<dyn VectorIndex>> {
         match config {
             VectorIndexTypeConfig::Flat(flat_config) => {
-                Self::dispatch_flat(storage, name, flat_config, false)
+                // Both arms come through here (Issue #889 PR-4): the
+                // segmented path's `open_or_create` opens existing manifests
+                // and migrates legacy monolithic indexes; the flag-off path
+                // is reverse-guarded against segmented directories.
+                Self::dispatch_flat(storage, name, flat_config, open_only)
             }
             VectorIndexTypeConfig::HNSW(hnsw_config) => {
-                Self::dispatch_hnsw(storage, name, hnsw_config, false)
+                // As for Flat (#882).
+                Self::dispatch_hnsw(storage, name, hnsw_config, open_only)
             }
             VectorIndexTypeConfig::IVF(ivf_config) => {
-                Self::dispatch_ivf(storage, name, ivf_config, false)
+                // As for Flat (Issue #889 PR-6).
+                Self::dispatch_ivf(storage, name, ivf_config, open_only)
             }
             VectorIndexTypeConfig::MultiVector(mv_config) => {
                 Self::dispatch_multi_vector(storage, name, mv_config)
@@ -175,17 +216,10 @@ impl VectorIndexFactory {
     fn dispatch_hnsw(
         storage: Arc<dyn Storage>,
         name: &str,
-        mut hnsw_config: crate::vector::index::config::HnswIndexConfig,
+        hnsw_config: crate::vector::index::config::HnswIndexConfig,
         open_only: bool,
     ) -> Result<Box<dyn VectorIndex>> {
         use crate::vector::index::hnsw::segmented::SegmentedHnswIndex;
-
-        // Resolve a configured shared PQ codebook (Issue #631) once here,
-        // the single choke point both the segmented and monolithic HNSW
-        // paths go through — every writer built from this config (and,
-        // for the segmented path, the merge engine, which clones this same
-        // config) picks up the resolved `Arc` for free.
-        hnsw_config.resolve_pq_codebook(storage.as_ref())?;
 
         if hnsw_config.segmented {
             let index = SegmentedHnswIndex::open_or_create(storage, name, hnsw_config)?;
@@ -264,16 +298,45 @@ impl VectorIndexFactory {
     /// # Returns
     ///
     /// A boxed index implementation.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create`], which says where a shared PQ codebook is loaded
+    /// from, and [`Self::open`].
     pub fn open_or_create(
+        storage: Arc<dyn Storage>,
+        name: &str,
+        mut config: VectorIndexTypeConfig,
+    ) -> Result<Box<dyn VectorIndex>> {
+        config.resolve_pq_codebook(storage.as_ref())?;
+        Self::open_or_create_resolved(storage, name, config)
+    }
+
+    /// [`Self::open_or_create`] with a config whose shared PQ codebook, if it
+    /// names one, has been loaded, for the index of a field, whose `storage`
+    /// is a directory of the vector storage (Issue #1738).
+    ///
+    /// `pq_codebook_path` is relative to the root of the vector storage. A
+    /// file of that name in the field's directory, such as the codebook of a
+    /// field `a/b` in the directory of a field `a`, is not the field's, also
+    /// when its own is missing.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage backend
+    /// * `name` - Index name
+    /// * `config` - Index configuration, with its codebook
+    ///
+    /// # Returns
+    ///
+    /// A boxed index implementation.
+    pub(crate) fn open_or_create_resolved(
         storage: Arc<dyn Storage>,
         name: &str,
         config: VectorIndexTypeConfig,
     ) -> Result<Box<dyn VectorIndex>> {
-        if storage.file_exists("metadata.json") {
-            Self::open(storage, name, config)
-        } else {
-            Self::create(storage, name, config)
-        }
+        let open_only = storage.file_exists("metadata.json");
+        Self::dispatch(storage, name, config, open_only)
     }
 
     /// Open an existing vector index with the given storage and configuration.
@@ -286,6 +349,12 @@ impl VectorIndexFactory {
     /// # Returns
     ///
     /// A boxed index implementation based on the configured index type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be opened, or when the file of
+    /// the shared PQ codebook the config names exists and cannot be read (see
+    /// [`Self::create`]).
     ///
     /// # Example
     ///
@@ -305,34 +374,10 @@ impl VectorIndexFactory {
     pub fn open(
         storage: Arc<dyn Storage>,
         name: &str,
-        config: VectorIndexTypeConfig,
+        mut config: VectorIndexTypeConfig,
     ) -> Result<Box<dyn VectorIndex>> {
-        match config {
-            VectorIndexTypeConfig::Flat(flat_config) => {
-                // Same dispatch as `create` (Issue #889 PR-4): the segmented
-                // path's `open_or_create` opens existing manifests and
-                // migrates legacy monolithic indexes; the flag-off path is
-                // reverse-guarded against segmented directories.
-                Self::dispatch_flat(storage, name, flat_config, true)
-            }
-            VectorIndexTypeConfig::HNSW(hnsw_config) => {
-                // Same dispatch as `create` (#882): the segmented path's
-                // `open_or_create` opens existing manifests and migrates
-                // legacy monolithic indexes; the flag-off path is
-                // reverse-guarded against segmented directories.
-                Self::dispatch_hnsw(storage, name, hnsw_config, true)
-            }
-            VectorIndexTypeConfig::IVF(ivf_config) => {
-                // Same dispatch as `create` (Issue #889 PR-6): the segmented
-                // path's `open_or_create` opens existing manifests and
-                // migrates legacy monolithic indexes; the flag-off path is
-                // reverse-guarded against segmented directories.
-                Self::dispatch_ivf(storage, name, ivf_config, true)
-            }
-            VectorIndexTypeConfig::MultiVector(mv_config) => {
-                Self::dispatch_multi_vector(storage, name, mv_config)
-            }
-        }
+        config.resolve_pq_codebook(storage.as_ref())?;
+        Self::dispatch(storage, name, config, true)
     }
 
     /// Open or create a [`MultiFieldVectorIndex`], one independent
@@ -350,9 +395,10 @@ impl VectorIndexFactory {
     /// [`HnswIndexConfig::pq_codebook_path`](crate::vector::index::config::HnswIndexConfig::pq_codebook_path)
     /// has its shared codebook resolved here, against the ROOT `storage` --
     /// *before* [`MultiFieldVectorIndex`] wraps each field in its own
-    /// `PrefixedStorage` sub-namespace. Resolving against the field-scoped
-    /// storage instead would look for the codebook file in the wrong place
-    /// (see the `multi_field` module docs' PQ codebook caveat).
+    /// `PrefixedStorage` sub-namespace. Nothing looks for the codebook file
+    /// in the field-scoped storage, where a file of that name would belong to
+    /// something else (see the `multi_field` module docs' PQ codebook caveat,
+    /// Issue #1738).
     pub fn open_or_create_multi_field(
         storage: Arc<dyn Storage>,
         field_configs: &BTreeMap<String, VectorIndexTypeConfig>,
@@ -402,6 +448,46 @@ mod tests {
         let index = VectorIndexFactory::open(storage, "test_index", config).unwrap();
 
         assert!(!index.is_closed());
+    }
+
+    /// `open_or_create` opens the single-file index that is there, instead of
+    /// creating it again, so another dimension is refused.
+    #[test]
+    fn open_or_create_opens_an_existing_single_file_index() {
+        let configs = |dimension| {
+            [
+                VectorIndexTypeConfig::Flat(FlatIndexConfig {
+                    dimension,
+                    segmented: false,
+                    ..Default::default()
+                }),
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    dimension,
+                    segmented: false,
+                    ..Default::default()
+                }),
+                VectorIndexTypeConfig::IVF(IvfIndexConfig {
+                    dimension,
+                    segmented: false,
+                    ..Default::default()
+                }),
+            ]
+        };
+        let mut failures = Vec::new();
+        let cases = ["Flat", "HNSW", "IVF"].into_iter().zip(configs(4));
+        for ((what, first), second) in cases.zip(configs(8)) {
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let index =
+                VectorIndexFactory::open_or_create(storage.clone(), "test_index", first).unwrap();
+            index.close().unwrap();
+            match VectorIndexFactory::open_or_create(storage, "test_index", second) {
+                Err(e)
+                    if e.to_string()
+                        .contains("Dimension mismatch: stored 4, config 8") => {}
+                other => failures.push(format!("{what}: {:?}", other.map(|_| ()))),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

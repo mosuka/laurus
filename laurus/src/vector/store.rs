@@ -1719,8 +1719,8 @@ impl VectorStore {
     /// [`Self::field_index_config`] for an index of the field that is to be
     /// opened: its shared PQ codebook, if it names one, is loaded from the
     /// root of the vector storage, as it is when the store is opened (Issue
-    /// #1735). The field's index sees only its own directory, where the file
-    /// is not.
+    /// #1735). The field's index sees only its own directory, and does not
+    /// look for the file there (Issue #1738).
     ///
     /// Call it before anything changes: a codebook that cannot be read must
     /// not be found out once a field's data is gone.

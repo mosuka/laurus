@@ -535,6 +535,12 @@ train-before-first-commit の順序ハザードを完全に解消することも
   インライン学習の segment はマイグレーション無しで共存でき、生成
   される code は同一サンプルでインライン学習した場合と
   **byte-identical** です。
+- `pq_codebook_path` は、**ベクトルの storage のルートからの相対パス**
+  です。学習もそこにファイルを書きます（CLI とサーバーでは、index の
+  ディレクトリの `store/vector/`）。フィールドのディレクトリ
+  （`store/vector/<field>/`）は探しません。そこにある同じ名前のファイル
+  （フィールド `a` のディレクトリにある、フィールド `a/b` の codebook など）
+  は、そのフィールド自身の codebook が無いときも使いません（Issue #1738）。
 - codebook ファイルは、**フィールドの index を開くときに一度だけ**解決
   されます。エンジンを開くとき、`add_field` でフィールドを足すとき、
   `update_field` でフィールドを作り直すとき（`Reindex` と `Destructive` の

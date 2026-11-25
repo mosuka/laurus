@@ -661,8 +661,9 @@ pub struct HnswIndexConfig {
     #[serde(default = "default_compaction_threshold")]
     pub compaction_threshold: f64,
 
-    /// Storage-relative file name of a pre-trained, shared PQ codebook
-    /// (Issue #631), e.g. `"embedding.pqcb"`.
+    /// File name of a pre-trained, shared PQ codebook (Issue #631), e.g.
+    /// `"embedding.pqcb"`, relative to the root of the vector storage, not to
+    /// the directory of the field.
     ///
     /// `None` (the default) keeps today's behavior: every segment's
     /// `write()` trains its own PQ codebook from scratch. When set,
@@ -816,8 +817,8 @@ impl HnswIndexConfig {
             rerank_storage: opt.rerank_storage,
             normalize_vectors: opt.distance == DistanceMetric::Cosine,
             // Issue #631: carry the schema-level shared-codebook file name;
-            // `resolve_pq_codebook` (called at index open, in
-            // `VectorIndexFactory::dispatch_hnsw`) turns it into the loaded
+            // `resolve_pq_codebook` (called with the root of the vector
+            // storage when the index is opened) turns it into the loaded
             // `pq_codebook` Arc.
             pq_codebook_path: opt.pq_codebook_path.clone(),
             ..Self::default()
@@ -838,9 +839,10 @@ impl HnswIndexConfig {
     ///
     /// # Arguments
     ///
-    /// * `storage` - The vector index's storage namespace to load the
-    ///   codebook file from (the same namespace `write()` will later
-    ///   read segment files from).
+    /// * `storage` - The root of the vector storage, which the path is
+    ///   relative to. The index of a field is opened over a directory of it,
+    ///   which must not be passed here: a file of that name there may be the
+    ///   codebook of another field (Issue #1738).
     ///
     /// # Errors
     ///
