@@ -15,6 +15,8 @@ pub struct TermQuery {
     term: String,
     /// The boost factor for this query.
     boost: f32,
+    /// The document frequency to score with in place of the term's own.
+    doc_freq: Option<u64>,
 }
 
 impl TermQuery {
@@ -32,7 +34,19 @@ impl TermQuery {
             field: field.into(),
             term: term.into(),
             boost: 1.0,
+            doc_freq: None,
         }
+    }
+
+    /// Score the term as if it were in `doc_freq` documents (Issue #1740):
+    /// the terms a fuzzy query expands to are scored alike, so that a rare
+    /// misspelling does not outrank a common word.
+    ///
+    /// Only the inverse document frequency changes. The bounds by which a
+    /// search skips documents are factors of it, so they stay valid.
+    pub(crate) fn with_doc_freq(mut self, doc_freq: u64) -> Self {
+        self.doc_freq = Some(doc_freq);
+        self
     }
 
     /// Get the field name.
@@ -87,7 +101,7 @@ impl Query for TermQuery {
                 // and aggregated cross-segment views remain valid.
                 let block_max: Arc<[_]> = Arc::from(term_info.block_max.into_boxed_slice());
                 let scorer = BM25Scorer::with_block_max(
-                    term_info.doc_freq,
+                    self.doc_freq.unwrap_or(term_info.doc_freq),
                     term_info.total_freq,
                     field_stats.doc_count,
                     field_stats.avg_length,

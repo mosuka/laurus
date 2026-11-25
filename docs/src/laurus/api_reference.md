@@ -203,7 +203,7 @@ The `weight` of each `QueryPayload` and `QueryVector` must be finite and at leas
 | `TermQuery::new(field, term)` | Exact term match | `TermQuery::new("body", "rust")` |
 | `PhraseQuery::new(field, terms)` | Exact phrase | `PhraseQuery::new("body", vec!["machine".into(), "learning".into()])` |
 | `BooleanQueryBuilder::new()` | Boolean combination | `.must(q1).should(q2).must_not(q3).build()` |
-| `FuzzyQuery::new(field, term)` | Fuzzy match (default max_edits=2) | `FuzzyQuery::new("body", "programing").max_edits(1)` |
+| `FuzzyQuery::new(field, term)` | Fuzzy match (default max_edits=2, scores the 50 closest terms) | `FuzzyQuery::new("body", "programing").max_edits(1)` |
 | `WildcardQuery::new(field, pattern)` | Wildcard | `WildcardQuery::new("file", "*.pdf")` |
 | `NumericRangeQuery::new(...)` | Numeric range | See [Lexical Search](../concepts/search.md) |
 | `DateTimeRangeQuery::between(field, start, end)` | DateTime range (`new(...)` takes `Option<DateTime<Utc>>` bounds; `from_literals(...)?` takes DSL literals) | See [Lexical Search](../concepts/search.md) |

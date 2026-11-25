@@ -9,6 +9,7 @@ use crate::lexical::index::inverted::core::automaton::{Automaton, PrefixAutomato
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{
     MultiTermQuery, RewriteMethod, multi_term_matcher, multi_term_scorer, rewrite_multi_term,
+    validate_multi_term,
 };
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query};
@@ -121,6 +122,10 @@ impl Query for PrefixQuery {
         rewrite_multi_term(self, reader)
     }
 
+    fn validate_boosts(&self) -> Result<()> {
+        validate_multi_term(self)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -136,13 +141,9 @@ impl Query for PrefixQuery {
     }
 
     fn cache_key(&self) -> Option<String> {
-        // Field + prefix + rewrite method determine the matched set (the
-        // rewrite method can cap term expansion, which affects membership);
-        // boost is score-only and excluded.
-        Some(format!(
-            "prefix|{:?}|{:?}|{:?}",
-            self.field, self.prefix, self.rewrite_method
-        ))
+        // Field + prefix determine the matched set; the boost and the rewrite
+        // method are score-only and excluded.
+        Some(format!("prefix|{:?}|{:?}", self.field, self.prefix))
     }
 }
 

@@ -10,6 +10,7 @@ use crate::lexical::index::inverted::core::automaton::{Automaton, RegexAutomaton
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::multi_term::{
     MultiTermQuery, RewriteMethod, multi_term_matcher, multi_term_scorer, rewrite_multi_term,
+    validate_multi_term,
 };
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query};
@@ -206,6 +207,10 @@ impl Query for WildcardQuery {
         rewrite_multi_term(self, reader)
     }
 
+    fn validate_boosts(&self) -> Result<()> {
+        validate_multi_term(self)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -217,13 +222,10 @@ impl Query for WildcardQuery {
     }
 
     fn cache_key(&self) -> Option<String> {
-        // Field + pattern + rewrite method determine the matched set; boost is
-        // score-only and excluded. The compiled regex is derived from the
-        // pattern, so it need not appear in the key.
-        Some(format!(
-            "wildcard|{:?}|{:?}|{:?}",
-            self.field, self.pattern, self.rewrite_method
-        ))
+        // Field + pattern determine the matched set; the boost and the rewrite
+        // method are score-only and excluded. The compiled regex is derived
+        // from the pattern, so it need not appear in the key.
+        Some(format!("wildcard|{:?}|{:?}", self.field, self.pattern))
     }
 }
 

@@ -85,6 +85,21 @@ use laurus::lexical::query::fuzzy::FuzzyQuery;
 let query = FuzzyQuery::new("body", "programing");  // default max_edits = 2
 ```
 
+The closest terms are scored, 50 by default, as in Lucene. A term counts as close by `1 - distance / length of the shorter term`, in characters and at least `0`: `1` for the exact term, which is never dropped. Among equally close terms the most frequent come first. That value is also the factor of the term's score, and every term is scored with the document frequency of the most frequent of them, so how rare a term is plays no part in its score.
+
+`max_expansions` sets the number of terms, at least 1, and `with_rewrite_method` the scoring; they are one setting, of which the later call wins:
+
+| `RewriteMethod` | Score | Hits of a search for the query |
+| :--- | :--- | :--- |
+| `TopTermsBlended { max_expansions }` (default, with 50) | BM25 of the closest terms, with the factor, as if each were as frequent as the most frequent of them | The documents that have one of these terms |
+| `TopTermsScoring { max_expansions }` | BM25 of the closest terms, with the factor | The documents that have one of these terms |
+| `ConstantScore` | The boost | Every match |
+| `BooleanQuery` | BM25 of every matching term, with the factor | Every match; see the cost [below](#matches-and-scores-of-wildcard-prefix-and-regexp-queries) |
+
+A filter and a `MustNot` clause use the matches without their scores, so they cover every matching term with each method.
+
+Until Issue #1740 every matching term was scored, whatever `max_expansions` and `with_rewrite_method` said, without a factor.
+
 ### WildcardQuery
 
 Matches terms using wildcard patterns.
@@ -135,10 +150,11 @@ They are **constant-scored**, as in Lucene: every match receives the query's boo
 | `RewriteMethod` | Score | Hits of a search for the query |
 | :--- | :--- | :--- |
 | `ConstantScore` (default) | The boost | Every match |
-| `TopTermsScoring { max_expansions }`, `TopTermsBlended { max_expansions }` | BM25 of the `max_expansions` most frequent matching terms | The documents that have one of these terms |
+| `TopTermsScoring { max_expansions }` | BM25 of the `max_expansions` most frequent matching terms | The documents that have one of these terms |
+| `TopTermsBlended { max_expansions }` | The same, as if each were as frequent as the most frequent of them | The documents that have one of these terms |
 | `BooleanQuery` | BM25 of every matching term | Every match; the cost grows faster than the number of terms, to minutes for 10,000 terms in a large segment |
 
-A filter uses the matches without their scores, so it covers every matching term with each method.
+A filter and a `MustNot` clause use the matches without their scores, so they cover every matching term with each method.
 
 The cost of a search grows with the number of terms that match and of the documents that have them. A wildcard that starts with `?` or `*`, and a regexp with no literal text after a leading `^`, are compared with every term of the field.
 

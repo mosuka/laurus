@@ -120,15 +120,19 @@ impl LevenshteinAutomaton {
     pub fn uses_transpositions(&self) -> bool {
         self.transpositions
     }
-}
 
-impl Automaton for LevenshteinAutomaton {
-    fn matches(&self, candidate: &str) -> bool {
+    /// The edit distance between the pattern and `candidate`.
+    ///
+    /// # Returns
+    ///
+    /// `None` if the automaton does not match `candidate`: the distance is
+    /// above the maximum, or the required prefix differs.
+    pub fn distance(&self, candidate: &str) -> Option<usize> {
         // Check prefix requirement against the precomputed prefix.
         if let Some(prefix) = &self.pattern_prefix
             && !candidate.starts_with(prefix.as_str())
         {
-            return false;
+            return None;
         }
 
         // Calculate edit distance using the threshold-aware variants. They use
@@ -137,12 +141,17 @@ impl Automaton for LevenshteinAutomaton {
         // threshold, and avoid heap allocations for the matrix on the
         // non-matching majority of candidates.
         let threshold = self.max_edits as usize;
-        let distance = if self.transpositions {
+        if self.transpositions {
             damerau_levenshtein_distance_threshold(&self.pattern, candidate, threshold)
         } else {
             levenshtein_distance_threshold(&self.pattern, candidate, threshold)
-        };
-        distance.is_some()
+        }
+    }
+}
+
+impl Automaton for LevenshteinAutomaton {
+    fn matches(&self, candidate: &str) -> bool {
+        self.distance(candidate).is_some()
     }
 
     fn initial_seek_term(&self) -> Option<String> {
@@ -233,6 +242,32 @@ mod tests {
 
         assert!(!automaton.matches("world")); // too different
         assert!(!automaton.matches("hi")); // too different (2 edits)
+    }
+
+    /// The distance is that of the edits, within the maximum, and of the
+    /// strings with the required prefix only (Issue #1740).
+    #[test]
+    fn a_levenshtein_automaton_tells_the_distance() {
+        for (prefix_length, transpositions, candidate, expected) in [
+            (0, true, "hello", Some(0)),
+            (0, true, "hallo", Some(1)),
+            (0, true, "ehllo", Some(1)),
+            (0, false, "ehllo", Some(2)),
+            (0, true, "hxllx", Some(2)),
+            (0, true, "xxllx", None),
+            (2, true, "hello", Some(0)),
+            (2, true, "hello!", Some(1)),
+            (2, true, "hallo", None),
+            (2, true, "", None),
+        ] {
+            let automaton = LevenshteinAutomaton::new("hello", 2, prefix_length, transpositions);
+            assert_eq!(
+                automaton.distance(candidate),
+                expected,
+                "{candidate}, prefix {prefix_length}, transpositions {transpositions}"
+            );
+            assert_eq!(automaton.matches(candidate), expected.is_some());
+        }
     }
 
     /// The prefix is one that every match starts with (Issue #1740).

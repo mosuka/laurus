@@ -486,19 +486,18 @@ impl Query for BooleanQuery {
     fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Option<Box<dyn Query>>> {
         // Lower multi-term subqueries once at the searcher level (Issue
         // #613), against the top-level reader before any per-segment
-        // fanout. Should / Must / MustNot clauses are all rewritten
-        // (Issue #1313); a constant-scored multi-term query, which a
-        // per-segment view matches too, has nothing to rewrite (Issue
-        // #1740). Only Filter clauses are left alone: they are
-        // matched through the cached doc-id path keyed by the
-        // ORIGINAL clause's `cache_key`, which a rewrite would
-        // invalidate.
+        // fanout. Only the Should and Must clauses are scored. A MustNot
+        // clause is matched as it is, on a per-segment view too (Issue
+        // #1313): rewritten, a multi-term query would exclude the terms it
+        // scores alone (Issue #1740). So is a Filter clause, through the
+        // cached doc-id path keyed by the ORIGINAL clause's `cache_key`,
+        // which a rewrite would invalidate.
         let mut rewritten_any = false;
         let mut clauses = Vec::with_capacity(self.clauses.len());
         for clause in &self.clauses {
             let lowered = match clause.occur {
-                Occur::Should | Occur::Must | Occur::MustNot => clause.query.rewrite(reader)?,
-                Occur::Filter => None,
+                Occur::Should | Occur::Must => clause.query.rewrite(reader)?,
+                Occur::MustNot | Occur::Filter => None,
             };
             match lowered {
                 Some(query) => {

@@ -201,7 +201,7 @@ cargo doc --open
 | `TermQuery::new(field, term)` | 完全一致 | `TermQuery::new("body", "rust")` |
 | `PhraseQuery::new(field, terms)` | フレーズ一致 | `PhraseQuery::new("body", vec!["machine".into(), "learning".into()])` |
 | `BooleanQueryBuilder::new()` | ブール結合 | `.must(q1).should(q2).must_not(q3).build()` |
-| `FuzzyQuery::new(field, term)` | あいまい一致（デフォルト max_edits=2） | `FuzzyQuery::new("body", "programing").max_edits(1)` |
+| `FuzzyQuery::new(field, term)` | あいまい一致（デフォルト max_edits=2、近い順に 50 個のタームをスコアの対象にする） | `FuzzyQuery::new("body", "programing").max_edits(1)` |
 | `WildcardQuery::new(field, pattern)` | ワイルドカード | `WildcardQuery::new("file", "*.pdf")` |
 | `NumericRangeQuery::new(...)` | 数値範囲 | [Lexical Search](../concepts/search.md) を参照 |
 | `DateTimeRangeQuery::between(field, start, end)` | 日時範囲（`new(...)` は `Option<DateTime<Utc>>` の境界、`from_literals(...)?` は DSL リテラルを受け取る） | [Lexical Search](../concepts/search.md) を参照 |

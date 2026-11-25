@@ -105,7 +105,9 @@ roam~
 roam~2
 ```
 
-Without a number, the maximum edit distance is 2. The number can be anything from 0 to 4294967295; a larger one is rejected with `InvalidArgument` (HTTP 400). One of 256 or more used to become 2 without an error (Issue #1570). There is no smaller limit: a distance at least as long as the term matches every term of the field. The query expands to the 50 matching terms with the highest document frequency, not to the closest ones.
+Without a number, the maximum edit distance is 2. The number can be anything from 0 to 4294967295; a larger one is rejected with `InvalidArgument` (HTTP 400). One of 256 or more used to become 2 without an error (Issue #1570). There is no smaller limit: a distance at least as long as the term matches every term of the field.
+
+The query finds the documents of the 50 closest matching terms, the exact term first, and among equally close ones of the most frequent. A closer term weighs more, and how rare a term is plays no part (see [FuzzyQuery](search/lexical_search.md#fuzzyquery)). An exclusion, `-roam~`, covers every matching term. Until Issue #1740 the query found the documents of every matching term and ranked a rare misspelling above a common word.
 
 ### Wildcard Query
 
