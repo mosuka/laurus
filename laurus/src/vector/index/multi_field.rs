@@ -62,12 +62,10 @@
 //! three (Issue #1735). A config passed to
 //! [`update_field_config`](VectorIndex::update_field_config) need not be: the
 //! index keeps the codebook it has.
-//! `VectorIndexFactory::open_or_create`'s own internal resolution
-//! attempt (against the field-scoped storage, where the codebook file does
-//! not exist) is a harmless no-op in that case —
-//! [`HnswIndexConfig::resolve_pq_codebook`](crate::vector::index::config::HnswIndexConfig::resolve_pq_codebook)
-//! only overwrites an already-resolved
-//! codebook when it finds a *replacement* file, never clears one to `None`.
+//! Nothing looks for the codebook in a field's own directory: a field name
+//! may contain `/`, so a file of that name there may be the codebook of
+//! another field (Issue #1738). A config that names a codebook and does not
+//! hold one fails where a segment is written.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -119,12 +117,14 @@ fn open_field_index(
     name: &str,
     config: VectorIndexTypeConfig,
 ) -> Result<Box<dyn VectorIndex>> {
-    VectorIndexFactory::open_or_create(storage, SUB_INDEX_NAME, config).map_err(|e| match e {
-        LaurusError::InvalidArgument(reason) => {
-            LaurusError::invalid_argument(format!("vector field '{name}': {reason}"))
-        }
-        e => e,
-    })
+    VectorIndexFactory::open_or_create_resolved(storage, SUB_INDEX_NAME, config).map_err(
+        |e| match e {
+            LaurusError::InvalidArgument(reason) => {
+                LaurusError::invalid_argument(format!("vector field '{name}': {reason}"))
+            }
+            e => e,
+        },
+    )
 }
 
 /// Run `f` over every value in `map`, tolerating individual failures until

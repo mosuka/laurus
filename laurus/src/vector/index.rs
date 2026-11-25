@@ -603,10 +603,9 @@ impl ManagedVectorIndex {
     ) -> Result<Self> {
         let path = path.into();
         // Resolve a configured shared PQ codebook (Issue #631) before
-        // constructing the writer -- mirrors `factory.rs`'s
-        // `dispatch_hnsw` resolution point for the `VectorIndexFactory`
-        // path; this constructor is the other (bench/direct-use) path
-        // into an HNSW writer.
+        // constructing the writer, as the entry points of
+        // `VectorIndexFactory` do; this constructor is the other
+        // (bench/direct-use) path into an HNSW writer.
         config.resolve_pq_codebook(storage.as_ref())?;
         // Create builder based on config type
         let builder: Box<dyn VectorIndexWriter> = match &config {

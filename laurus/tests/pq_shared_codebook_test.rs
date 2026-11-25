@@ -19,6 +19,7 @@ use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
 use laurus::vector::core::quantization::QuantizationMethod;
 use laurus::vector::index::config::{HnswIndexConfig, VectorIndexTypeConfig};
+use laurus::vector::index::factory::VectorIndexFactory;
 use laurus::vector::index::hnsw::HnswIndex;
 use laurus::vector::index::hnsw::reader::HnswIndexReader;
 use laurus::vector::index::hnsw::segmented::SegmentedHnswIndex;
@@ -26,7 +27,9 @@ use laurus::vector::index::pq_codebook::{default_codebook_name, train_and_write_
 use laurus::vector::index::storage::VectorStorage;
 use laurus::vector::index::{ManagedVectorIndex, VectorIndex};
 use laurus::vector::search::searcher::{VectorIndexQuery, VectorIndexQueryParams};
+use laurus::vector::store::VectorStore;
 use laurus::vector::{DistanceMetric, Vector};
+use laurus::{DataValue, Document};
 
 const DIM: usize = 32;
 const M: usize = 4;
@@ -282,4 +285,83 @@ fn a_managed_index_loads_the_shared_codebook() {
         VectorStorage::OwnedPq(pool) => assert_eq!(pool.codebook, trained.codebook),
         other => panic!("expected product quantization, got {other:?}"),
     }
+}
+
+/// Each public entry point of [`VectorIndexFactory`], and a [`VectorStore`] of
+/// a single index, load the codebook the config names from the storage they are
+/// given, in either layout. The index of a field goes another way, which does
+/// not look in the field's directory (Issue #1738).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_factory_loads_the_shared_codebook_of_a_single_index() {
+    const NAME: &str = "vector_index";
+    let mut failures = Vec::new();
+    let sample: Vec<Vector> = make_corpus(400, 1, 0)
+        .into_iter()
+        .map(|(_, _, v)| v)
+        .collect();
+    for segmented in [true, false] {
+        for entry in [
+            "create",
+            "open",
+            "open_or_create, new",
+            "open_or_create, existing",
+            "store, new",
+            "store, existing",
+        ] {
+            let storage = storage();
+            let trained = train_and_write_pq_codebook(
+                storage.as_ref(),
+                "v.pqcb",
+                DIM,
+                M,
+                256,
+                false,
+                &sample,
+            )
+            .unwrap();
+            let config = || {
+                VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+                    segmented,
+                    pq_codebook_path: Some("v.pqcb".to_string()),
+                    ..base_config()
+                })
+            };
+            let dyn_storage = || storage.clone() as Arc<dyn Storage>;
+            // What is there is empty, so the segment below is the first one.
+            if entry == "open" || entry.ends_with("existing") {
+                drop(VectorIndexFactory::create(dyn_storage(), NAME, config()).unwrap());
+            }
+            let written = if entry.starts_with("store") {
+                let store = VectorStore::with_index_type_config(dyn_storage(), config()).unwrap();
+                let doc = Document::builder()
+                    .add_field("v", DataValue::Vector(sample[0].data.to_vec()))
+                    .build();
+                store.upsert_document_by_internal_id(1, doc).await.unwrap();
+                store.commit().await
+            } else {
+                let index = match entry {
+                    "create" => VectorIndexFactory::create(dyn_storage(), NAME, config()),
+                    "open" => VectorIndexFactory::open(dyn_storage(), NAME, config()),
+                    _ => VectorIndexFactory::open_or_create(dyn_storage(), NAME, config()),
+                }
+                .unwrap();
+                let mut writer = index.writer().unwrap();
+                writer.add_vectors(make_corpus(10, 2, 0)).unwrap();
+                writer.commit()
+            };
+            let what = format!("segmented {segmented}, {entry}");
+            if let Err(e) = written {
+                failures.push(format!("{what}: the write failed: {e}"));
+                continue;
+            }
+            let segment = if segmented { "segment_000000" } else { NAME };
+            let reader =
+                HnswIndexReader::load(dyn_storage(), segment, DistanceMetric::Euclidean).unwrap();
+            match reader.vectors() {
+                VectorStorage::OwnedPq(pool) if pool.codebook == trained.codebook => {}
+                other => failures.push(format!("{what}: {other:?}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

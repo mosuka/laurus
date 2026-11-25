@@ -10,6 +10,10 @@
 //! Issue #1735: an open engine that rebuilds, adds or recreates the field
 //! loads the codebook too, and a change of its search-time parameters keeps
 //! the one in use. Each used to leave the field with no codebook.
+//!
+//! Issue #1738: the path is relative to the root of the vector storage, and a
+//! file of that name in the field's own directory, such as the codebook of a
+//! field nested under it, is not the field's.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
@@ -399,7 +403,11 @@ fn ids(numbers: impl IntoIterator<Item = u64>) -> BTreeSet<String> {
 /// oldest first. A file of a replaced segment can stay on Windows until the
 /// next open, so the files are not listed.
 fn segment_codebooks(storage: &Arc<dyn Storage>) -> Vec<Option<Vec<f32>>> {
-    let field: Arc<dyn Storage> = Arc::new(PrefixedStorage::new("embedding", vector_root(storage)));
+    segment_codebooks_of(storage, "embedding")
+}
+
+fn segment_codebooks_of(storage: &Arc<dyn Storage>, field: &str) -> Vec<Option<Vec<f32>>> {
+    let field: Arc<dyn Storage> = Arc::new(PrefixedStorage::new(field, vector_root(storage)));
     let Some((manifest, _)) =
         load_checksummed_json::<serde_json::Value>(field.as_ref(), "segments.json", None).unwrap()
     else {
@@ -806,6 +814,274 @@ async fn a_missing_or_mismatched_codebook_fails_where_a_segment_is_written() {
         match engine.commit().await {
             Err(e) if e.to_string().contains(message) => {}
             other => failures.push(format!("{what}: the commit returned {other:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The path of field `embedding`'s codebook, and a field whose codebook, under
+/// the default name, has the same path in the directory of `embedding`.
+const NESTED: [(&str, &str); 2] = [
+    ("b.pqcb", "embedding/b"),
+    ("embedding.pqcb", "embedding/embedding"),
+];
+
+/// Every way the index of a field is opened.
+const WAYS: [&str; 6] = [
+    "opened",
+    "added",
+    "added again",
+    "rebuilt",
+    "rebuilt from flat",
+    "recreated",
+];
+
+/// What lies in the directory of `embedding`, under the path of its codebook.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Nested {
+    /// The codebook of a field of the schema.
+    OfAField,
+    /// A codebook that no field names.
+    OfNoField,
+    /// A file that is not a codebook.
+    Unreadable,
+    /// A codebook with another dimension and number of subvectors.
+    OfAnotherShape(usize, usize),
+}
+
+/// Put the file there, and return its centroids.
+fn put_nested(storage: &Arc<dyn Storage>, field: &str, nested: Nested) -> Option<Vec<f32>> {
+    let name = format!("{field}.pqcb");
+    match nested {
+        Nested::OfAField | Nested::OfNoField => Some(train(storage, &name, 2)),
+        Nested::OfAnotherShape(dimension, subvectors) => {
+            Some(train_shape(storage, &name, 2, dimension, subvectors))
+        }
+        Nested::Unreadable => {
+            let mut output = vector_root(storage).create_output(&name).unwrap();
+            output.write_all(b"not a codebook").unwrap();
+            output.close().unwrap();
+            None
+        }
+    }
+}
+
+/// Open an engine whose schema has `option`, if any, as field `embedding`, and
+/// `nested`, if any, as an HNSW field with the default codebook name.
+async fn open_nested(
+    storage: &Arc<dyn Storage>,
+    option: Option<FieldOption>,
+    nested: Option<&str>,
+) -> laurus::Result<Engine> {
+    let mut schema = schema_with(option);
+    if let Some(field) = nested {
+        schema.fields.insert(
+            field.to_string(),
+            hnsw(|o| o.pq_codebook_path = Some(format!("{field}.pqcb"))),
+        );
+    }
+    Engine::new(storage.clone(), schema).await
+}
+
+/// Open the index of `embedding` in one of [`WAYS`], with its own codebook at
+/// the root and `nested` in its directory, and return why it does not use its
+/// own, if it does not.
+///
+/// Unless the way is an open, the engine is opened before the file is there,
+/// so that only the operation can come across it.
+async fn check_nested(path: &str, field: &str, nested: Nested, way: &str) -> Result<(), String> {
+    let dir = TempDir::new().unwrap();
+    let storage = file_storage(&dir);
+    let own = train(&storage, path, 1);
+    let in_schema = (nested == Nested::OfAField).then_some(field);
+    let option = hnsw(|o| o.pq_codebook_path = Some(path.to_string()));
+    let after = hnsw(|o| {
+        o.pq_codebook_path = Some(path.to_string());
+        match way {
+            "rebuilt" => o.m = 24,
+            "recreated" => o.distance = DistanceMetric::Cosine,
+            _ => {}
+        }
+    });
+    let before = match way {
+        "added" => None,
+        "rebuilt from flat" => Some(flat()),
+        _ => Some(option),
+    };
+    let mut other = None;
+    if way == "opened" {
+        other = put_nested(&storage, field, nested);
+    }
+    let engine = open_nested(&storage, before, in_schema)
+        .await
+        .map_err(|e| format!("the open failed: {e}"))?;
+    let mut expected = BTreeSet::new();
+    if way != "opened" {
+        if way != "added" {
+            put(&engine, 0..5).await;
+            engine.commit().await.unwrap();
+        }
+        other = put_nested(&storage, field, nested);
+        let changed = match way {
+            "added again" => {
+                engine.delete_field("embedding").await.unwrap();
+                engine.add_field("embedding", after.clone()).await.err()
+            }
+            "added" => engine.add_field("embedding", after.clone()).await.err(),
+            _ => engine
+                .update_field("embedding", after.clone(), REINDEX)
+                .await
+                .err(),
+        };
+        if let Some(e) = changed {
+            return Err(format!("the change failed: {e}"));
+        }
+        if way.starts_with("rebuilt") {
+            expected = ids(0..5);
+            if let Some(why) = wrong(&engine, &storage, &expected, &own).await {
+                return Err(format!("the change: {why}"));
+            }
+        }
+    }
+    for (from, to) in [(10, 30), (30, 31)] {
+        put(&engine, from..to).await;
+        engine
+            .commit()
+            .await
+            .map_err(|e| format!("the commit failed: {e}"))?;
+    }
+    expected.extend(ids(10..31));
+    if let Some(why) = wrong(&engine, &storage, &expected, &own).await {
+        return Err(format!("the commits: {why}"));
+    }
+    drop(engine);
+
+    let engine = open_nested(&storage, Some(after), in_schema)
+        .await
+        .map_err(|e| format!("the reopen failed: {e}"))?;
+    let mut doc = Document::builder().add_vector("embedding", make_vectors(1, 7)[0].data.to_vec());
+    if let Some(field) = in_schema {
+        doc = doc.add_vector(field, make_vectors(1, 8)[0].data.to_vec());
+    }
+    engine.put_document("d40", doc.build()).await.unwrap();
+    engine
+        .commit()
+        .await
+        .map_err(|e| format!("the commit after a reopen failed: {e}"))?;
+    expected.extend(ids(40..41));
+    if let Some(why) = wrong(&engine, &storage, &expected, &own).await {
+        return Err(format!("reopened: {why}"));
+    }
+    if let Some(field) = in_schema
+        && segment_codebooks_of(&storage, field) != [other]
+    {
+        return Err("the nested field does not use its own codebook".to_string());
+    }
+    Ok(())
+}
+
+/// A field takes its codebook from the root of the vector storage, however its
+/// index is opened. A codebook of the same path in its directory, where a field
+/// nested under it keeps its own, is not taken, and the nested field uses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codebook_in_the_directory_of_a_field_is_not_taken() {
+    let mut failures = Vec::new();
+    for (path, field) in NESTED {
+        for nested in [Nested::OfAField, Nested::OfNoField] {
+            for way in WAYS {
+                let result = check_nested(path, field, nested, way).await;
+                report(
+                    &mut failures,
+                    &format!("{path}, {nested:?}, {way}"),
+                    result.err(),
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A file there that cannot be read, or is of another geometry, does not fail
+/// the operation either, and so does not fail a destructive change after the
+/// data is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_in_the_directory_of_a_field_that_does_not_fit_does_not_matter() {
+    let mut failures = Vec::new();
+    let (path, field) = NESTED[0];
+    for nested in [
+        Nested::Unreadable,
+        Nested::OfAnotherShape(DIM, 8),
+        Nested::OfAnotherShape(16, M),
+    ] {
+        for way in WAYS {
+            let result = check_nested(path, field, nested, way).await;
+            report(&mut failures, &format!("{nested:?}, {way}"), result.err());
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A codebook in the directory of a field does not stand in for a missing one:
+/// the field is opened and added, and its commit fails with the command to
+/// train one, and a rebuild fails before it publishes, leaving the field as it
+/// was. Once the field's own is trained, the commit succeeds with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codebook_in_the_directory_of_a_field_does_not_stand_in_for_a_missing_one() {
+    let mut failures = Vec::new();
+    let missing = |e: &laurus::LaurusError| {
+        let message = e.to_string();
+        message.contains("no codebook has been trained")
+            && message.contains("laurus train pq-codebook")
+    };
+    for (path, field) in NESTED {
+        let option = hnsw(|o| o.pq_codebook_path = Some(path.to_string()));
+        for way in ["opened", "added"] {
+            let what = format!("{path}, {way}");
+            let dir = TempDir::new().unwrap();
+            let storage = file_storage(&dir);
+            put_nested(&storage, field, Nested::OfNoField);
+            let before = (way == "opened").then(|| option.clone());
+            let engine = open(&storage, before).await;
+            if way == "added" {
+                engine.add_field("embedding", option.clone()).await.unwrap();
+            }
+            put(&engine, 0..20).await;
+            match engine.commit().await {
+                Err(e) if missing(&e) => {}
+                other => failures.push(format!("{what}: the commit returned {other:?}")),
+            }
+            drop(engine);
+
+            let own = train(&storage, path, 1);
+            let engine = open(&storage, Some(option.clone())).await;
+            if let Err(e) = engine.commit().await {
+                failures.push(format!("{what}: trained, the commit failed: {e}"));
+            }
+            report(
+                &mut failures,
+                &format!("{what}, trained"),
+                wrong(&engine, &storage, &ids(0..20), &own).await,
+            );
+        }
+
+        let what = format!("{path}, rebuilt from flat");
+        let dir = TempDir::new().unwrap();
+        let storage = file_storage(&dir);
+        let engine = open(&storage, Some(flat())).await;
+        put(&engine, 0..20).await;
+        engine.commit().await.unwrap();
+        put_nested(&storage, field, Nested::OfNoField);
+        match engine.update_field("embedding", option, REINDEX).await {
+            Err(e) if missing(&e) => {}
+            other => failures.push(format!("{what}: {:?}", other.map(|o| o.classification))),
+        }
+        if format!("{:?}", engine.schema().fields["embedding"]) != format!("{:?}", flat()) {
+            failures.push(format!("{what}: the schema changed"));
+        }
+        put(&engine, 20..21).await;
+        engine.commit().await.unwrap();
+        if found(&engine).await != ids(0..21) {
+            failures.push(format!("{what}: documents are missing"));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
