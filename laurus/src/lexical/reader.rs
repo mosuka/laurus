@@ -3,8 +3,10 @@
 use crate::error::Result;
 use crate::lexical::core::document::Document;
 use crate::lexical::core::field::FieldValue;
+use crate::lexical::index::inverted::core::automaton::Automaton;
 use crate::lexical::index::structures::bkd_tree::BKDTree;
 use crate::lexical::index::structures::dictionary::BlockMax;
+use roaring::RoaringTreemap;
 use std::sync::Arc;
 
 /// Information about a term in the index.
@@ -214,6 +216,61 @@ pub trait LexicalIndexReader: Send + Sync + std::fmt::Debug {
     /// Returns an iterator over the documents that contain the given term
     /// in the specified field, or `None` if the term is not found.
     fn postings(&self, field: &str, term: &str) -> Result<Option<Box<dyn PostingIterator>>>;
+
+    /// The live documents that hold a term of `field` that `automaton`
+    /// matches, whatever the number of such terms (Issue #1740).
+    ///
+    /// Each segment looks the terms up in its own dictionary. A segment
+    /// without one contributes nothing.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The field whose terms are matched.
+    /// * `automaton` - Decides which terms match.
+    ///
+    /// # Returns
+    ///
+    /// The documents' ids, or `None` if this reader cannot enumerate terms
+    /// (the default).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a dictionary or a posting list cannot be read.
+    fn docs_of_matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Option<RoaringTreemap>> {
+        let _ = (field, automaton);
+        Ok(None)
+    }
+
+    /// The terms of `field` that `automaton` matches, in ascending order, each
+    /// with the number of documents that hold it (Issue #1740).
+    ///
+    /// The number counts deleted documents, as [`Self::term_doc_freq`] does.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The field whose terms are matched.
+    /// * `automaton` - Decides which terms match.
+    ///
+    /// # Returns
+    ///
+    /// The terms, or `None` if this reader cannot enumerate terms (the
+    /// default).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a dictionary cannot be read.
+    fn matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        let _ = (field, automaton);
+        Ok(None)
+    }
 
     /// Get statistics for a field.
     ///

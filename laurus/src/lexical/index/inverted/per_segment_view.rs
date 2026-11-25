@@ -47,6 +47,7 @@ use roaring::RoaringTreemap;
 
 use crate::error::Result;
 use crate::lexical::core::document::Document;
+use crate::lexical::index::inverted::core::automaton::Automaton;
 use crate::lexical::index::inverted::reader::{SegmentFieldLengths, SegmentReader};
 use crate::lexical::index::structures::bkd_tree::BKDTree;
 use crate::lexical::query::Query;
@@ -265,6 +266,26 @@ impl LexicalIndexReader for PerSegmentReaderView {
     fn postings(&self, field: &str, term: &str) -> Result<Option<Box<dyn PostingIterator>>> {
         let seg = self.segment.read().unwrap();
         seg.postings(field, term)
+    }
+
+    fn docs_of_matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Option<RoaringTreemap>> {
+        // This segment's documents only: the fanout merges the hits of each
+        // segment, so another segment's would be returned twice.
+        let seg = self.segment.read().unwrap();
+        Ok(Some(seg.docs_of_matching_terms(field, automaton)?))
+    }
+
+    fn matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        let seg = self.segment.read().unwrap();
+        Ok(Some(seg.matching_terms(field, automaton)?))
     }
 
     fn field_stats(&self, field: &str) -> Result<Option<FieldStats>> {

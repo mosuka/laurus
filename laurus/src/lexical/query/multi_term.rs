@@ -2,12 +2,25 @@
 //!
 //! This module provides traits and utilities for queries that match multiple terms,
 //! similar to Lucene's MultiTermQuery.
+//!
+//! Which documents a multi-term query matches does not depend on how it is
+//! scored (Issue #1740): its matcher covers every term its automaton matches,
+//! whatever their number, and each segment looks those terms up in its own
+//! dictionary. The [`RewriteMethod`] decides the scores: the boost for every
+//! match, or the BM25 scores of some or all of the terms. A search for the
+//! query itself returns the documents that are scored, so a method that limits
+//! the terms limits its hits too.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::lexical::index::inverted::core::terms::TermsEnum;
+use crate::lexical::index::inverted::core::automaton::Automaton;
+use crate::lexical::index::inverted::reader::InvertedIndexReader;
 use crate::lexical::query::Query;
+use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
+use crate::lexical::query::matcher::{EmptyMatcher, Matcher, PreComputedMatcher};
+use crate::lexical::query::scorer::{ConstantScorer, Scorer};
+use crate::lexical::query::term::TermQuery;
 use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches multiple terms based on some pattern or criteria.
@@ -23,24 +36,21 @@ use crate::lexical::reader::LexicalIndexReader;
 ///
 /// # Design
 ///
-/// MultiTermQuery implementations should:
-/// 1. Enumerate matching terms from the index's term dictionary
-/// 2. Apply rewrite strategies to convert to simpler queries (e.g., BooleanQuery)
-/// 3. Limit the number of expanded terms to prevent resource exhaustion
+/// An implementation says which terms match, with its
+/// [`automaton`](Self::automaton), and how the matches are scored, with its
+/// [`rewrite_method`](Self::rewrite_method).
 ///
-/// # Example (conceptual - not fully implemented yet)
+/// # Example (conceptual)
 ///
 /// ```ignore
 /// use laurus::lexical::query::multi_term::MultiTermQuery;
-/// use laurus::lexical::query::fuzzy::FuzzyQuery;
+/// use laurus::lexical::query::prefix::PrefixQuery;
 ///
-/// let fuzzy_query = FuzzyQuery::new("content", "hello").max_edits(2);
+/// let query = PrefixQuery::new("content", "hel");
 ///
-/// // The query will enumerate terms from the index that match within edit distance 2
+/// // Every term of the field that starts with "hel"
 /// let reader = index.reader()?;
-/// let matching_terms = fuzzy_query.enumerate_terms(&reader)?;
-///
-/// // Results are limited by max_expansions (default 50)
+/// let matching_terms = query.enumerate_terms(&reader)?;
 /// println!("Found {} matching terms", matching_terms.len());
 /// ```
 pub trait MultiTermQuery: Query {
@@ -50,14 +60,14 @@ pub trait MultiTermQuery: Query {
     /// Get the rewrite method.
     fn rewrite_method(&self) -> RewriteMethod;
 
-    /// Enumerate terms from the index that match this query's criteria.
+    /// Build the automaton that decides which terms this query matches.
     ///
-    /// This method should:
-    /// 1. Access the term dictionary for the field
-    /// 2. Iterate over terms that potentially match
-    /// 3. Filter terms based on the query's criteria (e.g., edit distance, pattern)
-    /// 4. Limit results to max_expansions
-    /// 5. Return terms sorted by relevance/score
+    /// # Errors
+    ///
+    /// Returns an error if the query's pattern is invalid.
+    fn automaton(&self) -> Result<Box<dyn Automaton>>;
+
+    /// Enumerate every term of the index that this query matches.
     ///
     /// # Arguments
     ///
@@ -65,232 +75,195 @@ pub trait MultiTermQuery: Query {
     ///
     /// # Returns
     ///
-    /// A vector of tuples containing:
+    /// A vector of tuples in ascending order of the terms, containing:
     /// - `term`: The matching term text
     /// - `doc_freq`: Number of documents containing this term
-    /// - `boost`: Optional boost factor for this term (default 1.0)
+    /// - `boost`: The factor of the term's score (1.0)
     ///
-    /// # Performance
+    /// It is empty if the reader cannot enumerate terms.
     ///
-    /// Implementations should use efficient term dictionary enumeration rather than
-    /// scanning all documents. See the `TermsEnum` trait for the proper API.
-    fn enumerate_terms(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<(String, u64, f32)>>;
-
-    /// Get the maximum number of terms this query will expand to.
+    /// # Errors
     ///
-    /// This prevents queries from matching too many terms and consuming
-    /// excessive resources. Default should be 50, same as Lucene.
-    fn max_expansions(&self) -> usize {
-        50
+    /// Returns an error if the automaton cannot be built or a term dictionary
+    /// cannot be read.
+    fn enumerate_terms(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<(String, u64, f32)>> {
+        let automaton = self.automaton()?;
+        let terms = reader
+            .matching_terms(MultiTermQuery::field(self), automaton.as_ref())?
+            .unwrap_or_default();
+        Ok(terms
+            .into_iter()
+            .map(|(term, doc_freq)| (term, doc_freq, 1.0))
+            .collect())
     }
 
-    /// Create a TermsEnum that filters terms according to this query's criteria.
+    /// Rewrite the query into a `BooleanQuery` of the terms its
+    /// [`rewrite_method`](Self::rewrite_method) scores: the top ones of a
+    /// method with a limit, otherwise every term.
     ///
-    /// This is the preferred method for implementing efficient multi-term queries.
-    /// Instead of enumerating all terms and filtering in memory, this creates
-    /// a TermsEnum that only yields matching terms.
+    /// # Arguments
     ///
-    /// # Example (conceptual)
+    /// * `reader` - The index reader to enumerate terms from
     ///
-    /// ```ignore
-    /// // For a FuzzyQuery:
-    /// fn get_terms_enum(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn TermsEnum>> {
-    ///     let terms = reader.terms(self.field)?;
-    ///     let automaton = LevenshteinAutomaton::build(&self.term, self.max_edits);
-    ///     Ok(Box::new(AutomatonTermsEnum::new(terms, automaton)))
-    /// }
-    /// ```
-    fn get_terms_enum(
-        &self,
-        _reader: &dyn LexicalIndexReader,
-    ) -> Result<Option<Box<dyn TermsEnum>>> {
-        // Default implementation returns None, indicating that enumerate_terms()
-        // should be used instead. Implementations should override this for better performance.
-        Ok(None)
-    }
-
-    /// Rewrite the query into a simpler form (e.g., BooleanQuery).
+    /// # Errors
+    ///
+    /// Returns an error if the terms cannot be enumerated.
     fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Query>> {
-        let rewrite_method = self.rewrite_method();
-
-        // Try to get TermsEnum
-        let terms_enum_opt = self.get_terms_enum(reader)?;
-
-        let matching_terms = if let Some(mut terms_enum) = terms_enum_opt {
-            match rewrite_method {
-                RewriteMethod::TopTermsScoring { max_expansions }
-                | RewriteMethod::TopTermsBlended { max_expansions } => {
-                    // Use priority queue to collect top terms
-                    collect_top_terms(&mut *terms_enum, max_expansions)?
-                }
-                _ => {
-                    // Collect all terms
-                    let mut terms = Vec::new();
-                    while let Some(term_stats) = terms_enum.next()? {
-                        terms.push((term_stats.term.clone(), term_stats.doc_freq, 1.0));
-                    }
-                    terms
-                }
-            }
-        } else {
-            // Fallback to legacy enumerate_terms
-            self.enumerate_terms(reader)?
-        };
-
-        if matching_terms.is_empty() {
-            // We return a BooleanQuery which will produce EmptyMatcher if empty.
-            use crate::lexical::query::boolean::BooleanQuery;
-            return Ok(Box::new(BooleanQuery::new()));
+        let mut terms = self.enumerate_terms(reader)?;
+        if let Some(limit) = self.rewrite_method().max_expansions() {
+            keep_top_terms(&mut terms, limit);
         }
-
-        use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
-        use crate::lexical::query::term::TermQuery;
-
+        // Without terms, the query produces an EmptyMatcher.
         let mut boolean_query = BooleanQuery::new();
         boolean_query.set_boost(self.boost());
-
-        match rewrite_method {
-            RewriteMethod::TopTermsScoring { .. } => {
-                for (term, _, _) in matching_terms {
-                    let term_query = TermQuery::new(MultiTermQuery::field(self).to_string(), term);
-                    boolean_query
-                        .add_clause(BooleanClause::new(Box::new(term_query), Occur::Should));
-                }
-            }
-            RewriteMethod::TopTermsBlended { .. } => {
-                // TODO: Implement proper blended scoring (adjusting IDF across terms)
-                // For now, treat same as TopTermsScoring but typically boosts might vary
-                for (term, _, _) in matching_terms {
-                    let term_query = TermQuery::new(MultiTermQuery::field(self).to_string(), term);
-                    boolean_query
-                        .add_clause(BooleanClause::new(Box::new(term_query), Occur::Should));
-                }
-            }
-            RewriteMethod::ConstantScore => {
-                for (term, _, _) in matching_terms {
-                    let term_query = TermQuery::new(MultiTermQuery::field(self).to_string(), term);
-                    boolean_query
-                        .add_clause(BooleanClause::new(Box::new(term_query), Occur::Should));
-                }
-            }
-            RewriteMethod::BooleanQuery => {
-                for (term, _, _) in matching_terms {
-                    let term_query = TermQuery::new(MultiTermQuery::field(self).to_string(), term);
-                    boolean_query
-                        .add_clause(BooleanClause::new(Box::new(term_query), Occur::Should));
-                }
-            }
+        let field = MultiTermQuery::field(self);
+        for (term, _, boost) in terms {
+            let term_query = TermQuery::new(field, term).with_boost(boost);
+            boolean_query.add_clause(BooleanClause::new(Box::new(term_query), Occur::Should));
         }
-
         Ok(Box::new(boolean_query))
     }
 }
 
-// Helper struct for priority queue
-#[derive(PartialEq)]
-struct ScoredTerm {
-    term: String,
-    doc_freq: u64,
-    boost: f32,
+/// Keep the `limit` terms that rank best: by boost, then by document
+/// frequency, then in the order of the terms.
+fn keep_top_terms(terms: &mut Vec<(String, u64, f32)>, limit: usize) {
+    if terms.len() <= limit {
+        return;
+    }
+    if limit > 0 {
+        terms.select_nth_unstable_by(limit - 1, |a, b| {
+            b.2.total_cmp(&a.2)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+    }
+    terms.truncate(limit);
 }
 
-impl Eq for ScoredTerm {}
-
-impl PartialOrd for ScoredTerm {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+/// The matcher of a multi-term query: every document that holds a term its
+/// automaton matches.
+///
+/// # Arguments
+///
+/// * `query` - The multi-term query.
+/// * `reader` - The reader whose documents are matched.
+///
+/// # Errors
+///
+/// Returns an error if the automaton cannot be built, or a dictionary or a
+/// posting list cannot be read.
+pub(crate) fn multi_term_matcher<Q: MultiTermQuery>(
+    query: &Q,
+    reader: &dyn LexicalIndexReader,
+) -> Result<Box<dyn Matcher>> {
+    let automaton = query.automaton()?;
+    let field = MultiTermQuery::field(query);
+    Ok(
+        match reader.docs_of_matching_terms(field, automaton.as_ref())? {
+            Some(docs) => Box::new(PreComputedMatcher::new(docs.iter().collect())),
+            None => Box::new(EmptyMatcher::new()),
+        },
+    )
 }
 
-impl Ord for ScoredTerm {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse doc_freq comparison: Lower DF > Higher DF
-        other
-            .doc_freq
-            .cmp(&self.doc_freq)
-            .then_with(|| self.term.cmp(&other.term)) // Tie-break by term
+/// The scorer of a multi-term query.
+///
+/// # Arguments
+///
+/// * `query` - The multi-term query.
+/// * `reader` - The reader whose documents are scored.
+///
+/// # Errors
+///
+/// Returns an error if the terms to score cannot be enumerated.
+pub(crate) fn multi_term_scorer<Q: MultiTermQuery>(
+    query: &Q,
+    reader: &dyn LexicalIndexReader,
+) -> Result<Box<dyn Scorer>> {
+    if query.rewrite_method().is_constant_score() {
+        return Ok(Box::new(ConstantScorer::with_boost(1.0, query.boost())));
     }
+    MultiTermQuery::rewrite(query, reader)?.scorer(reader)
 }
 
-fn collect_top_terms(
-    terms_enum: &mut dyn TermsEnum,
-    max_expansions: usize,
-) -> Result<Vec<(String, u64, f32)>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    let mut heap = BinaryHeap::with_capacity(max_expansions + 1);
-
-    while let Some(term_stats) = terms_enum.next()? {
-        let scored_term = ScoredTerm {
-            term: term_stats.term.clone(),
-            doc_freq: term_stats.doc_freq,
-            boost: 1.0,
-        };
-
-        heap.push(Reverse(scored_term));
-
-        if heap.len() > max_expansions {
-            heap.pop(); // Remove the smallest item (Lowest Score)
-        }
+/// What [`Query::rewrite`] returns for a multi-term query.
+///
+/// `None` for a constant score, which needs no statistics of the index, and
+/// for a reader of one segment, whose statistics are not the index's: the
+/// matcher and the scorer then work on the query itself.
+///
+/// # Arguments
+///
+/// * `query` - The multi-term query.
+/// * `reader` - The reader the search runs against.
+///
+/// # Errors
+///
+/// Returns an error if the terms cannot be enumerated.
+pub(crate) fn rewrite_multi_term<Q: MultiTermQuery>(
+    query: &Q,
+    reader: &dyn LexicalIndexReader,
+) -> Result<Option<Box<dyn Query>>> {
+    if query.rewrite_method().is_constant_score() || !reader.as_any().is::<InvertedIndexReader>() {
+        return Ok(None);
     }
-
-    let mut results = Vec::with_capacity(heap.len());
-    while let Some(Reverse(scored_term)) = heap.pop() {
-        results.push((scored_term.term, scored_term.doc_freq, scored_term.boost));
-    }
-
-    Ok(results)
+    Ok(Some(MultiTermQuery::rewrite(query, reader)?))
 }
 
 /// Rewrite strategies for multi-term queries.
 ///
-/// Similar to Lucene's RewriteMethod, these strategies determine how a
-/// multi-term query is converted into a simpler form for execution.
+/// Similar to Lucene's RewriteMethod, these strategies determine how the
+/// matches of a multi-term query are scored.
 ///
 /// # Strategies
 ///
-/// - **TopTermsRewrite**: Collect the top N scoring terms (default)
-/// - **ConstantScoreRewrite**: All matching terms get the same score
-/// - **BooleanRewrite**: Convert to BooleanQuery with all matching terms
+/// - **ConstantScore** (default): every match scores the query's boost
+/// - **TopTermsScoring** and **TopTermsBlended**: the top N terms are scored
+/// - **BooleanQuery**: every term is scored
 ///
-/// The choice of strategy affects both performance and scoring behavior.
+/// The choice affects the scores, the cost of a search, and with a limit the
+/// documents a search for the query returns. A filter uses the set of matches
+/// alone, which covers every term with each of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RewriteMethod {
-    /// Collect the top N terms by score, then create a BooleanQuery.
-    /// This is the default and most performant for scoring queries.
+    /// Score the top N terms as the clauses of a BooleanQuery: the most
+    /// frequent ones, and among equally frequent ones the first.
     ///
     /// Similar to Lucene's TopTermsScoringBooleanQueryRewrite.
     TopTermsScoring { max_expansions: usize },
 
-    /// Collect the top N terms by document frequency, assign constant score.
-    /// Good for filtering without needing accurate scores.
+    /// Score the top N terms as `TopTermsScoring` does. The document
+    /// frequencies of the terms are not blended.
     ///
     /// Similar to Lucene's TopTermsBlendedFreqScoringRewrite.
     TopTermsBlended { max_expansions: usize },
 
-    /// All matching terms get a constant score equal to the query boost.
-    /// Most efficient when you don't need term-specific scoring.
+    /// Every match scores the query's boost, whatever its term and however
+    /// many terms match.
     ///
     /// Similar to Lucene's CONSTANT_SCORE_REWRITE.
     ConstantScore,
 
-    /// Convert to BooleanQuery with all matching terms.
-    /// May hit max clause count limits for queries matching many terms.
+    /// Score every matching term as a clause of a BooleanQuery.
     ///
-    /// Similar to Lucene's SCORING_BOOLEAN_REWRITE.
+    /// The cost of a search grows faster than the number of terms, to
+    /// minutes for 10,000 terms in a large segment, and nothing limits it.
+    ///
+    /// Similar to Lucene's SCORING_BOOLEAN_REWRITE, which has a limit on the
+    /// clauses.
     BooleanQuery,
 }
 
 impl Default for RewriteMethod {
+    /// The default of a prefix, wildcard or regexp query, as in Lucene.
     fn default() -> Self {
-        // Use TopTermsBlended as default, same as Lucene's FuzzyQuery
-        RewriteMethod::TopTermsBlended { max_expansions: 50 }
+        RewriteMethod::ConstantScore
     }
 }
 
 impl RewriteMethod {
-    /// Get the maximum number of terms to expand to, if applicable.
+    /// Get the maximum number of terms that are scored, if the method has one.
     pub fn max_expansions(&self) -> Option<usize> {
         match self {
             RewriteMethod::TopTermsScoring { max_expansions } => Some(*max_expansions),
@@ -311,5 +284,40 @@ impl RewriteMethod {
             self,
             RewriteMethod::TopTermsScoring { .. } | RewriteMethod::TopTermsBlended { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boost ranks first, then the document frequency, then the order of
+    /// the terms.
+    #[test]
+    fn top_terms_rank_by_boost_then_frequency_then_term() {
+        let terms = || {
+            vec![
+                ("a".to_string(), 1, 1.0),
+                ("b".to_string(), 9, 0.5),
+                ("c".to_string(), 3, 1.0),
+                ("d".to_string(), 3, 1.0),
+                ("e".to_string(), 2, 1.0),
+            ]
+        };
+        for (limit, expected) in [
+            (0, vec![]),
+            (1, vec!["c"]),
+            (2, vec!["c", "d"]),
+            (3, vec!["c", "d", "e"]),
+            (4, vec!["a", "c", "d", "e"]),
+            (5, vec!["a", "b", "c", "d", "e"]),
+            (9, vec!["a", "b", "c", "d", "e"]),
+        ] {
+            let mut kept = terms();
+            keep_top_terms(&mut kept, limit);
+            let mut kept: Vec<&str> = kept.iter().map(|(term, _, _)| term.as_str()).collect();
+            kept.sort_unstable();
+            assert_eq!(kept, expected, "limit {limit}");
+        }
     }
 }

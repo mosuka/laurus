@@ -2789,6 +2789,7 @@ dependencies = [
  "rand 0.10.4",
  "rayon",
  "regex",
+ "regex-syntax",
  "reqwest",
  "rkyv",
  "roaring",

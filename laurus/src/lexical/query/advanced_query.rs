@@ -1317,8 +1317,6 @@ mod tests {
 
     /// #1305: a wrapped multi-term core is lowered at the top-level
     /// rewrite, so on two segments it returns what the bare query returns.
-    /// Unrewritten, the fanout's per-segment views cannot enumerate its
-    /// terms.
     #[test]
     fn wrapped_multi_term_cores_match_the_bare_queries_on_two_segments() {
         let store = store_with_segments(&[FRUIT_A, FRUIT_B]);

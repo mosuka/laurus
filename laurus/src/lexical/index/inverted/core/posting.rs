@@ -379,6 +379,26 @@ pub struct DecodedPostingList {
     pub doc_frequency: u64,
 }
 
+/// A posting list decoded as far as its doc ids (Issue #1740): the header,
+/// the skip levels and Section 1.
+#[derive(Debug)]
+pub(crate) struct DecodedDocIds {
+    /// The `"field:term"` key this posting list represents.
+    pub(crate) term: String,
+    /// Doc IDs, sorted ascending.
+    pub(crate) doc_ids: Vec<u32>,
+    /// The skip table as read; empty in a v1 list, which has none on disk.
+    skip_levels: Vec<Vec<u32>>,
+    /// Total term frequency across all documents.
+    total_frequency: u64,
+    /// Document frequency (number of documents containing this term).
+    doc_frequency: u64,
+    /// Whether any posting carries positions, in Section 4.
+    any_positions: bool,
+    /// Whether the weights, Section 3, are there.
+    any_weights: bool,
+}
+
 impl DecodedPostingList {
     /// Number of postings in this list.
     pub fn len(&self) -> usize {
@@ -498,6 +518,16 @@ enum PostingFormat {
 }
 
 impl PostingFormat {
+    /// The format a dictionary's posting-format `version` stands for: 1 and 2
+    /// by number, anything else is v3.
+    fn from_version(version: u32) -> Self {
+        match version {
+            1 => Self::V1,
+            2 => Self::V2,
+            _ => Self::V3,
+        }
+    }
+
     /// Whether the payload carries a multi-level skip table between the
     /// header and Section 1.
     ///
@@ -1048,12 +1078,40 @@ impl PostingList {
         version: u32,
         max_postings: u64,
     ) -> Result<DecodedPostingList> {
-        let format = match version {
-            1 => PostingFormat::V1,
-            2 => PostingFormat::V2,
-            _ => PostingFormat::V3,
-        };
-        Self::decode_soa_inner(reader, format, Some(max_postings))
+        Self::decode_soa_inner(
+            reader,
+            PostingFormat::from_version(version),
+            Some(max_postings),
+        )
+    }
+
+    /// Decode a posting list of a segment that holds `max_postings` documents
+    /// as far as its doc ids, for a caller that needs no more than the set of
+    /// documents (Issue #1740). `version` and `max_postings` are those of
+    /// [`Self::decode_soa_for_segment`], and so are the checks on what is
+    /// read.
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - The structured input reader positioned at a posting-list
+    ///   header. It is left after the doc ids.
+    /// * `version` - The dictionary's posting-format version.
+    /// * `max_postings` - The number of documents the segment holds, deleted
+    ///   ones included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the list cannot be read or is corrupted.
+    pub(crate) fn decode_doc_ids_for_segment<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        version: u32,
+        max_postings: u64,
+    ) -> Result<DecodedDocIds> {
+        Self::decode_doc_ids(
+            reader,
+            PostingFormat::from_version(version),
+            Some(max_postings),
+        )
     }
 
     /// Bound a posting list's declared count `n` before anything is
@@ -1174,27 +1232,17 @@ impl PostingList {
         Ok(())
     }
 
-    /// Shared decoder for every on-disk version.
-    ///
-    /// The versions differ on two independent axes, both carried by
-    /// [`PostingFormat`]: whether the **Skip levels** section is
-    /// consumed from the input stream (v2 onward; v1 rebuilds the table
-    /// from `doc_ids` at the end instead), and whether the **weights**
-    /// section is gated by an `any_weights` header byte rather than
-    /// always present (v3 onward).
+    /// Decode a posting list's header, skip levels and doc ids: the part that
+    /// [`Self::decode_soa_inner`] goes on from.
     ///
     /// # Arguments
     ///
-    /// * `reader` - The structured input reader positioned at a
-    ///   posting-list header.
-    /// * `format` - The on-disk version the stream is known to be in.
-    /// * `max_postings` - The segment's document count, when known: an upper
-    ///   bound on the list's postings (see [`Self::decode_soa_for_segment`]).
-    fn decode_soa_inner<R: StorageInput>(
+    /// Those of [`Self::decode_soa_inner`].
+    fn decode_doc_ids<R: StorageInput>(
         reader: &mut StructReader<R>,
         format: PostingFormat,
         max_postings: Option<u64>,
-    ) -> Result<DecodedPostingList> {
+    ) -> Result<DecodedDocIds> {
         let term = reader.read_string()?;
         let total_frequency = reader.read_varint()?;
         let doc_frequency = reader.read_varint()?;
@@ -1234,24 +1282,6 @@ impl PostingList {
         }
 
         let n = Self::bounded_posting_count(reader, n, any_weights, any_positions, max_postings)?;
-        if n == 0 {
-            Self::check_skip_levels(format, &disk_skip_levels, &[])?;
-            return Ok(DecodedPostingList {
-                term,
-                doc_ids: Vec::new(),
-                frequencies: Vec::new(),
-                weights: Vec::new(),
-                positions: if any_positions {
-                    Some(Vec::new())
-                } else {
-                    None
-                },
-                skip_levels: disk_skip_levels,
-                total_frequency,
-                doc_frequency,
-            });
-        }
-
         let bitpacker = BitPacker4x::new();
         let full_blocks = n / POSTING_BLOCK_LEN;
         let tail = n % POSTING_BLOCK_LEN;
@@ -1295,6 +1325,70 @@ impl PostingList {
         }
         Self::check_ascending_doc_ids(&doc_ids)?;
         Self::check_skip_levels(format, &disk_skip_levels, &doc_ids)?;
+
+        Ok(DecodedDocIds {
+            term,
+            doc_ids,
+            skip_levels: disk_skip_levels,
+            total_frequency,
+            doc_frequency,
+            any_positions,
+            any_weights,
+        })
+    }
+
+    /// Shared decoder for every on-disk version.
+    ///
+    /// The versions differ on two independent axes, both carried by
+    /// [`PostingFormat`]: whether the **Skip levels** section is
+    /// consumed from the input stream (v2 onward; v1 rebuilds the table
+    /// from `doc_ids` at the end instead), and whether the **weights**
+    /// section is gated by an `any_weights` header byte rather than
+    /// always present (v3 onward).
+    ///
+    /// # Arguments
+    ///
+    /// * `reader` - The structured input reader positioned at a
+    ///   posting-list header.
+    /// * `format` - The on-disk version the stream is known to be in.
+    /// * `max_postings` - The segment's document count, when known: an upper
+    ///   bound on the list's postings (see [`Self::decode_soa_for_segment`]).
+    fn decode_soa_inner<R: StorageInput>(
+        reader: &mut StructReader<R>,
+        format: PostingFormat,
+        max_postings: Option<u64>,
+    ) -> Result<DecodedPostingList> {
+        let DecodedDocIds {
+            term,
+            doc_ids,
+            skip_levels: disk_skip_levels,
+            total_frequency,
+            doc_frequency,
+            any_positions,
+            any_weights,
+        } = Self::decode_doc_ids(reader, format, max_postings)?;
+        let n = doc_ids.len();
+        if n == 0 {
+            return Ok(DecodedPostingList {
+                term,
+                doc_ids,
+                frequencies: Vec::new(),
+                weights: Vec::new(),
+                positions: if any_positions {
+                    Some(Vec::new())
+                } else {
+                    None
+                },
+                skip_levels: disk_skip_levels,
+                total_frequency,
+                doc_frequency,
+            });
+        }
+
+        let bitpacker = BitPacker4x::new();
+        let full_blocks = n / POSTING_BLOCK_LEN;
+        let tail = n % POSTING_BLOCK_LEN;
+        let mut buf = [0u32; POSTING_BLOCK_LEN];
 
         // Section 2: frequencies (same zero-copy block path).
         let mut frequencies: Vec<u32> = Vec::with_capacity(n);
@@ -3167,6 +3261,100 @@ mod tests {
             let decoded = PostingList::decode_soa_for_segment(&mut reader, 3, n).unwrap();
             assert_eq!(decoded.doc_ids, (0..n as u32).collect::<Vec<_>>());
         }
+    }
+
+    /// The doc ids of a list alone are those of the whole list, in every
+    /// format, with and without positions (Issue #1740).
+    #[test]
+    fn the_doc_ids_alone_are_those_of_the_whole_list() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        for n in [0u64, 1, 7, 8, 127, 128, 129, 1000] {
+            for positions in [false, true] {
+                let mut list = PostingList::new("body:t".to_string());
+                for i in 0..n {
+                    // Gaps that vary, so that the blocks differ in width.
+                    let doc_id = i * 3 + (i / 50) * 1000;
+                    list.add_posting(if positions {
+                        Posting::with_positions(doc_id, vec![1, 5])
+                    } else {
+                        Posting::with_frequency(doc_id, 2)
+                    });
+                }
+                for version in [1u32, 2, 3] {
+                    let name = format!("ids_{n}_{positions}_{version}");
+                    let mut reader = reader_over(&storage, &name, |w| {
+                        match version {
+                            1 => list.encode(w),
+                            2 => list.encode_v2(w),
+                            _ => list.encode_v3(w),
+                        }
+                        .unwrap()
+                    });
+                    let ids =
+                        PostingList::decode_doc_ids_for_segment(&mut reader, version, n).unwrap();
+                    let read = reader.position();
+                    let mut reader = StructReader::new(storage.open_input(&name).unwrap()).unwrap();
+                    let whole =
+                        PostingList::decode_soa_for_segment(&mut reader, version, n).unwrap();
+                    assert_eq!(ids.doc_ids, whole.doc_ids, "{name}");
+                    assert_eq!(ids.term, whole.term, "{name}");
+                    assert_eq!(whole.frequencies.len() as u64, n, "{name}");
+                    assert!(read < reader.position() || n == 0, "{name}");
+                }
+            }
+        }
+    }
+
+    /// What makes the doc ids of a list unreadable is refused when they are
+    /// read alone, as it is when the whole list is read (Issue #1740).
+    #[test]
+    fn corrupt_doc_ids_are_rejected_when_read_alone() {
+        let storage = MemoryStorage::new(MemoryStorageConfig::default());
+        let mut reader = reader_over(&storage, "alone_capped", |w| {
+            write_v3_header(w, 1000, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_raw(&[0u8; 2000]).unwrap();
+        });
+        assert_corrupted(
+            PostingList::decode_doc_ids_for_segment(&mut reader, 3, 10),
+            "segment holds only 10 documents",
+        );
+        let mut reader = reader_over(&storage, "alone_wide", |w| {
+            write_v3_header(w, 128, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_u8(33).unwrap(); // num_bits of the doc-id block
+            w.write_raw(&[0u8; 33 * POSTING_BLOCK_LEN / 8]).unwrap();
+        });
+        assert_corrupted(
+            PostingList::decode_doc_ids_for_segment(&mut reader, 3, 128),
+            "bits per value",
+        );
+        let mut reader = reader_over(&storage, "alone_repeated", |w| {
+            write_v3_header(w, 2, false, false);
+            w.write_u8(0).unwrap(); // num_levels
+            w.write_varint(5).unwrap(); // doc-id delta
+            w.write_varint(0).unwrap(); // a repeated doc id
+            w.write_varint(1).unwrap(); // frequency
+            w.write_varint(1).unwrap(); // frequency
+        });
+        assert_corrupted(
+            PostingList::decode_doc_ids_for_segment(&mut reader, 3, 10),
+            "not strictly ascending",
+        );
+        let mut reader = reader_over(&storage, "alone_levels", |w| {
+            write_v3_header(w, 2, false, false);
+            w.write_u8(1).unwrap(); // num_levels
+            w.write_varint(1).unwrap(); // level_len
+            w.write_u32(7).unwrap(); // an entry that two doc ids have not
+            w.write_varint(5).unwrap(); // doc-id delta
+            w.write_varint(1).unwrap(); // doc-id delta
+            w.write_varint(1).unwrap(); // frequency
+            w.write_varint(1).unwrap(); // frequency
+        });
+        assert_corrupted(
+            PostingList::decode_doc_ids_for_segment(&mut reader, 3, 10),
+            "the skip table does not match",
+        );
     }
 
     #[test]

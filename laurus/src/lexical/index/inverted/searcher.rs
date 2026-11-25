@@ -420,18 +420,18 @@ impl InvertedIndexSearcher {
         parallel: bool,
         deadline: Option<Deadline>,
     ) -> Result<C> {
-        // Query rewrite (Issue #613): lower multi-term queries (prefix /
-        // wildcard / fuzzy / regexp) into Boolean-of-TermQuery ONCE,
-        // against the top-level reader, before any gating below. This
+        // Query rewrite (Issue #613): lower multi-term queries whose terms
+        // are scored (a fuzzy one, by default) into Boolean-of-TermQuery
+        // ONCE, against the top-level reader, before any gating below. This
         // (a) halves the term-dictionary enumerations (matcher and
-        // scorer used to re-enumerate independently), and (b) hands the
-        // per-segment fanout a query it can execute — the fanout's
-        // `PerSegmentReaderView` cannot enumerate the term dictionary,
-        // which previously made raw multi-term queries return 0 hits on
-        // multi-segment indexes. `None` (nothing to rewrite, or the
-        // reader is itself a per-segment view) keeps the original query;
-        // an already-lowered query rewrites to `None`, so the fanout's
-        // recursion back into this method is a cheap no-op.
+        // scorer used to re-enumerate independently), and (b) picks the
+        // terms by the index's document frequencies, which the fanout's
+        // `PerSegmentReaderView` does not know: it enumerates its own
+        // segment's terms. `None` (nothing to rewrite, such as a
+        // constant-scored multi-term query, or the reader is itself a
+        // per-segment view) keeps the original query; an already-lowered
+        // query rewrites to `None`, so the fanout's recursion back into
+        // this method is a cheap no-op.
         let query = match query.rewrite(self.reader.as_ref())? {
             Some(rewritten) => rewritten,
             None => query,
@@ -801,13 +801,12 @@ impl InvertedIndexSearcher {
             .expect("search_field_sorted_fanout requires InvertedIndexReader");
 
         // Query rewrite (Issue #1314), as `search_with_collector_deadline`
-        // already does for the score-sorted path (#613, searcher.rs:435).
+        // already does for the score-sorted path (#613).
         // Each segment below is searched through a `PerSegmentReaderView`,
-        // which can neither enumerate the term dictionary (multi-term
-        // queries would otherwise rewrite to an always-empty
-        // `BooleanQuery`) nor see the other segments' postings (so
-        // `SynonymQuery`/`MultiFieldQuery::CombinedFields` would blend
-        // only their own segment's document frequency). Rewriting once
+        // which does not see the other segments' postings (so a multi-term
+        // query would pick its top terms, and
+        // `SynonymQuery`/`MultiFieldQuery::CombinedFields` would blend, by
+        // their own segment's document frequency only). Rewriting once
         // here, against the top-level reader, fixes both; every
         // downstream use of `query` in this function (and the pruning
         // branch's `count_matches_only` call) picks it up via closure

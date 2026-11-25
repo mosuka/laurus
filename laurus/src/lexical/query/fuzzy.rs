@@ -5,11 +5,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::lexical::index::inverted::core::automaton::LevenshteinAutomaton;
-use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
-use crate::lexical::index::inverted::reader::InvertedIndexReader;
+use crate::lexical::index::inverted::core::automaton::{Automaton, LevenshteinAutomaton};
 use crate::lexical::query::matcher::Matcher;
-use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
+use crate::lexical::query::multi_term::{
+    MultiTermQuery, RewriteMethod, multi_term_matcher, multi_term_scorer, rewrite_multi_term,
+};
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
@@ -47,7 +47,8 @@ impl FuzzyQuery {
             transpositions: true,
             max_expansions: 50, // Same default as Lucene
             boost: 1.0,
-            rewrite_method: RewriteMethod::default(),
+            // Every matching term is scored; `max_expansions` is not read yet.
+            rewrite_method: RewriteMethod::BooleanQuery,
         }
     }
 
@@ -124,32 +125,9 @@ impl FuzzyQuery {
         self.rewrite_method
     }
 
-    /// Find matching terms using efficient term dictionary enumeration.
-    ///
-    /// This uses the Term Dictionary API and Levenshtein Automaton for efficient matching,
-    /// similar to Lucene's FuzzyTermsEnum approach.
-    ///
-    /// Falls back to legacy document scanning if Term Dictionary API is not available.
-    fn get_terms_enum(
-        &self,
-        reader: &dyn LexicalIndexReader,
-    ) -> Result<Option<Box<dyn TermsEnum>>> {
-        if let Some(inverted_reader) = reader.as_any().downcast_ref::<InvertedIndexReader>()
-            && let Some(terms) = inverted_reader.terms(&self.field)?
-        {
-            let terms_enum =
-                crate::lexical::index::inverted::core::automaton::AutomatonTermsEnum::new(
-                    terms.iterator()?,
-                    self.automaton(),
-                );
-            return Ok(Some(Box::new(terms_enum)));
-        }
-        Ok(None)
-    }
-
     /// The edit-distance automaton this query enumerates terms with — and
     /// what the highlighter tests tokens against (#594).
-    fn automaton(&self) -> LevenshteinAutomaton {
+    fn levenshtein(&self) -> LevenshteinAutomaton {
         LevenshteinAutomaton::new(
             &self.term,
             self.max_edits,
@@ -168,27 +146,18 @@ impl MultiTermQuery for FuzzyQuery {
         self.rewrite_method
     }
 
-    fn enumerate_terms(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<(String, u64, f32)>> {
-        let mut results = Vec::new();
-        if let Some(mut terms_enum) = self.get_terms_enum(reader)? {
-            while let Some(term_stats) = terms_enum.next()? {
-                // TODO: Calculate actual similarity score if needed
-                results.push((term_stats.term.clone(), term_stats.doc_freq, 1.0));
-            }
-        }
-        Ok(results)
+    fn automaton(&self) -> Result<Box<dyn Automaton>> {
+        Ok(Box::new(self.levenshtein()))
     }
 }
 
 impl Query for FuzzyQuery {
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        let rewritten = MultiTermQuery::rewrite(self, reader)?;
-        rewritten.matcher(reader)
+        multi_term_matcher(self, reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        let rewritten = MultiTermQuery::rewrite(self, reader)?;
-        rewritten.scorer(reader)
+        multi_term_scorer(self, reader)
     }
 
     fn boost(&self) -> f32 {
@@ -220,18 +189,7 @@ impl Query for FuzzyQuery {
     }
 
     fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Option<Box<dyn Query>>> {
-        // Lower once at the searcher level (Issue #613). When the reader
-        // cannot enumerate terms (e.g. the per-segment fanout view), keep
-        // the original query so the matcher/scorer fallback stays in
-        // charge; probing via the downcast costs nothing extra.
-        if reader
-            .as_any()
-            .downcast_ref::<InvertedIndexReader>()
-            .is_none()
-        {
-            return Ok(None);
-        }
-        Ok(Some(MultiTermQuery::rewrite(self, reader)?))
+        rewrite_multi_term(self, reader)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -244,7 +202,7 @@ impl Query for FuzzyQuery {
 
     fn collect_highlight_terms(&self, field: Option<&str>, out: &mut Vec<HighlightTerm>) {
         if !self.term.is_empty() && field.is_none_or(|f| f == self.field) {
-            out.push(HighlightTerm::Fuzzy(self.automaton()));
+            out.push(HighlightTerm::Fuzzy(self.levenshtein()));
         }
     }
 

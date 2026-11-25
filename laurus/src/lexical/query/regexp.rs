@@ -7,11 +7,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LaurusError, Result};
-use crate::lexical::index::inverted::core::automaton::{AutomatonTermsEnum, RegexAutomaton};
-use crate::lexical::index::inverted::core::terms::{TermDictionaryAccess, TermsEnum};
-use crate::lexical::index::inverted::reader::InvertedIndexReader;
+use crate::lexical::index::inverted::core::automaton::{Automaton, RegexAutomaton};
 use crate::lexical::query::matcher::Matcher;
-use crate::lexical::query::multi_term::{MultiTermQuery, RewriteMethod};
+use crate::lexical::query::multi_term::{
+    MultiTermQuery, RewriteMethod, multi_term_matcher, multi_term_scorer, rewrite_multi_term,
+};
 use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query};
 use crate::lexical::reader::LexicalIndexReader;
@@ -81,40 +81,12 @@ impl MultiTermQuery for RegexpQuery {
         self.rewrite_method
     }
 
-    fn get_terms_enum(
-        &self,
-        reader: &dyn LexicalIndexReader,
-    ) -> Result<Option<Box<dyn TermsEnum>>> {
-        if let Some(inverted_reader) = reader.as_any().downcast_ref::<InvertedIndexReader>()
-            && let Some(terms) = inverted_reader.terms(&self.field)?
-        {
-            let regex_automaton = if let Some(regex) = &self.regex {
-                RegexAutomaton::from_regex(regex.as_ref().clone(), self.pattern.clone())
-            } else {
-                RegexAutomaton::new(&self.pattern)?
-            };
-
-            let terms_enum = AutomatonTermsEnum::new(terms.iterator()?, regex_automaton);
-            return Ok(Some(Box::new(terms_enum)));
-        }
-        Ok(None)
-    }
-
-    fn enumerate_terms(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<(String, u64, f32)>> {
-        if let Some(mut terms_enum) = self.get_terms_enum(reader)? {
-            let mut results = Vec::new();
-            let max = self.rewrite_method.max_expansions();
-            while let Some(term_stats) = terms_enum.next()? {
-                results.push((term_stats.term.clone(), term_stats.doc_freq, 1.0));
-                if let Some(m) = max
-                    && results.len() >= m
-                {
-                    break;
-                }
-            }
-            return Ok(results);
-        }
-        Ok(Vec::new())
+    fn automaton(&self) -> Result<Box<dyn Automaton>> {
+        Ok(Box::new(match &self.regex {
+            Some(regex) => RegexAutomaton::from_regex(regex.as_ref().clone(), self.pattern.clone()),
+            // A deserialized query has not been compiled.
+            None => RegexAutomaton::new(&self.pattern)?,
+        }))
     }
 }
 
@@ -124,13 +96,11 @@ impl Query for RegexpQuery {
     }
 
     fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
-        let rewritten = MultiTermQuery::rewrite(self, reader)?;
-        rewritten.matcher(reader)
+        multi_term_matcher(self, reader)
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        let rewritten = MultiTermQuery::rewrite(self, reader)?;
-        rewritten.scorer(reader)
+        multi_term_scorer(self, reader)
     }
 
     fn boost(&self) -> f32 {
@@ -161,18 +131,7 @@ impl Query for RegexpQuery {
     }
 
     fn rewrite(&self, reader: &dyn LexicalIndexReader) -> Result<Option<Box<dyn Query>>> {
-        // Lower once at the searcher level (Issue #613). When the reader
-        // cannot enumerate terms (e.g. the per-segment fanout view), keep
-        // the original query so the matcher/scorer fallback stays in
-        // charge; probing via the downcast costs nothing extra.
-        if reader
-            .as_any()
-            .downcast_ref::<InvertedIndexReader>()
-            .is_none()
-        {
-            return Ok(None);
-        }
-        Ok(Some(MultiTermQuery::rewrite(self, reader)?))
+        rewrite_multi_term(self, reader)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -184,7 +143,7 @@ impl Query for RegexpQuery {
             return;
         }
         // `regex` is `None` after deserialization; recompile like
-        // `get_terms_enum` does.
+        // `automaton` does.
         let regex = match &self.regex {
             Some(regex) => Arc::clone(regex),
             None => match Regex::new(&self.pattern) {

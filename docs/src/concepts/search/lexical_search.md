@@ -126,6 +126,22 @@ let query = RegexpQuery::new("version", r"^v\d+\.\d+")?;
 
 > **Note:** `RegexpQuery::new()` returns `Result` because the regex pattern is validated at construction time. Invalid patterns will produce an error.
 
+#### Matches and scores of wildcard, prefix and regexp queries
+
+A `WildcardQuery`, `PrefixQuery` or `RegexpQuery` matches every document that has a matching term, however many terms match. Until Issue #1740 it found only the documents of 50 of the terms, the least frequent ones, and as a `MustNot` clause excluded only those.
+
+They are **constant-scored**, as in Lucene: every match receives the query's boost (`1.0` by default), since how frequent a term is says little about how well it fits a pattern. `with_rewrite_method` selects another scoring:
+
+| `RewriteMethod` | Score | Hits of a search for the query |
+| :--- | :--- | :--- |
+| `ConstantScore` (default) | The boost | Every match |
+| `TopTermsScoring { max_expansions }`, `TopTermsBlended { max_expansions }` | BM25 of the `max_expansions` most frequent matching terms | The documents that have one of these terms |
+| `BooleanQuery` | BM25 of every matching term | Every match; the cost grows faster than the number of terms, to minutes for 10,000 terms in a large segment |
+
+A filter uses the matches without their scores, so it covers every matching term with each method.
+
+The cost of a search grows with the number of terms that match and of the documents that have them. A wildcard that starts with `?` or `*`, and a regexp with no literal text after a leading `^`, are compared with every term of the field.
+
 ### NumericRangeQuery
 
 Matches documents with numeric field values within a range.
@@ -328,6 +344,10 @@ Lexical search results are scored using **BM25**. The score reflects how relevan
 - Higher term frequency in the document increases the score
 - Rarer terms across the index increase the score
 - Shorter documents are boosted relative to longer ones
+
+Wildcard, prefix, regexp and range queries are constant-scored instead: every match receives the query's boost.
+
+Hits with the same score are returned in ascending order of their internal document ids, the order in which the documents were written, so the pages of a search do not overlap while the index does not change (Issue #1740).
 
 ### Field Boosts
 

@@ -11,13 +11,14 @@ use std::sync::{Arc, OnceLock, RwLock};
 use ahash::AHashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::analysis::analyzer::analyzer::Analyzer;
 use crate::analysis::analyzer::standard::StandardAnalyzer;
 use crate::error::{LaurusError, Result};
 use crate::lexical::core::document::Document;
 use crate::lexical::core::field::FieldValue;
+use crate::lexical::index::inverted::core::automaton::Automaton;
 use crate::lexical::index::inverted::core::posting::{DecodedPostingList, Posting, PostingList};
 use crate::lexical::index::inverted::core::terms::{
     InvertedIndexTerms, MergedInvertedIndexTerms, TermDictionaryAccess, Terms,
@@ -869,6 +870,22 @@ impl SegmentCore {
     }
 }
 
+/// Where the decode of a posting list ended, in the `.post` part.
+enum DecodedEnd {
+    /// The whole list was decoded.
+    OfList(u64),
+    /// The list was decoded as far as its doc ids (Issue #1740).
+    OfDocIds(u64),
+}
+
+/// The set of `ids`, which ascend strictly.
+fn ascending_bitmap(ids: &[u32]) -> RoaringBitmap {
+    RoaringBitmap::from_sorted_iter(ids.iter().copied()).unwrap_or_else(|_| {
+        debug_assert!(false, "the ids must ascend strictly");
+        ids.iter().copied().collect()
+    })
+}
+
 impl SegmentReader {
     /// Return a reference to the segment metadata.
     ///
@@ -1606,18 +1623,17 @@ impl SegmentReader {
             // A list that decodes must still be the one the dictionary
             // entry describes, inside this segment (Issue #1235).
             .and_then(|decoded| {
-                self.check_posting_list(&decoded, field, term, &term_info, reader.position())?;
+                self.check_posting_list(
+                    &decoded.term,
+                    &decoded.doc_ids,
+                    field,
+                    term,
+                    &term_info,
+                    DecodedEnd::OfList(reader.position()),
+                )?;
                 Ok(decoded)
             })
-            // Name the segment and term a corruption was found in; other
-            // errors (I/O) keep their variant.
-            .map_err(|e| match e {
-                LaurusError::Index(msg) => LaurusError::Index(format!(
-                    "segment {}: {field}:{term}: {msg}",
-                    self.info.segment_id
-                )),
-                other => other,
-            })?;
+            .map_err(|e| self.name_corruption(field, term, e))?;
             let filtered = self.filter_deleted_soa(decoded)?;
 
             if filtered.is_empty() {
@@ -1646,6 +1662,156 @@ impl SegmentReader {
         }
     }
 
+    /// Name the segment and the term a corruption was found in; other errors
+    /// (I/O) keep their variant.
+    fn name_corruption(&self, field: &str, term: &str, error: LaurusError) -> LaurusError {
+        match error {
+            LaurusError::Index(msg) => LaurusError::Index(format!(
+                "segment {}: {field}:{term}: {msg}",
+                self.info.segment_id
+            )),
+            other => other,
+        }
+    }
+
+    /// Call `f` with each term of `field` that `automaton` matches, in
+    /// ascending order, and its entry in this segment's dictionary (Issue
+    /// #1740). A segment without a dictionary has none.
+    ///
+    /// Only the terms with the automaton's prefix are visited, and no term is
+    /// copied.
+    fn for_each_matching_term(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+        mut f: impl FnMut(&str, &TermInfo, &BlockTermDictionary) -> Result<()>,
+    ) -> Result<()> {
+        let Some(dictionary) = self.loaded_term_dictionary()? else {
+            return Ok(());
+        };
+        let mut start = format!("{field}:");
+        let term_at = start.len();
+        if let Some(prefix) = automaton.initial_seek_term() {
+            start.push_str(&prefix);
+        }
+        let mut index = dictionary.seek_index(&start);
+        while let Some((key, info)) = dictionary.entry_at(index) {
+            if !key.starts_with(&start) {
+                break;
+            }
+            let term = &key[term_at..];
+            if automaton.matches(term) {
+                f(term, info, &dictionary)?;
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    /// The terms of `field` that `automaton` matches, in ascending order, each
+    /// with the number of documents of this segment that hold it, deleted ones
+    /// included (Issue #1740).
+    pub(crate) fn matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut terms = Vec::new();
+        self.for_each_matching_term(field, automaton, |term, info, _| {
+            terms.push((term.to_string(), info.doc_frequency));
+            Ok(())
+        })?;
+        Ok(terms)
+    }
+
+    /// The live documents of this segment that hold a term of `field` that
+    /// `automaton` matches (Issue #1740).
+    ///
+    /// The posting lists are read as far as their doc ids, past the posting
+    /// cache: the lists of a broad expansion would push those of other queries
+    /// out of it. The deletions taken off are this segment's own, since another
+    /// segment may hold a live version of a document that is deleted here
+    /// (Issue #1211).
+    pub(crate) fn docs_of_matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<RoaringTreemap> {
+        /// Doc ids of short lists gathered before they are sorted into the set.
+        const BATCH: usize = 1 << 16;
+        /// A list of this many doc ids or more goes into the set on its own.
+        const LONG: usize = 1 << 10;
+
+        let postings_file = format!("{}.post", self.info.segment_id);
+        if !self.core.storage.file_exists(&postings_file) {
+            // No postings part: `postings` answers from the stored documents
+            // (Issue #1196).
+            let mut docs = RoaringTreemap::new();
+            self.for_each_matching_term(field, automaton, |term, _, _| {
+                if let Some(mut postings) = self.postings(field, term)? {
+                    while postings.next()? {
+                        docs.insert(postings.doc_id());
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok(docs);
+        }
+
+        let mut docs = RoaringBitmap::new();
+        let mut batch: Vec<u32> = Vec::new();
+        let flush = |batch: &mut Vec<u32>, docs: &mut RoaringBitmap| {
+            batch.sort_unstable();
+            batch.dedup();
+            *docs |= ascending_bitmap(batch);
+            batch.clear();
+        };
+        let mut reader = None;
+        self.for_each_matching_term(field, automaton, |term, info, dictionary| {
+            let reader = match &mut reader {
+                Some(reader) => reader,
+                None => {
+                    let input = self.core.storage.open_input(&postings_file)?;
+                    reader.insert(StructReader::new(input)?)
+                }
+            };
+            reader.seek(std::io::SeekFrom::Start(info.posting_offset))?;
+            let list = PostingList::decode_doc_ids_for_segment(
+                reader,
+                dictionary.posting_format_version(),
+                self.info.doc_count,
+            )
+            .and_then(|list| {
+                self.check_posting_list(
+                    &list.term,
+                    &list.doc_ids,
+                    field,
+                    term,
+                    info,
+                    DecodedEnd::OfDocIds(reader.position()),
+                )?;
+                Ok(list)
+            })
+            .map_err(|e| self.name_corruption(field, term, e))?;
+            if list.doc_ids.len() >= LONG {
+                docs |= ascending_bitmap(&list.doc_ids);
+            } else {
+                batch.extend_from_slice(&list.doc_ids);
+                if batch.len() >= BATCH {
+                    flush(&mut batch, &mut docs);
+                }
+            }
+            Ok(())
+        })?;
+        flush(&mut batch, &mut docs);
+
+        let docs = RoaringTreemap::from_bitmaps([(0, docs)]);
+        Ok(match self.deletions() {
+            Some(deleted) => docs - deleted.ids(),
+            None => docs,
+        })
+    }
+
     /// Check a posting list decoded for `field:term` against the dictionary
     /// entry that located it and against this segment (Issue #1235).
     ///
@@ -1657,33 +1823,33 @@ impl SegmentReader {
     /// its posting count, derives the block-max entries from the same
     /// postings, and the segment's id range from the documents it writes.
     ///
-    /// `end` is the reader's position after the decode. Positions are
-    /// relative to the `.post` part in both layouts: a compound container
-    /// serves the part through a window that seeks and reports positions
-    /// relative to the part's start, as the writer's were.
+    /// `key` and `doc_ids` are the list's own, and `end` is the reader's
+    /// position after the decode. Positions are relative to the `.post` part
+    /// in both layouts: a compound container serves the part through a window
+    /// that seeks and reports positions relative to the part's start, as the
+    /// writer's were.
     fn check_posting_list(
         &self,
-        decoded: &DecodedPostingList,
+        key: &str,
+        doc_ids: &[u32],
         field: &str,
         term: &str,
         term_info: &TermInfo,
-        end: u64,
+        end: DecodedEnd,
     ) -> Result<()> {
         // A dictionary offset that points at another term's list decodes
         // cleanly, so the list's own key is compared.
-        if decoded
-            .term
+        if key
             .strip_prefix(field)
             .and_then(|rest| rest.strip_prefix(':'))
             != Some(term)
         {
             return Err(LaurusError::index(format!(
-                "posting list: the dictionary entry leads to the list of {:?} — segment is \
-                 corrupted",
-                decoded.term
+                "posting list: the dictionary entry leads to the list of {key:?} — segment is \
+                 corrupted"
             )));
         }
-        let n = decoded.doc_ids.len();
+        let n = doc_ids.len();
         if n as u64 != term_info.doc_frequency {
             return Err(LaurusError::index(format!(
                 "posting list: holds {n} postings but the dictionary declares {} documents — \
@@ -1693,8 +1859,18 @@ impl SegmentReader {
         }
         // A corrupt byte can change how much the decoder reads — a varint
         // continuation bit, a block's bit width — and leave a list that
-        // still parses, with its values shifted. Only its end tells.
-        if end.checked_sub(term_info.posting_offset) != Some(term_info.posting_length) {
+        // still parses, with its values shifted. Only its end tells. A list
+        // read as far as its doc ids ends inside its span.
+        let (end, whole) = match end {
+            DecodedEnd::OfList(end) => (end, true),
+            DecodedEnd::OfDocIds(end) => (end, false),
+        };
+        let within = end
+            .checked_sub(term_info.posting_offset)
+            .is_some_and(|read| {
+                read == term_info.posting_length || (!whole && read < term_info.posting_length)
+            });
+        if !within {
             return Err(LaurusError::index(format!(
                 "posting list: the decode ended at byte {end}, but the dictionary places the list \
                  at byte {} with {} bytes — segment is corrupted",
@@ -1704,7 +1880,7 @@ impl SegmentReader {
         // The doc ids are strictly ascending (the decoder checks it), so the
         // ends bound the rest. An id outside the range is not this segment's
         // document.
-        if let (Some(&first), Some(&last)) = (decoded.doc_ids.first(), decoded.doc_ids.last()) {
+        if let (Some(&first), Some(&last)) = (doc_ids.first(), doc_ids.last()) {
             if u64::from(first) < self.info.min_doc_id {
                 return Err(LaurusError::index(format!(
                     "posting list: doc id {first} is below the segment's min_doc_id {} — \
@@ -1743,7 +1919,7 @@ impl SegmentReader {
             }
             for (i, entry) in block_max.iter().enumerate() {
                 // `i < blocks` and `n > 0` here, so the index is in range.
-                let block_last = decoded.doc_ids[((i + 1) * BLOCK_SIZE).min(n) - 1];
+                let block_last = doc_ids[((i + 1) * BLOCK_SIZE).min(n) - 1];
                 if entry.last_doc_id != u64::from(block_last) {
                     return Err(LaurusError::index(format!(
                         "posting list: block-max entry {i} ends at doc id {}, but block {i} of \
@@ -3036,6 +3212,40 @@ impl crate::lexical::reader::LexicalIndexReader for InvertedIndexReader {
         } else {
             Ok(None)
         }
+    }
+
+    fn docs_of_matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Option<RoaringTreemap>> {
+        self.check_closed()?;
+        let mut docs = RoaringTreemap::new();
+        for segment in &self.segment_readers {
+            docs |= segment
+                .read()
+                .unwrap()
+                .docs_of_matching_terms(field, automaton)?;
+        }
+        Ok(Some(docs))
+    }
+
+    fn matching_terms(
+        &self,
+        field: &str,
+        automaton: &dyn Automaton,
+    ) -> Result<Option<Vec<(String, u64)>>> {
+        self.check_closed()?;
+        let mut terms: BTreeMap<String, u64> = BTreeMap::new();
+        for segment in &self.segment_readers {
+            for (term, doc_freq) in segment.read().unwrap().matching_terms(field, automaton)? {
+                // Saturating: an on-disk statistic a corrupt segment can push
+                // past u64 (Issue #1224).
+                let total = terms.entry(term).or_default();
+                *total = total.saturating_add(doc_freq);
+            }
+        }
+        Ok(Some(terms.into_iter().collect()))
     }
 
     fn postings(
@@ -4791,23 +5001,10 @@ mod tests {
         };
         let segment = SegmentReader::open(understated, storage).unwrap();
         segment.set_term_dictionary(dictionary);
-        match segment.postings("body", "alpha") {
-            Err(LaurusError::Index(msg)) => {
-                assert!(
-                    msg.contains(
-                        "posting list: header declares 3 postings but the segment holds only 1 \
-                         documents"
-                    ),
-                    "{msg}"
-                );
-                assert!(
-                    msg.contains("body:alpha"),
-                    "the error names the term: {msg}"
-                );
-            }
-            Err(other) => panic!("expected Index error, got {other:?}"),
-            Ok(_) => panic!("a list longer than its segment must be rejected"),
-        }
+        assert_alpha_rejected(
+            &segment,
+            "posting list: header declares 3 postings but the segment holds only 1 documents",
+        );
     }
 
     /// Writes one segment of three documents, each holding `body:alpha`,
@@ -5012,10 +5209,24 @@ mod tests {
         entries
     }
 
+    /// The documents of `body` terms that start with `prefix`.
+    fn docs_with_prefix(segment: &SegmentReader, prefix: &str) -> Result<Vec<u64>> {
+        use crate::lexical::index::inverted::core::automaton::PrefixAutomaton;
+
+        let docs = segment.docs_of_matching_terms("body", &PrefixAutomaton::new(prefix))?;
+        Ok(docs.iter().collect())
+    }
+
     /// Asserts that `body:alpha`'s postings are refused as corruption with a
-    /// message naming the segment, the term and `what`.
+    /// message naming the segment, the term and `what`, read whole and as far
+    /// as their doc ids (Issue #1740).
     fn assert_alpha_rejected(segment: &SegmentReader, what: &str) {
-        match segment.postings("body", "alpha") {
+        assert_rejected(segment, what, segment.postings("body", "alpha").map(|_| ()));
+        assert_rejected(segment, what, docs_with_prefix(segment, "al").map(|_| ()));
+    }
+
+    fn assert_rejected(segment: &SegmentReader, what: &str, read: Result<()>) {
+        match read {
             Err(LaurusError::Index(msg)) => {
                 assert!(msg.contains(what), "{msg}");
                 assert!(msg.contains("segment is corrupted"), "{msg}");
@@ -5052,6 +5263,26 @@ mod tests {
                 open_with_dictionary(&storage, info, with_alpha_entry(&dictionary, |_| {}));
             assert_eq!(posting_entries(&rebuilt, "body", "alpha"), all);
             assert_eq!(posting_entries(&rebuilt, "body", "beta"), every_second);
+
+            let ids = |entries: &[(u64, u64)]| -> Vec<u64> {
+                entries.iter().map(|(id, _)| *id).collect()
+            };
+            for segment in [&loaded, &rebuilt] {
+                for (prefix, expected) in [
+                    ("", ids(&all)),
+                    ("a", ids(&all)),
+                    ("alpha", ids(&all)),
+                    ("b", ids(&every_second)),
+                    ("alphabet", Vec::new()),
+                    ("c", Vec::new()),
+                ] {
+                    assert_eq!(
+                        docs_with_prefix(segment, prefix).unwrap(),
+                        expected,
+                        "{prefix}"
+                    );
+                }
+            }
         }
     }
 
@@ -5097,15 +5328,22 @@ mod tests {
             let doctored =
                 with_alpha_entry(&dictionary, |alpha| alpha.posting_length = doctored_length);
             let segment = open_with_dictionary(&storage, info.clone(), doctored);
-            assert_alpha_rejected(
+            assert_rejected(
                 &segment,
                 &format!(
                     "the decode ended at byte {}, but the dictionary places the list at byte \
                      {offset} with {doctored_length} bytes",
                     offset + length
                 ),
+                segment.postings("body", "alpha").map(|_| ()),
             );
+            // The doc ids end before either.
+            assert_eq!(docs_with_prefix(&segment, "alpha").unwrap().len(), 200);
         }
+        // Doc ids that go past the recorded span (Issue #1740).
+        let doctored = with_alpha_entry(&dictionary, |alpha| alpha.posting_length = 20);
+        let segment = open_with_dictionary(&storage, info, doctored);
+        assert_alpha_rejected(&segment, "with 20 bytes");
     }
 
     /// A doc id outside the segment's `[min_doc_id, max_doc_id]` is not the
