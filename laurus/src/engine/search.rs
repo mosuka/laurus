@@ -33,8 +33,8 @@ pub enum SearchQuery {
     ///
     /// Supports lexical, vector, and hybrid queries in a single string:
     ///
-    /// - **Lexical**: `title:hello`, `"exact phrase"`, `AND`/`OR`, `term~2`,
-    ///   `[a TO z]`, etc.
+    /// - **Lexical**: `title:hello`, `"exact phrase"`, `AND`/`OR`/`NOT` in
+    ///   capitals, `term~2`, `[a TO z]`, etc.
     /// - **Vector**: `field:"text"`, `field:text^0.8` (with boost).
     /// - **Hybrid**: mix both — `title:hello content:"cute kitten"^0.8`.
     Dsl(String),

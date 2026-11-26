@@ -9,7 +9,8 @@
 //! Vector fields are identified by schema — any `field:value` clause where
 //! `field` is a vector field is routed to the vector parser:
 //!
-//! - **Lexical**: Standard query syntax (`title:hello`, `"phrase"`, `AND`/`OR`, etc.)
+//! - **Lexical**: Standard query syntax (`title:hello`, `"phrase"`, `AND`/`OR`/`NOT` in
+//!   capitals, etc.)
 //! - **Vector**: `field:"text"` or `field:text` where `field` is a vector field
 //!
 //! # Examples
@@ -486,9 +487,16 @@ impl UnifiedQueryParser {
 /// 2. Remove empty groups (`( )`, optionally `+`/`-` prefixed) left behind
 ///    when a vector clause is extracted from inside a boolean group, e.g.
 ///    `+(embedding:"...")` → `+( )` (GitHub issue #983)
-/// 3. Remove leading/trailing boolean operators (AND, OR)
+/// 3. Remove leading/trailing boolean operators (`AND`, `OR`)
 /// 4. Collapse consecutive boolean operators (AND AND → AND)
+///
+/// Only `AND` and `OR` in capitals are operators (Issue #1747), so an `and`
+/// or `Or` is a term and stays. A `NOT` stays too: a `-` or `NOT` before a
+/// vector clause is not handled here.
 fn clean_lexical_string(s: &str) -> String {
+    // The lexical grammar's `boolean_op`, which takes them only in capitals.
+    let is_boolean_op = |token: &str| token == "AND" || token == "OR";
+
     static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
     static EMPTY_GROUP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[+-]?\(\s*\)").unwrap());
 
@@ -517,12 +525,12 @@ fn clean_lexical_string(s: &str) -> String {
     let mut result: Vec<&str> = Vec::new();
 
     for token in &tokens {
-        if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") {
+        if is_boolean_op(token) {
             // Only add boolean operator if there's a preceding non-boolean token
             // and the previous token is not already a boolean operator.
             if !result.is_empty() {
                 let last = result.last().unwrap();
-                if !last.eq_ignore_ascii_case("AND") && !last.eq_ignore_ascii_case("OR") {
+                if !is_boolean_op(last) {
                     result.push(token);
                 }
                 // else: skip consecutive boolean operator
@@ -535,7 +543,7 @@ fn clean_lexical_string(s: &str) -> String {
 
     // Remove trailing boolean operator
     if let Some(last) = result.last()
-        && (last.eq_ignore_ascii_case("AND") || last.eq_ignore_ascii_case("OR"))
+        && is_boolean_op(last)
     {
         result.pop();
     }
@@ -1025,6 +1033,19 @@ mod tests {
         assert_eq!(
             clean_lexical_string("hello AND OR world"),
             "hello AND world"
+        );
+    }
+
+    /// Issue #1747: only `AND` and `OR` in capitals are operators, so an
+    /// `and` or `or` in another case is a term and stays, at an edge or
+    /// next to an operator.
+    #[test]
+    fn test_clean_keeps_and_or_in_another_case() {
+        assert_eq!(clean_lexical_string("and hello or"), "and hello or");
+        assert_eq!(clean_lexical_string("Or hello And"), "Or hello And");
+        assert_eq!(
+            clean_lexical_string("hello AND and world"),
+            "hello AND and world"
         );
     }
 

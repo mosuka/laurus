@@ -41,12 +41,14 @@ title:hello
 
 ### ブーリアン演算子
 
-`AND` と `OR`（大文字小文字を区別しない）で句を結合します。
+大文字で書いた `AND` と `OR` で句を結合します。
 
 ```text
 title:hello AND body:world
 title:hello OR title:goodbye
 ```
+
+`AND`・`OR`・[`NOT`](#必須--禁止句) は、Lucene のクエリパーサーと同じく、大文字で書いた独立した語のときだけ演算子です。`and`・`Or`・`ANDROID`・`NOTE` は語として検索します。以前は大文字小文字を問わず演算子として読み、ほかの句の後ではこれらで始まる語を分けていたため、`apple android` は `apple AND roid`、`apple orange` は `apple OR ange` を検索していました（Issue #1747）。
 
 `AND` は対称的に動作します。両側の句を必須（`Must`）にマークするため、`title:hello AND body:world` は **両方** の句にマッチするドキュメントだけを返します。連鎖（`a AND b AND c`）でも 3 つすべてが必須となります。ただし `+`（必須）または `-`（禁止）が明示されている句は元の意図が維持され、`AND` で上書きされることはありません。
 
@@ -60,7 +62,17 @@ title:hello OR title:goodbye
 +title:hello -title:goodbye
 ```
 
-`-title:goodbye` のように `-` の句だけのクエリは、ほかのすべてのドキュメントにマッチし、Elasticsearch と同じく、どのドキュメントのスコアも 0 です。除外する句はスコアを持ちません（Issue #1744）。以前は、1 つのドキュメントに 1 回だけ現れる語のスコアを付けていて、その値はインデックスが大きいほど大きくなりました。
+大文字の `NOT` は、`-` と同じく、後ろの句を禁止します（Issue #1747）。
+
+```text
+title:hello NOT title:goodbye
+title:hello AND NOT title:goodbye
+NOT (title:hello OR title:goodbye)
+```
+
+`a NOT b` と `a OR NOT b` は `a -b`、`a AND NOT b` は `+a -b` と同じです。後ろに句のない `NOT` は語です。この語そのものを検索するには、小文字で書く（`not`）か、引用符で囲む（`"NOT"`）か、フィールド名の後に書きます（`title:NOT`）。`StandardAnalyzer` は `not` を stop word として除くので、この語を持てるのは、それを残す analyzer のフィールドだけです。
+
+`-title:goodbye` のように `-` または `NOT` の句だけのクエリは、ほかのすべてのドキュメントにマッチし、Elasticsearch と同じく、どのドキュメントのスコアも 0 です。除外する句はスコアを持ちません（Issue #1744）。以前は、1 つのドキュメントに 1 回だけ現れる語のスコアを付けていて、その値はインデックスが大きいほど大きくなりました。
 
 ### フレーズクエリ
 
@@ -428,6 +440,7 @@ Vector 句と Lexical 句の区別は、スキーマのフィールド型に基�
 - Vector 句に `+` プレフィックスが**ない**場合、フュージョンは Lexical と Vector の結果を **union（OR）** で結合します
 - **1 つでも** Vector 句に `+` プレフィックスがある場合、フュージョンは **intersection（AND）** に切り替わり、Lexical と Vector の両方の結果セットに存在するドキュメントのみが返されます
 - Lexical フィールドの `+`（例: `+title:Rust`）は、Lexical クエリパーサーによって *required clause*（必須句）として解釈されます。これは既存の Tantivy/Lucene スタイルの動作であり、それ自体ではハイブリッドフュージョンの intersection モードをトリガーしません
+- Vector 句の前の `-` と `NOT` は、何も除外しません。Vector 句はそのまま検索され、`-` や `NOT` は消えるか、後ろの Lexical 句を禁止します。たとえば `-content:"cats" title:Rust` は `title:Rust` を除外します。ここには書かないでください。既知の不具合です（Issue #1751）
 
 ### 統合クエリの例
 

@@ -2,8 +2,11 @@
 //!
 //! This parser supports the full query syntax including:
 //! - Field-specific queries: `title:hello`
-//! - Boolean operators: `AND`, `OR`
-//! - Required/prohibited: `+required`, `-forbidden`
+//! - Boolean operators: `AND`, `OR`, only in capitals and as whole words
+//!   (#1747): `and`, `Or` and `ANDROID` are terms
+//! - Required/prohibited: `+required`, `-forbidden`; `NOT forbidden`, in
+//!   capitals, is `-forbidden` (#1747), and `NOT` with no clause after it is
+//!   a term
 //! - Phrases: `"hello world"` (quoted → `PhraseQuery`; a quoted value that
 //!   analyzes to one token → `TermQuery`). Tokens the analyzer stacks at one
 //!   position (synonyms) are alternatives there, and a multi-word synonym
@@ -241,10 +244,10 @@ impl LexicalQueryParser {
         for inner_pair in pair.into_inner() {
             match inner_pair.as_rule() {
                 Rule::boolean_op => {
-                    let op = inner_pair.as_str();
-                    let new_occur = match op.to_uppercase().as_str() {
+                    // The grammar takes the operators in capitals only
+                    // (#1747), so the text is `AND` or `OR` as written.
+                    let new_occur = match inner_pair.as_str() {
                         "AND" => Occur::Must,
-                        "OR" => Occur::Should,
                         _ => Occur::Should,
                     };
                     current_occur = new_occur;
@@ -308,6 +311,8 @@ impl LexicalQueryParser {
                     }
                 }
                 Rule::prohibited_clause => {
+                    // `-clause` or `NOT clause` (#1747); the `not_op` pair
+                    // before the sub-clause is skipped.
                     for sub_pair in inner_pair.into_inner() {
                         if sub_pair.as_rule() == Rule::sub_clause {
                             let query = self.parse_sub_clause(sub_pair)?;
@@ -1787,6 +1792,151 @@ mod tests {
             parsed_occurs("hello world AND foo"),
             vec![Occur::Should, Occur::Must, Occur::Must],
         );
+    }
+
+    // ---- NOT, and the operators in capitals as whole words (#1747) ----
+
+    /// The clauses of `query_str` parsed on the field `content`, in source
+    /// order: each one's occur, and its term when it is a `TermQuery`. A
+    /// query that is not a `BooleanQuery` is one `Should` clause.
+    fn parsed_clauses(query_str: &str) -> Vec<(Occur, Option<String>)> {
+        let parser = create_test_parser().with_default_field("content");
+        let query = parser
+            .parse(query_str)
+            .unwrap_or_else(|e| panic!("'{query_str}' must parse: {e}"));
+        let term = |query: &dyn Query| {
+            query
+                .as_any()
+                .downcast_ref::<TermQuery>()
+                .map(|term| term.term().to_string())
+        };
+        match query.as_any().downcast_ref::<BooleanQuery>() {
+            Some(bool_q) => bool_q
+                .clauses()
+                .iter()
+                .map(|clause| (clause.occur, term(clause.query.as_ref())))
+                .collect(),
+            None => vec![(Occur::Should, term(query.as_ref()))],
+        }
+    }
+
+    /// A query string, and the clauses expected from it: each one's occur,
+    /// and its term when it is a `TermQuery`.
+    type ClauseCase<'a> = (&'a str, Vec<(Occur, Option<&'a str>)>);
+
+    /// The cases whose clauses are not the expected ones, each with what it
+    /// parsed to.
+    fn wrong_clauses(cases: &[ClauseCase]) -> Vec<String> {
+        cases
+            .iter()
+            .filter_map(|(query_str, expected)| {
+                let clauses = parsed_clauses(query_str);
+                let expected: Vec<(Occur, Option<String>)> = expected
+                    .iter()
+                    .map(|(occur, term)| (*occur, term.map(str::to_string)))
+                    .collect();
+                (clauses != expected)
+                    .then(|| format!("'{query_str}': {clauses:?}, expected {expected:?}"))
+            })
+            .collect()
+    }
+
+    /// Issue #1747: `NOT` prohibits the clause after it, as `-` does: alone,
+    /// after a clause, after `AND` or `OR`, and before a group or a phrase.
+    #[test]
+    fn not_prohibits_the_clause_after_it() {
+        use Occur::{Must, MustNot, Should};
+        let wrong = wrong_clauses(&[
+            ("NOT hello", vec![(MustNot, Some("hello"))]),
+            (
+                "hello NOT world",
+                vec![(Should, Some("hello")), (MustNot, Some("world"))],
+            ),
+            (
+                "hello AND NOT world",
+                vec![(Must, Some("hello")), (MustNot, Some("world"))],
+            ),
+            (
+                "hello OR NOT world",
+                vec![(Should, Some("hello")), (MustNot, Some("world"))],
+            ),
+            (
+                "NOT hello AND world",
+                vec![(MustNot, Some("hello")), (Must, Some("world"))],
+            ),
+            ("NOT(hello world)", vec![(MustNot, None)]),
+            ("NOT \"hello world\"", vec![(MustNot, None)]),
+        ]);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1747: `AND`, `OR` and `NOT` are operators only in capitals;
+    /// in another case they are terms. `and`, `or` and `not` are stop words
+    /// of `StandardAnalyzer`, so each becomes a query that matches nothing,
+    /// but it stays a clause of its own.
+    #[test]
+    fn an_operator_in_another_case_is_a_term() {
+        use Occur::Should;
+        let cases: Vec<ClauseCase> = [
+            "hello and world",
+            "hello And world",
+            "hello or world",
+            "hello oR world",
+            "hello not world",
+            "hello Not world",
+        ]
+        .into_iter()
+        .map(|query_str| {
+            (
+                query_str,
+                vec![
+                    (Should, Some("hello")),
+                    (Should, None),
+                    (Should, Some("world")),
+                ],
+            )
+        })
+        .collect();
+        let wrong = wrong_clauses(&cases);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1747: an operator is a whole word: a word that starts with
+    /// `AND`, `OR` or `NOT`, in any case, is a term, also after a clause.
+    #[test]
+    fn a_word_that_starts_with_an_operator_is_a_term() {
+        use Occur::Should;
+        let cases: Vec<ClauseCase> = [
+            ("hello ANDROID", "android"),
+            ("hello android", "android"),
+            ("hello ORACLE", "oracle"),
+            ("hello orange", "orange"),
+            ("hello NOTE", "note"),
+            ("hello NOTHING", "nothing"),
+        ]
+        .into_iter()
+        .map(|(query_str, word)| {
+            (
+                query_str,
+                vec![(Should, Some("hello")), (Should, Some(word))],
+            )
+        })
+        .collect();
+        let wrong = wrong_clauses(&cases);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1747: an operator with no clause after it is a term, as a
+    /// trailing `AND` or `OR` already was (a stop word here).
+    #[test]
+    fn an_operator_with_nothing_after_it_is_a_term() {
+        use Occur::Should;
+        let cases: Vec<ClauseCase> = ["hello NOT", "hello AND", "hello OR"]
+            .into_iter()
+            .map(|query_str| (query_str, vec![(Should, Some("hello")), (Should, None)]))
+            .collect();
+        let wrong = wrong_clauses(&cases);
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

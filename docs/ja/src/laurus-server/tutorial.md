@@ -208,7 +208,7 @@ curl -X POST http://localhost:8080/v1/search \
 
 ### ブーリアンクエリ
 
-`AND`、`OR`、`NOT` で条件を組み合わせます:
+大文字で書いた `AND`、`OR`、`NOT` で条件を組み合わせます:
 
 ```bash
 curl -X POST http://localhost:8080/v1/search \

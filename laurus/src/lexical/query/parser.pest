@@ -11,14 +11,26 @@ boolean_query = { clause ~ (boolean_op ~ clause | clause)* }
 
 clause = { required_clause | prohibited_clause | sub_clause }
 
+// `NOT` prohibits the clause after it, as `-` does (issue #1747). With no
+// clause after it, `NOT` is a term, as a trailing `AND` or `OR` is.
 required_clause = { "+" ~ sub_clause }
-prohibited_clause = { "-" ~ sub_clause }
+prohibited_clause = { ("-" | not_op) ~ sub_clause }
 
 sub_clause = { grouped_query | field_query | term_query }
 
 grouped_query = { "(" ~ boolean_query ~ ")" ~ boost? }
 
-boolean_op = { ^"AND" | ^"OR" }
+// The keywords are operators only in capitals and as whole words (issue
+// #1747), as in Lucene's classic query parser and Tantivy: `and`, `Not`,
+// `ANDROID` and `NOTE` are terms. The rules are atomic, so no implicit
+// whitespace comes between a keyword and the lookahead after it.
+boolean_op = @{ ("AND" | "OR") ~ !keyword_tail }
+not_op = @{ "NOT" ~ !keyword_tail }
+
+// A character that continues a term, a field name (`AND:x` is the field
+// `AND`), an escape, a wildcard, a fuzzy term or a boost after a keyword.
+// `(`, `"` and whitespace end it: `NOT(a b)` and `NOT"a b"` prohibit.
+keyword_tail = _{ LETTER | NUMBER | "_" | "-" | "'" | "." | ":" | "\\" | "*" | "?" | "~" | "^" }
 
 // Field-specific queries
 field_query = { field ~ ":" ~ field_value }

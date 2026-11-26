@@ -70,7 +70,7 @@ let query = BooleanQueryBuilder::new()
 | :--- | :--- | :--- |
 | `Must` | ドキュメントが必ずマッチしなければならない | `+term` または `AND` |
 | `Should` | ドキュメントがマッチすべき（スコアをブースト） | `term` または `OR` |
-| `MustNot` | ドキュメントがマッチしてはならない | `-term` または `NOT` |
+| `MustNot` | ドキュメントがマッチしてはならない | `-term` または `NOT term` |
 | `Filter` | 必ずマッチする必要があるが、スコアには影響しない | （DSL に相当するものなし） |
 
 `Must` 句も `Should` 句も無い `BooleanQuery`（filter だけ、除外だけ、またはその両方）は、boost にかかわらず、どのマッチにもスコア 0 を付けます。Lucene と Elasticsearch の filter、Elasticsearch の除外だけのクエリと同じです。別のクエリの中では何も足さず、`min_score` が 0 より大きいと何も返しません。Issue #1744 までは、1 つのドキュメントに 1 回だけ現れる語のスコアを付けていました（並列検索の filter だけのクエリは 0 でした）。
