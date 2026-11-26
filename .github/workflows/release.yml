@@ -6,6 +6,15 @@ on:
     tags:
       - "v*.*.*"
 
+env:
+  # Line tables only for the builds of the `dev` and `test` profiles (Issue
+  # #1749): with full debug info the 150-odd test binaries of laurus, built
+  # with `embeddings-all`, take about 92 GB of the 110 GB the Linux runner has
+  # once `Free disk space` ran, and the doctests ran out of disk. Line tables
+  # keep the file and line of each frame of a backtrace, and take 36 GB.
+  # `--release` and `--profile ci` builds, and local builds, are unchanged.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   # ============================================================
   # Format code with rustfmt
