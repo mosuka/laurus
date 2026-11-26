@@ -177,20 +177,21 @@ impl Clone for BooleanQuery {
 /// Resolve the cached doc-id set for `query` when `reader` exposes a snapshot
 /// query/filter cache (#578/#764).
 ///
-/// Reachable on the cross-segment [`InvertedIndexReader`] and on the
-/// per-segment fanout [`PerSegmentReaderView`] (which delegates to the
-/// cross-segment cache). Doc ids are global in both, so the same cached set is
-/// valid in either context. Returns `None` when no cache is reachable, so the
+/// Reachable on the cross-segment [`InvertedIndexReader`], which gives the set
+/// of the whole index, and on the per-segment fanout
+/// [`PerSegmentReaderView`], which gives its segment's share of that set
+/// (Issue #1743), so the set holds only documents the reader's own matchers
+/// could return. Returns `None` when no cache is reachable or kept, so the
 /// caller falls back to the query's normal matcher.
 fn cached_filter_doc_ids(
     query: &dyn Query,
     reader: &dyn LexicalIndexReader,
 ) -> Result<Option<Arc<RoaringTreemap>>> {
     if let Some(inverted) = reader.as_any().downcast_ref::<InvertedIndexReader>() {
-        return Ok(Some(inverted.matching_doc_ids(query)?));
+        return inverted.cached_matching_doc_ids(query);
     }
     if let Some(view) = reader.as_any().downcast_ref::<PerSegmentReaderView>() {
-        return Ok(Some(view.matching_doc_ids(query)?));
+        return view.matching_doc_ids(query);
     }
     Ok(None)
 }

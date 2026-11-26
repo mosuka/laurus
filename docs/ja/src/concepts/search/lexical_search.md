@@ -477,7 +477,11 @@ posting 走査ではなく単一のルックアップで済ませます。
   lexical 側・vector 側の両方に供給されます。
 - **BooleanQuery 内でも再利用。** `BooleanQuery` 内の `Occur::Filter` 句
   （例: `must(user_query).filter(tenant_filter)`）も、posting 再走査ではなくキャッシュから
-  マッチ集合を取得します。マルチセグメント時の per-segment fanout 経路でも有効です。
+  マッチ集合を取得します。マルチセグメント時の per-segment fanout 経路でも有効で、
+  各セグメントはキャッシュの集合から自分が持つドキュメントだけを取り出します。
+  Issue #1743 までは各セグメントが集合の全体を使っていたので、Must 句の無い filter の
+  `BooleanQuery` は 1 つのドキュメントをセグメントの数だけ返し、`MustNot` 句はその
+  セグメントのドキュメントしか除いていませんでした。
 - **構造的に安全（safe by construction）。** canonical なキーを持つクエリのみキャッシュ
   されます。Term・Phrase・Prefix・Wildcard・Regexp・Fuzzy・Range・Geo・Geo3d クエリは
   キャッシュ可能で、キャッシュ可能な句のみで構成され、かつ少なくとも 1 つの正句
@@ -485,7 +489,8 @@ posting 走査ではなく単一のルックアップで済ませます。
   Span クエリ・マルチフィールドクエリは毎回新規評価され（キャッシュされず）、結果は常に
   正しくなります。
 
-キャッシュはデフォルトで有効です。インデックス設定で調整・無効化できます。
+キャッシュはデフォルトで有効です。インデックス設定で調整・無効化できます。無効にすると、
+filter 句は検索のたびに各セグメントの posting で評価されます。
 
 ```rust
 use laurus::lexical::store::config::LexicalIndexConfig;
