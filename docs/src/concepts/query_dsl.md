@@ -53,12 +53,14 @@ query), not required to appear as an exact phrase. Use a quoted
 
 ### Boolean Operators
 
-Combine clauses with `AND` and `OR` (case-insensitive):
+Combine clauses with `AND` and `OR`, written in capitals:
 
 ```text
 title:hello AND body:world
 title:hello OR title:goodbye
 ```
+
+`AND`, `OR` and [`NOT`](#required--prohibited-clauses) are operators only in capitals and as whole words, as in Lucene's query parser: `and`, `Or`, `ANDROID` and `NOTE` are terms. They used to be operators in any case, and after another clause a word that started with one was split, so `apple android` searched `apple AND roid` and `apple orange` searched `apple OR ange` (Issue #1747).
 
 `AND` is symmetric — it makes the clauses on **both** sides required (`Must`). For example, `title:hello AND body:world` returns only documents that match **both** clauses. The same is true for chains: `a AND b AND c` requires all three. A clause that was already explicitly marked with `+` (required) or `-` (prohibited) keeps that intent — `AND` does not override an explicit prefix.
 
@@ -72,7 +74,17 @@ Use `+` (must match) and `-` (must not match):
 +title:hello -title:goodbye
 ```
 
-A query of `-` clauses alone, such as `-title:goodbye`, matches every other document, and each with the score 0, as in Elasticsearch: a clause that excludes carries no score (Issue #1744). It used to score each match as a term that one document has once, a value that grew with the index.
+`NOT`, in capitals, prohibits the clause after it as `-` does (Issue #1747):
+
+```text
+title:hello NOT title:goodbye
+title:hello AND NOT title:goodbye
+NOT (title:hello OR title:goodbye)
+```
+
+`a NOT b` and `a OR NOT b` are `a -b`, and `a AND NOT b` is `+a -b`. A `NOT` with no clause after it is a term. To search the word itself, write it in lowercase (`not`), quote it (`"NOT"`), or write it after a field name (`title:NOT`); `StandardAnalyzer` drops `not` as a stop word, so only a field whose analyzer keeps it holds the word.
+
+A query of `-` or `NOT` clauses alone, such as `-title:goodbye`, matches every other document, and each with the score 0, as in Elasticsearch: a clause that excludes carries no score (Issue #1744). It used to score each match as a term that one document has once, a value that grew with the index.
 
 ### Phrase Query
 
@@ -446,6 +458,7 @@ Rules:
 - When **no** vector clause carries the `+` prefix, the fusion produces a **union** (OR) of lexical and vector results.
 - When **at least one** vector clause carries the `+` prefix, the fusion switches to **intersection** (AND) — only documents present in both the lexical and vector result sets are returned.
 - `+` on a lexical field (e.g., `+title:Rust`) is interpreted by the lexical query parser as a *required clause*, which is the existing Tantivy/Lucene-style behaviour. It does not by itself trigger intersection mode for the hybrid fusion.
+- A `-` or `NOT` before a vector clause does not exclude anything: the vector clause is still searched, and the `-` or `NOT` is lost or prohibits the lexical clause after it, so `-content:"cats" title:Rust` excludes `title:Rust`. Do not write one there; this is a known bug (Issue #1751).
 
 ### Unified Query Examples
 

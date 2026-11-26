@@ -208,7 +208,7 @@ Expected result: only `doc001` is returned.
 
 ### Boolean Queries
 
-Combine conditions with `AND`, `OR`, and `NOT`:
+Combine conditions with `AND`, `OR`, and `NOT`, written in capitals:
 
 ```bash
 curl -X POST http://localhost:8080/v1/search \

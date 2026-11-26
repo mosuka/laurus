@@ -154,7 +154,8 @@ struct SearchParams {
     ///
     /// **Lexical search** — standard text search syntax:
     /// - Term queries: `title:hello`
-    /// - Boolean operators: `AND`, `OR`, `NOT`
+    /// - Boolean operators, in capitals: `AND`, `OR`, `NOT` (`a NOT b` is
+    ///   `a -b`); `and`, `or` and `not` are terms
     /// - Phrase queries: `"exact phrase"`
     /// - Fuzzy queries: `roam~2`
     /// - Range queries: `date:[2024-01-01 TO 2024-12-31]`
@@ -957,7 +958,7 @@ impl LaurusMcpServer {
 
     /// Search documents using the laurus unified query DSL.
     #[tool(
-        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators (AND, OR, NOT), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: field:\"text\" on a vector field of the schema for semantic similarity (content:\"cute kitten\", content:\"cute kitten\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Returns JSON with the array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped)."
+        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators in capitals (AND, OR, NOT; lowercase and/or/not are terms), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: field:\"text\" on a vector field of the schema for semantic similarity (content:\"cute kitten\", content:\"cute kitten\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Returns JSON with the array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped)."
     )]
     async fn search(
         &self,
