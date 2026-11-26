@@ -3827,7 +3827,8 @@ impl Engine {
     /// Batch-resolve external IDs and documents for multiple internal IDs.
     ///
     /// Fetches all documents in one pass through the document store,
-    /// reducing per-document lock acquisition overhead.
+    /// reducing per-document lock acquisition overhead. An id given twice is
+    /// resolved once.
     ///
     /// # Arguments
     ///
@@ -3851,6 +3852,11 @@ impl Engine {
         let schema = self.schema.read();
         let mut results = HashMap::with_capacity(internal_ids.len());
         for &id in internal_ids {
+            // A repeated id keeps what its first turn took out of `fetched`
+            // (Issue #1743).
+            if results.contains_key(&id) {
+                continue;
+            }
             match fetched.remove(&id) {
                 Some(doc) => {
                     let external_id = doc
@@ -11852,6 +11858,34 @@ mod tests {
             None => builder,
         }
         .build()
+    }
+
+    /// Issue #1743: a hit given twice keeps its first position, with its id
+    /// and document. It used to come back as `unknown_<n>`, with no document.
+    #[tokio::test]
+    async fn resolve_hits_keeps_the_first_of_a_repeated_id() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
+        let schema = Schema::builder()
+            .add_text_field("title", crate::lexical::core::field::TextOption::default())
+            .build();
+        let engine = Engine::new(storage, schema).await.unwrap();
+        for id in ["a", "b"] {
+            engine
+                .put_document(id, Document::builder().add_text("title", id).build())
+                .await
+                .unwrap();
+        }
+        engine.commit().await.unwrap();
+        let (a, b) = (internal_id(&engine, "a"), internal_id(&engine, "b"));
+
+        let results = engine
+            .resolve_hits(vec![(a, 2.0), (a, 1.0), (b, 0.5), (a, 0.1)])
+            .unwrap();
+        let resolved: Vec<(&str, f32, bool)> = results
+            .iter()
+            .map(|r| (r.id.as_str(), r.score, r.document.is_some()))
+            .collect();
+        assert_eq!(resolved, [("a", 2.0, true), ("b", 0.5, true)]);
     }
 
     fn internal_id(engine: &Engine, external_id: &str) -> u64 {

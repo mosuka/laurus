@@ -722,22 +722,17 @@ impl InvertedIndexSearcher {
         // Build a cross-segment matching-doc-ids closure (#764) so each
         // PerSegmentReaderView can resolve a cacheable filter clause against the
         // cross-segment snapshot cache rather than re-walking postings per
-        // segment. The fanout is only entered when `self.reader` is an
-        // InvertedIndexReader (dispatch gate), so the downcast succeeds; the
-        // defensive branch drains the matcher uncached.
+        // segment. The set is the whole index's; each view keeps its segment's
+        // share (Issue #1743). Without a cache — or, defensively, without an
+        // InvertedIndexReader, which the dispatch gate rules out — each view
+        // matches the clause itself.
         let global_matching_doc_ids_fn = {
             let reader_arc = self.reader.clone();
             std::sync::Arc::new(
-                move |query: &dyn Query| -> Result<Arc<roaring::RoaringTreemap>> {
-                    if let Some(inverted) =
-                        reader_arc.as_any().downcast_ref::<InvertedIndexReader>()
-                    {
-                        inverted.matching_doc_ids(query)
-                    } else {
-                        let matcher = query.matcher(reader_arc.as_ref())?;
-                        Ok(Arc::new(
-                            crate::lexical::index::inverted::query_cache::drain_matcher(matcher)?,
-                        ))
+                move |query: &dyn Query| -> Result<Option<Arc<roaring::RoaringTreemap>>> {
+                    match reader_arc.as_any().downcast_ref::<InvertedIndexReader>() {
+                        Some(inverted) => inverted.cached_matching_doc_ids(query),
+                        None => Ok(None),
                     }
                 },
             )
@@ -875,16 +870,10 @@ impl InvertedIndexSearcher {
         let global_matching_doc_ids_fn = {
             let reader_arc = self.reader.clone();
             std::sync::Arc::new(
-                move |query: &dyn Query| -> Result<Arc<roaring::RoaringTreemap>> {
-                    if let Some(inverted) =
-                        reader_arc.as_any().downcast_ref::<InvertedIndexReader>()
-                    {
-                        inverted.matching_doc_ids(query)
-                    } else {
-                        let matcher = query.matcher(reader_arc.as_ref())?;
-                        Ok(Arc::new(
-                            crate::lexical::index::inverted::query_cache::drain_matcher(matcher)?,
-                        ))
+                move |query: &dyn Query| -> Result<Option<Arc<roaring::RoaringTreemap>>> {
+                    match reader_arc.as_any().downcast_ref::<InvertedIndexReader>() {
+                        Some(inverted) => inverted.cached_matching_doc_ids(query),
+                        None => Ok(None),
                     }
                 },
             )
@@ -1837,6 +1826,210 @@ mod tests {
         assert!(err.to_string().contains("timeout"), "{err}");
     }
 
+    /// Over several segments, filter clauses alone select each document once,
+    /// in parallel or not (Issue #1743): each segment used to return the
+    /// documents of every segment.
+    #[test]
+    fn filter_clauses_alone_select_each_document_once() {
+        let searcher = populated_searcher(2);
+        for parallel in [false, true] {
+            for filters in 1..=2 {
+                let mut query = BooleanQueryBuilder::new();
+                for _ in 0..filters {
+                    query = query.filter(Box::new(TermQuery::new("content", "hello")));
+                }
+                let hits = searcher
+                    .search_with_collector_parallel(
+                        Box::new(query.build()),
+                        TopDocsCollector::new(1000),
+                        parallel,
+                    )
+                    .unwrap()
+                    .results();
+                let ids: std::collections::BTreeSet<u64> =
+                    hits.iter().map(|hit| hit.doc_id).collect();
+                let what = format!("{filters} filters, parallel {parallel}");
+                assert_eq!(hits.len(), 400, "{what}");
+                assert_eq!(ids.len(), 400, "{what}");
+            }
+        }
+    }
+
+    /// A view's share of a cached set is the documents its segment holds live
+    /// (Issue #1743): of its range, or of its recorded ids, minus its
+    /// deletions, even for an id another segment holds live.
+    #[test]
+    fn a_views_share_of_a_cached_set_is_its_segments_live_documents() {
+        use crate::lexical::index::inverted::per_segment_view::PerSegmentReaderView;
+        use crate::lexical::index::inverted::segment::Membership;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::builder().build()).unwrap();
+        let doc = || crate::Document::builder().add_text("body", "word").build();
+        for ids in [&[0u64, 1, 2, 3][..], &[10, 12, 14], &[11, 13]] {
+            for id in ids {
+                store.upsert_document(*id, doc()).unwrap();
+            }
+            store.commit().unwrap();
+        }
+        // 12 goes; 1 moves to a fourth segment.
+        store.delete_document_by_internal_id(12).unwrap();
+        store.upsert_document(1, doc()).unwrap();
+        store.commit().unwrap();
+
+        let reader = store.reader_for_tests().unwrap();
+        let inverted = reader
+            .as_any()
+            .downcast_ref::<InvertedIndexReader>()
+            .unwrap();
+        let query = TermQuery::new("body", "word");
+        let whole: RoaringTreemap = (0..=20).collect();
+        let mut shares = Vec::new();
+        for segment in inverted.segment_readers() {
+            let kind = match segment.read().unwrap().membership() {
+                Membership::Range => "range",
+                Membership::Set(_) => "set",
+                Membership::Empty => "empty",
+                Membership::Unknown => "unknown",
+            };
+            let whole = whole.clone();
+            let view = PerSegmentReaderView::new(
+                Arc::clone(segment),
+                inverted.doc_count(),
+                inverted.max_doc(),
+                Arc::new(|_: &str, _: &str| Ok(None)),
+                Arc::new(move |_: &dyn Query| Ok(Some(Arc::new(whole.clone())))),
+            );
+            let share = view.matching_doc_ids(&query).unwrap().unwrap();
+            shares.push((kind, share.iter().collect::<Vec<u64>>()));
+        }
+        assert_eq!(
+            shares,
+            [
+                ("range", vec![0, 2, 3]),
+                ("set", vec![10, 14]),
+                ("set", vec![11, 13]),
+                ("range", vec![1]),
+            ]
+        );
+
+        // Sets smaller than a segment are read id by id, larger ones with the
+        // segment's live documents: both give their intersection.
+        let sets: Vec<RoaringTreemap> = vec![
+            RoaringTreemap::new(),
+            [1].into_iter().collect(),
+            [0, 1, 2].into_iter().collect(),
+            [2, 11, 12].into_iter().collect(),
+            [9, 10, 12, 14, 15].into_iter().collect(),
+            [3, 4, 5, 10, 11].into_iter().collect(),
+            (0..=20).collect(),
+            (11..=13).collect(),
+        ];
+        for segment in inverted.segment_readers() {
+            let segment = segment.read().unwrap();
+            let live = segment.live_doc_ids().unwrap();
+            for docs in &sets {
+                assert_eq!(
+                    segment.live_docs_among(docs).unwrap(),
+                    &live & docs,
+                    "{:?} of {:?}",
+                    docs.iter().collect::<Vec<_>>(),
+                    live.iter().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// A segment that records no doc ids, and a reader that keeps no cache,
+    /// give a view no set: its own matcher selects the segment's documents,
+    /// and no set of the whole index is drained per segment (Issue #1743).
+    #[test]
+    fn a_view_without_a_cache_or_recorded_ids_matches_the_filter_itself() {
+        use crate::lexical::index::config::InvertedIndexConfig;
+        use crate::lexical::index::inverted::per_segment_view::PerSegmentReaderView;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+        use crate::storage::Storage;
+
+        let doc = || crate::Document::builder().add_text("body", "word").build();
+        let filter = || -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .filter(Box::new(TermQuery::new("body", "word")))
+                    .build(),
+            )
+        };
+        for (capacity, recorded) in [(1024, false), (0, true)] {
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let config = LexicalIndexConfig::Inverted(InvertedIndexConfig {
+                use_compound: false,
+                query_filter_cache_capacity: capacity,
+                ..Default::default()
+            });
+            let store = LexicalStore::new(storage.clone(), config).unwrap();
+            // {1, 3} has a gap, so it needs its recorded ids to tell them.
+            for ids in [&[1u64, 3][..], &[2], &[4, 5]] {
+                for id in ids {
+                    store.upsert_document(*id, doc()).unwrap();
+                }
+                store.commit().unwrap();
+            }
+            if !recorded {
+                for file in storage.list_files().unwrap() {
+                    if file.ends_with(".ids") || file.ends_with(".norms") {
+                        storage.delete_file(&file).unwrap();
+                    }
+                }
+                store.refresh().unwrap();
+            }
+            let what = format!("capacity {capacity}, recorded ids {recorded}");
+
+            let reader = store.reader_for_tests().unwrap();
+            let inverted = reader
+                .as_any()
+                .downcast_ref::<InvertedIndexReader>()
+                .unwrap();
+            let segment = &inverted.segment_readers()[0];
+            let reader_arc = Arc::clone(&reader);
+            let view = PerSegmentReaderView::new(
+                Arc::clone(segment),
+                inverted.doc_count(),
+                inverted.max_doc(),
+                Arc::new(|_: &str, _: &str| Ok(None)),
+                Arc::new(move |query: &dyn Query| {
+                    reader_arc
+                        .as_any()
+                        .downcast_ref::<InvertedIndexReader>()
+                        .unwrap()
+                        .cached_matching_doc_ids(query)
+                }),
+            );
+            let share = view
+                .matching_doc_ids(&TermQuery::new("body", "word"))
+                .unwrap();
+            assert!(share.is_none(), "{what}: {share:?}");
+            let before = inverted.query_cache_stats();
+
+            let searcher = InvertedIndexSearcher::from_arc(Arc::clone(&reader));
+            let hits = searcher
+                .search_with_collector(filter(), TopDocsCollector::new(100))
+                .unwrap()
+                .results();
+            let mut ids: Vec<u64> = hits.iter().map(|hit| hit.doc_id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [1, 2, 3, 4, 5], "{what}");
+            if capacity == 0 {
+                assert_eq!(
+                    inverted.query_cache_stats(),
+                    before,
+                    "{what}: the views looked a set up"
+                );
+            }
+        }
+    }
+
     /// In a parallel search a lone Filter clause selects documents without a
     /// score, as several do (Issue #1740).
     #[test]
@@ -2434,7 +2627,7 @@ mod tests {
                 inverted.doc_count(),
                 inverted.max_doc(),
                 Arc::new(|_: &str, _: &str| Ok(None)),
-                Arc::new(|_: &dyn Query| Ok(Arc::new(RoaringTreemap::new()))),
+                Arc::new(|_: &dyn Query| Ok(None)),
             );
             check(Arc::new(view), &|doc_id| {
                 segment
@@ -3883,9 +4076,7 @@ mod tests {
             inverted.doc_count(),
             inverted.max_doc(),
             std::sync::Arc::new(|_: &str, _: &str| Ok(None)),
-            std::sync::Arc::new(|_: &dyn crate::lexical::query::Query| {
-                Ok(std::sync::Arc::new(RoaringTreemap::new()))
-            }),
+            std::sync::Arc::new(|_: &dyn crate::lexical::query::Query| Ok(None)),
         );
 
         assert!(
@@ -4176,6 +4367,65 @@ mod tests {
         );
     }
 
+    /// Each segment's view takes a filter clause's share from the cache, which
+    /// is drained once (Issue #1743); without a cache no set is looked up, on
+    /// one segment or several, and the clause is matched by its own matcher.
+    #[test]
+    fn a_filter_clause_uses_the_cache_on_every_segment_or_none() {
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let query = || -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .must(Box::new(TermQuery::new("body", "alpha")))
+                    .filter(Box::new(TermQuery::new("body", "beta")))
+                    .build(),
+            )
+        };
+        for (segments, capacity) in [(4u64, 1024), (4, 0), (1, 0)] {
+            let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+            let config = LexicalIndexConfig::builder()
+                .query_filter_cache_capacity(capacity)
+                .build();
+            let store = LexicalStore::new(storage, config).unwrap();
+            for id in 0..40u64 {
+                let doc = crate::Document::builder()
+                    .add_text("body", "alpha beta")
+                    .build();
+                store.upsert_document(id, doc).unwrap();
+                if (id + 1) % (40 / segments) == 0 {
+                    store.commit().unwrap();
+                }
+            }
+            let reader = store.reader_for_tests().unwrap();
+            let inverted = reader
+                .as_any()
+                .downcast_ref::<InvertedIndexReader>()
+                .unwrap();
+            assert_eq!(inverted.segment_count() as u64, segments);
+            let searcher = InvertedIndexSearcher::from_arc(Arc::clone(&reader));
+            let search = || {
+                let hits = searcher
+                    .search_with_collector(query(), TopDocsCollector::new(100))
+                    .unwrap()
+                    .results();
+                assert_eq!(hits.len(), 40);
+            };
+            let what = format!("{segments} segments, capacity {capacity}");
+            search();
+            let first = inverted.query_cache_stats();
+            search();
+            let second = inverted.query_cache_stats();
+            if capacity == 0 {
+                assert_eq!(second.hits + second.misses, 0, "{what}: {second:?}");
+            } else {
+                assert_eq!(second.hits - first.hits, segments, "{what}: {second:?}");
+                assert_eq!(second.misses, first.misses, "{what}: {second:?}");
+            }
+        }
+    }
+
     /// Cache-on must produce exactly the same result set as cache-off for a
     /// filtered boolean across a multi-segment index (exercises the fanout
     /// path through `PerSegmentReaderView::matching_doc_ids`).
@@ -4222,6 +4472,30 @@ mod tests {
                     .build(),
             )
         };
+        // Without a Must clause, a set of the whole index on each segment
+        // returned every document once per segment (Issue #1743).
+        let alone = || -> Box<dyn Query> {
+            Box::new(
+                BooleanQueryBuilder::new()
+                    .filter(Box::new(TermQuery::new("body", "beta")))
+                    .build(),
+            )
+        };
+        let list = |store: &LexicalStore| -> Vec<u64> {
+            let mut ids: Vec<u64> = store
+                .search(
+                    LexicalSearchRequest::new(alone())
+                        .limit(usize::MAX)
+                        .load_documents(false),
+                )
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
         let run = |store: &LexicalStore| -> BTreeSet<u64> {
             store
                 .search(
@@ -4248,6 +4522,10 @@ mod tests {
             cached_set.iter().all(|&d| d % 6 == 0),
             "must(alpha=even) ∩ filter(beta=%3) == ids divisible by 6"
         );
+
+        let thirds: Vec<u64> = (0..400).filter(|id| id % 3 == 0).collect();
+        assert_eq!(list(&build(1024)), thirds, "filters alone, cached");
+        assert_eq!(list(&build(0)), thirds, "filters alone, not cached");
     }
 
     // ----- Issue #587: Roaring-backed parallel boolean executor -----

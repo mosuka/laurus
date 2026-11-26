@@ -49,6 +49,7 @@ use crate::error::Result;
 use crate::lexical::core::document::Document;
 use crate::lexical::index::inverted::core::automaton::Automaton;
 use crate::lexical::index::inverted::reader::{SegmentFieldLengths, SegmentReader};
+use crate::lexical::index::inverted::segment::Membership;
 use crate::lexical::index::structures::bkd_tree::BKDTree;
 use crate::lexical::query::Query;
 use crate::lexical::reader::{
@@ -65,10 +66,12 @@ type GlobalTermInfoFn = dyn Fn(&str, &str) -> Result<Option<ReaderTermInfo>> + S
 /// Cross-segment matching-doc-ids lookup function (#764). Resolves a query's
 /// matched document set against the **cross-segment** reader's snapshot-scoped
 /// query/filter cache, so a filter clause evaluated under this per-segment
-/// fanout view reuses the same cache as the top-level reader. Doc ids are
-/// global, so the returned set intersects correctly with this segment's local
-/// matchers.
-type GlobalMatchingDocIdsFn = dyn Fn(&dyn Query) -> Result<Arc<RoaringTreemap>> + Send + Sync;
+/// fanout view reuses the same cache as the top-level reader. The set is that
+/// of the **whole index**; the view keeps its segment's share of it (Issue
+/// #1743). `None` when the reader keeps no cache, so that each segment matches
+/// the query itself instead of draining the whole index.
+type GlobalMatchingDocIdsFn =
+    dyn Fn(&dyn Query) -> Result<Option<Arc<RoaringTreemap>>> + Send + Sync;
 
 /// Adapter that exposes a single [`SegmentReader`] as a
 /// [`LexicalIndexReader`] backed by per-segment posting / field data
@@ -108,14 +111,18 @@ impl PerSegmentReaderView {
         }
     }
 
-    /// Resolve the cross-segment cached doc-id set for `query` (#764).
+    /// This segment's share of the cached doc-id set for `query` (#764): the
+    /// documents of the whole index's set that this segment holds live.
     ///
-    /// Delegates to the cross-segment reader's
-    /// [`matching_doc_ids`](crate::lexical::index::inverted::reader::InvertedIndexReader::matching_doc_ids),
-    /// so a filter clause evaluated under this per-segment fanout view reuses
-    /// the same snapshot-scoped cache as the top-level reader. The returned
-    /// set uses global doc ids and therefore intersects correctly with this
-    /// segment's local matchers.
+    /// The cross-segment reader's cache holds the set of the whole index. A
+    /// view must not return it as it is (Issue #1743): the fanout merges the
+    /// hits of every segment, so each would return the others' documents too,
+    /// and a `MustNot` clause would exclude only the segment's own. The share
+    /// is the segment's live documents as
+    /// [`SegmentReader::live_doc_ids`] defines them (Issue #1211), so an id
+    /// this segment holds deleted is left out even when another segment holds
+    /// it live. It costs what the smaller of the set and the segment takes to
+    /// read.
     ///
     /// # Arguments
     ///
@@ -123,9 +130,29 @@ impl PerSegmentReaderView {
     ///
     /// # Returns
     ///
-    /// An `Arc<RoaringTreemap>` of matching global document ids.
-    pub fn matching_doc_ids(&self, query: &dyn Query) -> Result<Arc<RoaringTreemap>> {
-        (self.global_matching_doc_ids_fn)(query)
+    /// This segment's documents of the set, or `None` when the reader keeps
+    /// no cache or the segment records no doc ids: the caller then matches
+    /// the query on this view instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the set cannot be computed or the segment's live
+    /// documents cannot be read.
+    pub fn matching_doc_ids(&self, query: &dyn Query) -> Result<Option<Arc<RoaringTreemap>>> {
+        // A segment of unknown membership tells its documents from its stored
+        // documents, which its own matcher does not need to read.
+        if matches!(
+            self.segment.read().unwrap().membership(),
+            Membership::Unknown
+        ) {
+            return Ok(None);
+        }
+        // Not under this segment's lock: computing the set reads every segment.
+        let Some(docs) = (self.global_matching_doc_ids_fn)(query)? else {
+            return Ok(None);
+        };
+        let share = self.segment.read().unwrap().live_docs_among(&docs)?;
+        Ok(Some(Arc::new(share)))
     }
 }
 

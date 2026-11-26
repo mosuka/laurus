@@ -487,7 +487,11 @@ walk.
 - **Reused inside boolean queries.** An `Occur::Filter` clause within a
   `BooleanQuery` (e.g. `must(user_query).filter(tenant_filter)`) also draws its
   matched set from the cache instead of re-walking postings — including the
-  per-segment fan-out path on multi-segment indexes.
+  per-segment fan-out path on multi-segment indexes, where each segment takes
+  from the cached set only the documents it holds. Until Issue #1743 each
+  segment took the whole set: a `BooleanQuery` of filters without a `Must`
+  clause returned a document once per segment, and its `MustNot` clauses
+  excluded only the segment's own documents.
 - **Safe by construction.** Only queries with a canonical key are cached. Term,
   phrase, prefix, wildcard, regexp, fuzzy, range, geo, and geo3d queries are
   cacheable, as are boolean queries composed entirely of cacheable clauses with
@@ -495,7 +499,8 @@ walk.
   positive clause, span queries, and multi-field queries are evaluated fresh
   (never cached), so results are always correct.
 
-The cache is enabled by default. Tune or disable it via the index config:
+The cache is enabled by default. Tune or disable it via the index config; without
+it, a filter clause is matched against each segment's postings on every search:
 
 ```rust
 use laurus::lexical::store::config::LexicalIndexConfig;

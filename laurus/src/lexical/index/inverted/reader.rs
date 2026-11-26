@@ -1224,6 +1224,36 @@ impl SegmentReader {
         })
     }
 
+    /// The documents of `docs` that this segment holds live (Issue #1743):
+    /// `docs` ∩ [`Self::live_doc_ids`].
+    ///
+    /// Costs what the smaller of the two takes to read. A set no larger than
+    /// the segment is read from the segment's first id to its last, each id
+    /// checked against what the segment holds and its deletions; a larger
+    /// one is intersected with the segment's live documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment of unknown membership cannot read its
+    /// stored documents.
+    pub(crate) fn live_docs_among(&self, docs: &RoaringTreemap) -> Result<RoaringTreemap> {
+        let info = &self.info;
+        let membership = self.membership();
+        if matches!(membership, Membership::Unknown) || docs.len() > info.doc_count {
+            let mut live = self.live_doc_ids()?;
+            live &= docs;
+            return Ok(live);
+        }
+        let mut ids = docs.iter();
+        ids.advance_to(info.min_doc_id);
+        let held = ids
+            .take_while(|&id| id <= info.max_doc_id)
+            .filter(|&id| membership.holds(id) == Some(true))
+            .filter(|&id| !self.deleted_docs.as_ref().is_some_and(|d| d.contains(id)));
+        Ok(RoaringTreemap::from_sorted_iter(held)
+            .unwrap_or_else(|_| unreachable!("a treemap iterates its ids in ascending order")))
+    }
+
     /// Check whether a global doc_id is marked as deleted in this segment.
     pub fn is_deleted(&self, doc_id: u64) -> Result<bool> {
         // Hot on the scoring path, which probes deletion status per scored
@@ -2581,8 +2611,31 @@ impl InvertedIndexReader {
         self.query_cache.stats()
     }
 
+    /// The cached set of `query`, as [`Self::matching_doc_ids`] gives it, when
+    /// this reader keeps a query / filter cache.
+    ///
+    /// # Returns
+    ///
+    /// `None` when the cache is disabled (a capacity of 0): a set would be
+    /// drained and dropped on every call then, so the caller matches the query
+    /// itself instead (Issue #1743).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be matched.
+    pub(crate) fn cached_matching_doc_ids(
+        &self,
+        query: &dyn Query,
+    ) -> Result<Option<Arc<RoaringTreemap>>> {
+        if !self.query_cache.is_enabled() {
+            return Ok(None);
+        }
+        self.matching_doc_ids(query).map(Some)
+    }
+
     /// Return the set of document ids matching `query` within this reader
-    /// snapshot, consulting the snapshot-scoped query / filter cache (Issue
+    /// snapshot, the documents of the whole index, consulting the
+    /// snapshot-scoped query / filter cache (Issue
     /// [#578](https://github.com/mosuka/laurus/issues/578)).
     ///
     /// On a cache hit the stored [`RoaringTreemap`] is returned as a refcount
