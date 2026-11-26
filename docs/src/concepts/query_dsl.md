@@ -72,6 +72,8 @@ Use `+` (must match) and `-` (must not match):
 +title:hello -title:goodbye
 ```
 
+A query of `-` clauses alone, such as `-title:goodbye`, matches every other document, and each with the score 0, as in Elasticsearch: a clause that excludes carries no score (Issue #1744). It used to score each match as a term that one document has once, a value that grew with the index.
+
 ### Phrase Query
 
 Match an exact phrase using double quotes. Optional proximity (`~N`) allows N words between terms:

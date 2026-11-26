@@ -26,6 +26,8 @@ A quoted or bare value whose analyzer stacks several alternatives at one positio
 
 A wildcard, prefix or regexp query is not scored with BM25: every match receives the query's boost. A fuzzy query scores its closest terms, and a closer term higher. See [Matches and scores of wildcard, prefix and regexp queries](../concepts/search/lexical_search.md#matches-and-scores-of-wildcard-prefix-and-regexp-queries) and [FuzzyQuery](../concepts/search/lexical_search.md#fuzzyquery).
 
+A `BooleanQuery` without a `Must` or `Should` clause (filters or negations alone) scores every match 0, whatever its boost (Issue #1744; see [BooleanQuery](../concepts/search/lexical_search.md#booleanquery)).
+
 ### Field Boosts
 
 Per-field score multipliers are configured on the search request, not in a separate scoring struct:

@@ -11,7 +11,7 @@ use crate::lexical::query::matcher::{
     ConjunctionMatcher, ConjunctionNotMatcher, DisjunctionMatcher, EmptyMatcher, Matcher,
     PreComputedMatcher,
 };
-use crate::lexical::query::scorer::{BM25Scorer, Scorer};
+use crate::lexical::query::scorer::Scorer;
 use crate::lexical::query::{HighlightTerm, Query, check_query_boost};
 use crate::lexical::reader::LexicalIndexReader;
 
@@ -375,8 +375,15 @@ impl Query for BooleanQuery {
         }
     }
 
+    /// The scorer of the `Must` and `Should` clauses, which sums their scores.
+    ///
+    /// Without such a clause every match scores 0, whatever the boost (Issue
+    /// #1744): `Filter` and `MustNot` clauses decide which documents match and
+    /// carry no score, as Lucene and Elasticsearch score filters and
+    /// Elasticsearch a negation alone. Inside another query such a query adds
+    /// nothing.
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
-        use crate::lexical::query::scorer::BooleanScorer;
+        use crate::lexical::query::scorer::{BooleanScorer, ConstantScorer};
 
         let mut sub_queries = Vec::new();
 
@@ -388,16 +395,7 @@ impl Query for BooleanQuery {
         }
 
         if sub_queries.is_empty() {
-            // Fallback for empty boolean query
-            let scorer = BM25Scorer::new(
-                1,
-                1,
-                reader.doc_count(),
-                10.0,
-                reader.doc_count(),
-                self.boost,
-            );
-            return Ok(Box::new(scorer));
+            return Ok(Box::new(ConstantScorer::new(0.0)));
         }
 
         let mut boolean_scorer = BooleanScorer::new(reader, sub_queries)?;
@@ -779,6 +777,51 @@ mod tests {
         let scorer = query.scorer(&reader).unwrap();
         // Should create a scorer without error
         assert!(scorer.score(0, 1.0, None) >= 0.0);
+    }
+
+    /// Without a `Must` or `Should` clause every match scores 0, whatever the
+    /// boost (Issue #1744).
+    #[test]
+    fn a_query_without_a_scored_clause_scores_0() {
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        // Documents, so that a score taken from the index's statistics would
+        // not be 0.
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::builder().build()).unwrap();
+        for id in 0..12u64 {
+            let text = if id % 3 == 0 { "hello world" } else { "world" };
+            let doc = crate::Document::builder().add_text("title", text).build();
+            store.upsert_document(id, doc).unwrap();
+        }
+        store.commit().unwrap();
+        let reader = store.reader_for_tests().unwrap();
+        let reader = reader.as_ref();
+        let term = || Box::new(TermQuery::new("title", "hello")) as Box<dyn Query>;
+        for (what, query) in [
+            (
+                "a filter",
+                BooleanQueryBuilder::new().filter(term()).build(),
+            ),
+            (
+                "a negation",
+                BooleanQueryBuilder::new().must_not(term()).build(),
+            ),
+            (
+                "a filter and a negation, boost 2",
+                BooleanQueryBuilder::new()
+                    .filter(term())
+                    .must_not(term())
+                    .boost(2.0)
+                    .build(),
+            ),
+        ] {
+            let scorer = query.scorer(reader).unwrap();
+            assert_eq!(scorer.score(0, 1.0, None), 0.0, "{what}");
+            assert_eq!(scorer.score(7, 3.0, Some(10.0)), 0.0, "{what}");
+            assert_eq!(scorer.max_score(), 0.0, "{what}");
+        }
     }
 
     #[test]
