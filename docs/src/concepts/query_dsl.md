@@ -458,7 +458,8 @@ Rules:
 - When **no** vector clause carries the `+` prefix, the fusion produces a **union** (OR) of lexical and vector results.
 - When **at least one** vector clause carries the `+` prefix, the fusion switches to **intersection** (AND) — only documents present in both the lexical and vector result sets are returned.
 - `+` on a lexical field (e.g., `+title:Rust`) is interpreted by the lexical query parser as a *required clause*, which is the existing Tantivy/Lucene-style behaviour. It does not by itself trigger intersection mode for the hybrid fusion.
-- A `-` or `NOT` before a vector clause does not exclude anything: the vector clause is still searched, and the `-` or `NOT` is lost or prohibits the lexical clause after it, so `-content:"cats" title:Rust` excludes `title:Rust`. Do not write one there; this is a known bug (Issue #1751).
+- A vector clause cannot be prohibited: a `-` or `NOT` before it (`-content:"cats"`), or before a group around it (`NOT (title:Rust content:"cats")`), is rejected with `InvalidArgument` (HTTP 400) before anything is embedded. A vector search ranks the documents nearest to the query and has nothing to exclude; exclude documents with a lexical clause or a filter instead. Such a query used to search the vector clause anyway, and the `-` or `NOT` was lost or moved to the next lexical clause (Issue #1751).
+- Only what the lexical grammar reads as a clause is a vector clause: `content:cats` inside a quoted lexical phrase, as in `title:"cats content:cats"`, is the phrase's text. It used to be taken out as a vector clause (Issue #1751).
 
 ### Unified Query Examples
 

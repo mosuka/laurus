@@ -440,7 +440,8 @@ Vector 句と Lexical 句の区別は、スキーマのフィールド型に基�
 - Vector 句に `+` プレフィックスが**ない**場合、フュージョンは Lexical と Vector の結果を **union（OR）** で結合します
 - **1 つでも** Vector 句に `+` プレフィックスがある場合、フュージョンは **intersection（AND）** に切り替わり、Lexical と Vector の両方の結果セットに存在するドキュメントのみが返されます
 - Lexical フィールドの `+`（例: `+title:Rust`）は、Lexical クエリパーサーによって *required clause*（必須句）として解釈されます。これは既存の Tantivy/Lucene スタイルの動作であり、それ自体ではハイブリッドフュージョンの intersection モードをトリガーしません
-- Vector 句の前の `-` と `NOT` は、何も除外しません。Vector 句はそのまま検索され、`-` や `NOT` は消えるか、後ろの Lexical 句を禁止します。たとえば `-content:"cats" title:Rust` は `title:Rust` を除外します。ここには書かないでください。既知の不具合です（Issue #1751）
+- Vector 句は禁止できません。Vector 句の前（`-content:"cats"`）や、Vector 句を含むグループの前（`NOT (title:Rust content:"cats")`）の `-` と `NOT` は、何も埋め込む前に `InvalidArgument`（HTTP 400）で拒否されます。Vector 検索はクエリに近いドキュメントを順に並べるもので、除外するものを持ちません。ドキュメントを除外するには、Lexical 句か filter を使います。以前はそのまま Vector 句を検索し、`-` や `NOT` は消えるか、後ろの Lexical 句に移っていました（Issue #1751）
+- Lexical の文法が句として読むものだけが Vector 句です。`title:"cats content:cats"` のように、引用符で囲んだ Lexical のフレーズの中の `content:cats` は、フレーズの文字列です。以前は Vector 句として取り出していました（Issue #1751）
 
 ### 統合クエリの例
 
