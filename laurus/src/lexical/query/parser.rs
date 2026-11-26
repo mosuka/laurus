@@ -1146,6 +1146,78 @@ impl LexicalQueryParser {
     }
 }
 
+/// A term with no field in a query string, as the grammar reads it, and
+/// whether a `-` or `NOT` applies to it ([`bare_terms`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BareTerm {
+    /// The term as written.
+    pub(crate) text: String,
+    /// Whether a prohibited clause (`-` or `NOT`) holds the term, itself or
+    /// a group around it.
+    pub(crate) prohibited: bool,
+}
+
+/// The terms with no field in `query_str`, in order, as the grammar alone
+/// reads them: nothing is analyzed and no query is built (Issue #1751).
+///
+/// Such a term is a clause of its own, or of a group: a `term_query` whose
+/// value is a `simple_term`. The text of a phrase, a range or a field's
+/// value is not a clause, and is not returned. The unified parser asks this
+/// which of the vector clauses it finds in a query string are clauses, and
+/// which of them a `-` or `NOT` applies to.
+///
+/// # Errors
+///
+/// Returns an error if the grammar cannot read `query_str`, as
+/// [`LexicalQueryParser::parse`] does.
+pub(crate) fn bare_terms(query_str: &str) -> Result<Vec<BareTerm>> {
+    let pairs = QueryStringParser::parse(Rule::query, query_str)
+        .map_err(|e| LaurusError::parse(format!("Parse error: {e}")))?;
+    let mut terms = Vec::new();
+    for pair in pairs {
+        collect_bare_terms(pair, false, &mut terms);
+    }
+    Ok(terms)
+}
+
+/// Adds the bare terms under `pair` to `terms` ([`bare_terms`]).
+/// `prohibited` is whether a prohibited clause holds `pair`.
+fn collect_bare_terms(
+    pair: pest::iterators::Pair<Rule>,
+    prohibited: bool,
+    terms: &mut Vec<BareTerm>,
+) {
+    match pair.as_rule() {
+        Rule::prohibited_clause => {
+            for inner in pair.into_inner() {
+                collect_bare_terms(inner, true, terms);
+            }
+        }
+        // `term_query` > `field_value` > `simple_term` > `term`.
+        Rule::term_query => {
+            let term = pair
+                .into_inner()
+                .next()
+                .and_then(|value| value.into_inner().next())
+                .filter(|value| value.as_rule() == Rule::simple_term)
+                .and_then(|simple| simple.into_inner().find(|p| p.as_rule() == Rule::term));
+            if let Some(term) = term {
+                terms.push(BareTerm {
+                    text: term.as_str().to_string(),
+                    prohibited,
+                });
+            }
+        }
+        // A field's value holds no clause.
+        Rule::field_query => {}
+        _ => {
+            for inner in pair.into_inner() {
+                collect_bare_terms(inner, prohibited, terms);
+            }
+        }
+    }
+}
+
 /// The graph a quoted value's tokens form ([`phrase_graph`]).
 #[derive(Debug, PartialEq)]
 enum PhraseGraph {
@@ -1936,6 +2008,48 @@ mod tests {
             .map(|query_str| (query_str, vec![(Should, Some("hello")), (Should, None)]))
             .collect();
         let wrong = wrong_clauses(&cases);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1751: `bare_terms` reports the term `x` as prohibited when a
+    /// `-` or `NOT` applies to it or to a group around it, and does not
+    /// report it when it is the text of a phrase, a range or a field's value.
+    #[test]
+    fn bare_terms_report_whether_a_term_is_prohibited() {
+        let prohibited = |query_str: &str| {
+            bare_terms(query_str)
+                .unwrap_or_else(|e| panic!("'{query_str}' must parse: {e}"))
+                .into_iter()
+                .find(|term| term.text == "x")
+                .map(|term| term.prohibited)
+        };
+        let cases = [
+            ("-x", Some(true)),
+            ("NOT x", Some(true)),
+            ("- x", Some(true)),
+            ("-(a x)", Some(true)),
+            ("NOT (a x)", Some(true)),
+            ("(a -x)", Some(true)),
+            ("-(-x)", Some(true)),
+            ("-(+x)", Some(true)),
+            ("x -a", Some(false)),
+            ("+x", Some(false)),
+            ("a AND x", Some(false)),
+            ("(a x)", Some(false)),
+            ("\"a x\"", None),
+            ("title:[x TO y]", None),
+            ("title:x", None),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(query_str, expected)| prohibited(query_str) != *expected)
+            .map(|(query_str, expected)| {
+                format!(
+                    "'{query_str}': {:?}, expected {expected:?}",
+                    prohibited(query_str)
+                )
+            })
+            .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 

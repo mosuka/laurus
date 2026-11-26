@@ -40,7 +40,7 @@ use regex::Regex;
 
 use crate::engine::search::{FusionAlgorithm, HybridMode, SearchQuery, SearchRequest};
 use crate::error::{LaurusError, Result};
-use crate::lexical::query::parser::LexicalQueryParser;
+use crate::lexical::query::parser::{LexicalQueryParser, bare_terms};
 use crate::lexical::search::searcher::LexicalSearchQuery;
 use crate::vector::query::parser::{VectorQueryParser, removed_marker_error};
 
@@ -181,6 +181,12 @@ impl UnifiedQueryParser {
     /// the removed `~` marker (`content:~"cute kitten"`) or lexical-only
     /// syntax (proximity/fuzzy `~`, range queries).
     ///
+    /// Returns [`LaurusError::InvalidArgument`] if a `-` or `NOT` applies to
+    /// a vector clause, before it (`-content:cats`) or before a group around
+    /// it (`NOT (title:a content:cats)`), before any vector clause is
+    /// embedded (Issue #1751): a vector search ranks the documents nearest to
+    /// the query and has nothing to exclude.
+    ///
     /// Returns [`LaurusError::InvalidArgument`] if a vector field clause's
     /// `^` weight is too large for an `f32` (Issue #1552), before any vector
     /// clause is embedded.
@@ -264,11 +270,18 @@ impl UnifiedQueryParser {
     /// triggers [`HybridMode::Intersection`], requiring documents to appear
     /// in both lexical and vector results.
     ///
+    /// Only what the lexical grammar reads as a clause is a vector clause
+    /// (Issue #1751): `embedding:x` inside a quoted lexical phrase is the
+    /// phrase's text and stays in the lexical part.
+    ///
     /// # Errors
     ///
     /// Returns an error if a vector field clause uses the removed `~` marker
     /// (`content:~"text"`), or lexical-only syntax such as proximity/fuzzy
     /// modifiers (`~`) or range queries (`[`/`{`).
+    ///
+    /// Returns [`LaurusError::InvalidArgument`] if a `-` or `NOT` applies to
+    /// a vector clause, before it or before a group around it (Issue #1751).
     ///
     /// # Returns
     ///
@@ -307,19 +320,42 @@ impl UnifiedQueryParser {
         );
         let vector_re = Regex::new(&clause_pattern).unwrap();
 
+        // The pattern does not see quotes, groups or prohibitions, so ask the
+        // lexical grammar what each match is (Issue #1751). A vector clause
+        // that a `-` or `NOT` applies to is rejected before anything is
+        // embedded; a match that is the text of a phrase stays lexical.
+        let matches: Vec<regex::Captures<'_>> = vector_re.captures_iter(input).collect();
+        let roles = match_roles(input, &matches);
+        if let Some(i) = roles.iter().position(|role| *role == MatchRole::Prohibited) {
+            return Err(LaurusError::invalid_argument(format!(
+                "vector clause '{}' cannot be excluded with '-' or 'NOT': a vector search \
+                 ranks the documents nearest to the query and has nothing to exclude; \
+                 exclude them with a lexical clause or a filter instead",
+                &matches[i][3]
+            )));
+        }
+
         let mut vector_clauses: Vec<String> = Vec::new();
         let mut has_required = false;
-
-        for caps in vector_re.captures_iter(input) {
-            if caps.get(2).is_some() {
-                has_required = true;
+        for (caps, role) in matches.iter().zip(&roles) {
+            if *role == MatchRole::Clause {
+                has_required |= caps.get(2).is_some();
+                vector_clauses.push(caps[3].to_string());
             }
-            vector_clauses.push(caps[3].to_string());
         }
 
         // Remove the clauses (including `+`) but keep the clause start, so a
-        // `(` or `-` before a clause still belongs to the lexical part.
-        let lexical_raw = vector_re.replace_all(input, "${1} ");
+        // `(` before a clause still belongs to the lexical part. A match that
+        // is text stays as written. `replace_all` visits the matches in the
+        // order `captures_iter` gave them.
+        let mut role = roles.iter();
+        let lexical_raw = vector_re.replace_all(input, |caps: &regex::Captures<'_>| {
+            if role.next() == Some(&MatchRole::Text) {
+                caps[0].to_string()
+            } else {
+                format!("{} ", &caps[1])
+            }
+        });
         let lexical_cleaned = clean_lexical_string(&lexical_raw);
 
         let lexical = if lexical_cleaned.is_empty() {
@@ -478,6 +514,65 @@ impl UnifiedQueryParser {
 
         Ok(())
     }
+}
+
+/// What a match of the vector clause pattern is, as the lexical grammar
+/// reads it (Issue #1751).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchRole {
+    /// A vector clause.
+    Clause,
+    /// A vector clause that a `-` or `NOT` applies to, before it or before a
+    /// group around it.
+    Prohibited,
+    /// Text of a lexical clause: inside a phrase, a range or a field's value.
+    Text,
+}
+
+/// The term that stands for the `index`-th match in the copy
+/// [`match_roles`] parses: letters, digits and `_`, a term of its own.
+fn match_placeholder(index: usize) -> String {
+    format!("__laurus_vector_clause_{index}__")
+}
+
+/// What each of `matches` (of the vector clause pattern in `input`) is
+/// (Issue #1751).
+///
+/// In a copy of `input` each match, with its `+`, becomes a placeholder
+/// term, and the lexical grammar alone reads the copy ([`bare_terms`]): a
+/// placeholder that is a term with no field is a vector clause, prohibited
+/// if a `-` or `NOT` applies to it or to a group around it, and any other
+/// match is the text of a lexical clause. If the grammar cannot read the
+/// copy, every match is a vector clause, as before; the lexical parse then
+/// reports the error.
+fn match_roles(input: &str, matches: &[regex::Captures<'_>]) -> Vec<MatchRole> {
+    let mut copy = String::with_capacity(input.len());
+    let mut end = 0;
+    for (index, caps) in matches.iter().enumerate() {
+        // Group 2 is the optional `+`, group 3 the clause.
+        let start = caps
+            .get(2)
+            .or_else(|| caps.get(3))
+            .map_or(end, |m| m.start());
+        copy.push_str(&input[end..start]);
+        copy.push_str(&match_placeholder(index));
+        end = caps.get(0).map_or(start, |m| m.end());
+    }
+    copy.push_str(&input[end..]);
+
+    let Ok(terms) = bare_terms(&copy) else {
+        return vec![MatchRole::Clause; matches.len()];
+    };
+    (0..matches.len())
+        .map(|index| {
+            let placeholder = match_placeholder(index);
+            match terms.iter().find(|term| term.text == placeholder) {
+                Some(term) if term.prohibited => MatchRole::Prohibited,
+                Some(_) => MatchRole::Clause,
+                None => MatchRole::Text,
+            }
+        })
+        .collect()
 }
 
 /// Clean up a lexical query string after vector clause removal.
@@ -1282,7 +1377,9 @@ mod tests {
     }
 
     /// Issue #1373: a vector clause still splits after every character that
-    /// cannot be part of a field name: start, whitespace, `(`, `+`, `-`.
+    /// cannot be part of a field name: start, whitespace, `(`, `+`. After a
+    /// `-` it is a prohibited vector clause, which is rejected (Issue #1751,
+    /// `test_prohibited_vector_clause_is_rejected`).
     #[tokio::test]
     async fn test_vector_clause_boundaries_still_split() {
         let parser = make_parser();
@@ -1291,7 +1388,6 @@ mod tests {
             "title:hello content:cats",
             r#"(content:"cats")"#,
             "+content:cats",
-            "title:hello -content:cats",
         ] {
             let request = parser
                 .parse(query)
@@ -1324,11 +1420,6 @@ mod tests {
                 Some("+title:hello"),
                 "content:cats",
             ),
-            (
-                "-(content:cats) title:hello",
-                Some("title:hello"),
-                "content:cats",
-            ),
         ];
         for (query, lexical, vector) in cases {
             let (lexical_part, vector_part, _) = parser.split_query(query).unwrap();
@@ -1338,6 +1429,42 @@ mod tests {
                 .parse(query)
                 .await
                 .unwrap_or_else(|e| panic!("{query} must parse: {e:?}"));
+        }
+    }
+
+    /// Issue #1751: a vector clause that a `-` or `NOT` applies to, before it
+    /// or before a group around it, is rejected naming the clause. These
+    /// used to split, and the `-` stayed in the lexical part (#1373, #1377).
+    #[test]
+    fn test_prohibited_vector_clause_is_rejected() {
+        let parser = make_parser();
+        for (query, clause) in [
+            ("title:hello -content:cats", "content:cats"),
+            ("-(content:cats) title:hello", "content:cats"),
+            ("NOT content:\"cute kitten\"", "content:\"cute kitten\""),
+            ("NOT (title:hello content:cats^0.5)", "content:cats^0.5"),
+        ] {
+            match parser.split_query(query) {
+                Err(LaurusError::InvalidArgument(message))
+                    if message
+                        .contains(&format!("vector clause '{clause}' cannot be excluded")) => {}
+                other => panic!("{query} must be rejected naming {clause}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #1751: a vector-like text inside a quoted lexical phrase is the
+    /// phrase's text, and stays in the lexical part.
+    #[test]
+    fn test_vector_like_text_in_a_phrase_stays_lexical() {
+        let parser = make_parser();
+        for query in [
+            r#"title:"hello content:cats""#,
+            r#"title:"hello -content:cats" title:world"#,
+        ] {
+            let (lexical, vector, _) = parser.split_query(query).unwrap();
+            assert_eq!(lexical.as_deref(), Some(query), "{query}");
+            assert_eq!(vector, None, "{query}");
         }
     }
 
