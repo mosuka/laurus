@@ -26,6 +26,8 @@ score = IDF * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (doc_len / avg_doc_len))
 
 ワイルドカード・プレフィックス・正規表現クエリのスコアは BM25 ではなく、どのマッチもクエリのブーストの値です。ファジークエリは近い順のタームをスコアの対象にし、近いタームほど高くなります。[ワイルドカード・プレフィックス・正規表現クエリのマッチとスコア](../concepts/search/lexical_search.md#ワイルドカードプレフィックス正規表現クエリのマッチとスコア)と[FuzzyQuery](../concepts/search/lexical_search.md#fuzzyquery) を参照してください。
 
+`Must` 句も `Should` 句も無い `BooleanQuery`（filter だけ、または除外だけ）は、boost にかかわらず、どのマッチにもスコア 0 を付けます（Issue #1744。[BooleanQuery](../concepts/search/lexical_search.md#booleanquery) を参照）。
+
 ### フィールドブースト
 
 フィールドごとのスコア乗数は専用のスコアリング構造体ではなく、検索リクエスト上で設定します。

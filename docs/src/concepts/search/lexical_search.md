@@ -73,6 +73,8 @@ let query = BooleanQueryBuilder::new()
 | `MustNot` | Document MUST NOT match | `-term` or `NOT` |
 | `Filter` | MUST match, but does not affect score | (no DSL equivalent) |
 
+A `BooleanQuery` without a `Must` or `Should` clause — filters alone, negations alone, or both — gives every match the score 0, whatever its boost, as Lucene and Elasticsearch score filters and Elasticsearch a negation alone. Inside another query it adds nothing, and with a `min_score` above 0 it finds nothing. Until Issue #1744 it scored each match as a term that one document has once, except for filters alone in a parallel search, which scored 0.
+
 ### FuzzyQuery
 
 Matches terms within a specified edit distance (Levenshtein distance).
