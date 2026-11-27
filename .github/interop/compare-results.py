@@ -23,6 +23,16 @@ def load_json(path):
         return json.load(f)
 
 
+def load_search_results(path):
+    """The results of a `laurus --format json search` output file.
+
+    The CLI prints `{"results": [...]}`, with `"total_hits"` when asked for
+    (Issue #1472); it printed a bare array of results before. Both sides of
+    the check run the same binary, so both files have this shape.
+    """
+    return load_json(path)["results"]
+
+
 def relative_error(a, b):
     denom = max(abs(a), abs(b), 1e-12)
     return abs(a - b) / denom
@@ -118,8 +128,8 @@ def main():
         if not expected_path.exists() or not actual_path.exists():
             errors.append(f"[{name}] missing result file(s): {filename}")
             continue
-        expected = load_json(expected_path)
-        actual = load_json(actual_path)
+        expected = load_search_results(expected_path)
+        actual = load_search_results(actual_path)
         compare_search_results(name, mode, expected, actual, epsilon, errors)
 
     if errors:
