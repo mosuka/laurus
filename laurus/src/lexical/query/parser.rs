@@ -23,7 +23,8 @@
 //!   `te\*t*` too, read as in Lucene's `WildcardQuery` (#1745)
 //! - Escapes: a backslash before a special character makes it part of a
 //!   term, `a\:b`, and is dropped before the analysis, of a fuzzy term too
-//!   (#1754)
+//!   (#1754); in a quoted phrase or range bound a backslash takes any next
+//!   character literally, `"say \"hi\""` (#1758)
 //! - Boosting: `jakarta^4`; a group's boost multiplies the boosts inside
 //!   it, so `(jakarta^2 apache)^3` boosts `jakarta` by 6 (#1568)
 //! - Grouping: `(title:hello OR body:world)`
@@ -802,12 +803,22 @@ impl LexicalQueryParser {
         })
     }
 
+    /// A range bound: `*`, a quoted string's content with its escapes read
+    /// (Issue #1758), or an unquoted value as written. Trimming the quotes
+    /// off a quoted string would also take an escaped `"` before the closing
+    /// one.
     fn parse_range_value(&self, pair: pest::iterators::Pair<Rule>) -> Result<String> {
         let value = pair.as_str();
         if value == "*" {
-            Ok("*".to_string())
-        } else {
-            Ok(value.trim_matches('"').to_string())
+            return Ok("*".to_string());
+        }
+        let content = pair
+            .into_inner()
+            .find(|inner| inner.as_rule() == Rule::quoted_string)
+            .and_then(|quoted| quoted.into_inner().next());
+        match content {
+            Some(content) => Ok(discard_escapes(content.as_str())),
+            None => Ok(value.trim_matches('"').to_string()),
         }
     }
 
@@ -849,8 +860,9 @@ impl LexicalQueryParser {
 
         for inner_pair in pair.into_inner() {
             match inner_pair.as_rule() {
+                // Without the backslashes of its escapes (Issue #1758).
                 Rule::phrase_content => {
-                    phrase_content = inner_pair.as_str().to_string();
+                    phrase_content = discard_escapes(inner_pair.as_str());
                 }
                 Rule::proximity => {
                     for prox_pair in inner_pair.into_inner() {
@@ -1155,11 +1167,13 @@ impl LexicalQueryParser {
 /// `term` without the backslash of each escape, as Lucene's
 /// `discardEscapeChar`: `a\:b` is `a:b`, and `a\\b` is `a\b` (Issue #1754).
 ///
-/// The grammar takes a backslash in a term only before a special character
-/// (`escaped_char`), so each backslash escapes the character after it. A
-/// plain and a fuzzy term are read through this before the analyzer sees
-/// them; a wildcard keeps its escapes, which `WildcardQuery` reads.
-fn discard_escapes(term: &str) -> String {
+/// Each backslash the grammars let in escapes the character after it: in a
+/// term only a special character (`escaped_char`), and in a quoted string,
+/// a phrase, a range bound or a vector value, any character (Issue #1758).
+/// A plain and a fuzzy term and every quoted string are read through this
+/// before they are analyzed or embedded; a wildcard keeps its escapes, which
+/// `WildcardQuery` reads.
+pub(crate) fn discard_escapes(term: &str) -> String {
     let mut unescaped = String::with_capacity(term.len());
     let mut chars = term.chars();
     while let Some(c) = chars.next() {
@@ -2170,6 +2184,53 @@ mod tests {
                     _ => wrong.push(format!("{dsl}: {query:?}")),
                 },
                 Err(e) => wrong.push(format!("{dsl}: {e}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1758: a quoted phrase and a quoted range bound read their
+    /// escapes, as Lucene's `QUOTED` and `RANGE_QUOTED` do: a backslash takes
+    /// the next character literally, whatever it is, so `\"` does not end
+    /// the string, and the backslash is dropped before the analysis.
+    #[test]
+    fn a_quoted_string_reads_its_escapes() {
+        use crate::analysis::analyzer::keyword::KeywordAnalyzer;
+        let parser =
+            LexicalQueryParser::new(Arc::new(KeywordAnalyzer::new())).with_default_field("title");
+        let mut wrong = Vec::new();
+        for (dsl, expected) in [
+            (r#"title:"say \"hi\"""#, r#"say "hi""#),
+            (r#"title:"a\:b""#, "a:b"),
+            (r#"title:"a\\b""#, r"a\b"),
+            (r#"title:"C:\temp""#, "C:temp"),
+            (r#""say \"hi\"""#, r#"say "hi""#),
+            (r#"title:"say hi"^2"#, "say hi"),
+        ] {
+            match parser.parse(dsl) {
+                Ok(query) => match query.as_any().downcast_ref::<TermQuery>() {
+                    Some(term) if term.term() == expected => {}
+                    _ => wrong.push(format!("{dsl}: {query:?}")),
+                },
+                Err(e) => wrong.push(format!("{dsl}: {e}")),
+            }
+        }
+        let dsl = r#"title:["a\"b" TO "c\\d"]"#;
+        match parser.parse(dsl) {
+            Ok(query) => match query.as_any().downcast_ref::<RangeQuery>() {
+                Some(range)
+                    if (range.lower_bound(), range.upper_bound())
+                        == (
+                            &Bound::Included(r#"a"b"#.to_string()),
+                            &Bound::Included(r"c\d".to_string()),
+                        ) => {}
+                _ => wrong.push(format!("{dsl}: {query:?}")),
+            },
+            Err(e) => wrong.push(format!("{dsl}: {e}")),
+        }
+        for dsl in [r#"title:"say \""#, r#"title:["a\" TO "b"]"#] {
+            if let Ok(query) = parser.parse(dsl) {
+                wrong.push(format!("{dsl}: not closed, but parsed as {query:?}"));
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");

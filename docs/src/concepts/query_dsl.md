@@ -108,6 +108,8 @@ path:"file:///notes/a.md"
 links:"https://example.com/a"
 ```
 
+Inside the quotes a backslash takes the next character literally, whatever it is, as in Lucene's query parser: `"say \"hi\""` is the phrase `say "hi"`, `\\` is a backslash, and a backslash before any other character is dropped before the field's analyzer reads the phrase. So `"C:\temp"` searches `C:temp`, and a path with a backslash is written `"C:\\temp"`. A backslash before the closing quote leaves the phrase unclosed, and the query fails to parse. A quoted [range bound](#range-query) and a quoted [vector value](#basic-syntax) read their escapes the same way. Until Issue #1758 a quoted string ended at the next `"`, and a backslash in it was a character of its own.
+
 When the field's analyzer stacks several tokens at one position, as `SynonymGraphFilter` does, they are alternatives at that position. With `big` and `large` as synonyms, `"big"` matches documents that contain either word, and `"a big dog"` also matches "a large dog". A single position's alternatives are scored as one blended term (a `SynonymQuery`), not summed, so a document containing both `big` and `large` does not score higher than one containing `big` twice. A multi-word synonym makes one phrase per alternative, and the value matches when any of them does: with `ml` and `machine learning` as synonyms, `"ml"` matches `ml` or the phrase `machine learning`. These phrases are matched together through the graph, not one by one, so there is no limit on how many a value makes, and a document gets one phrase score however many of them it contains. See [Synonym Expansion](analysis.md#synonym-expansion).
 
 A phrase of two or more positions compares term positions, which a field stores only with `term_vectors: true` (the default). On a field with `term_vectors: false` the search is rejected with a query error instead of returning no hits. This includes an unfielded phrase that expands over the default fields when one of them has `term_vectors: false`, and a quoted word whose multi-word synonym makes it a phrase, such as `"ml"` above.
@@ -163,7 +165,7 @@ price:[* TO 100]
 - `nan`, `inf` and `infinity`, in any case and with or without a sign, are words, not numbers. Write `*` for an open side: `price:[* TO 100]`, not `price:[-inf TO 100]`.
 - A numeric bound next to a bound that is neither a number nor `*`, such as `price:[100 TO abc]` or `price:[nan TO 100]`, is a parse error (HTTP 400). Such a bound used to leave its side open (Issue #1591).
 - A number too large for a 64-bit float, such as `1e400`, is rejected with `InvalidArgument` (HTTP 400) instead of becoming an infinite bound. A number too small to tell from `0`, such as `1e-400`, is `0`.
-- Quoting a bound does not change its type: `price:["100" TO 500]` is a numeric range.
+- Quoting a bound does not change its type: `price:["100" TO 500]` is a numeric range. A quoted bound reads its escapes as a [phrase](#phrase-query) does (Issue #1758).
 
 #### Date and datetime bounds
 
@@ -323,6 +325,7 @@ geo_distance   = { ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
 geo_bbox       = { ^"geo_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
 phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
+phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity      = { "~" ~ number }
 fuzzy_term     = { term ~ "~" ~ fuzziness? ~ boost? }
 wildcard_term  = { wildcard_pattern ~ boost? }
@@ -349,7 +352,7 @@ The field name must refer to a vector field defined in the schema. The parser us
 | Element | Required | Description | Example |
 | :--- | :---: | :--- | :--- |
 | `field:` | **Yes** | Target vector field name (must be a vector field in the schema) | `content:` |
-| `"text"` or `text` | **Yes** | Text to embed (quoted or unquoted). In the unified DSL an unquoted value ends at whitespace or a parenthesis, so `(content:cats)` closes its group; quote the text to include them (Issue #1377). If the embedder returns a vector with a `NaN` or infinite component, the search fails with `InvalidArgument` (HTTP 400) as soon as the clause is embedded (Issue #1573). So does a vector of another dimension than the field, once the DSL is parsed, whatever the data (Issue #1575) | `"cute kitten"`, `python` |
+| `"text"` or `text` | **Yes** | Text to embed (quoted or unquoted). In the unified DSL an unquoted value ends at whitespace or a parenthesis, so `(content:cats)` closes its group; quote the text to include them (Issue #1377). In quoted text a backslash takes the next character literally, as in a [phrase](#phrase-query), so `\"` does not end it, and the text is embedded without the backslashes (Issue #1758). If the embedder returns a vector with a `NaN` or infinite component, the search fails with `InvalidArgument` (HTTP 400) as soon as the clause is embedded (Issue #1573). So does a vector of another dimension than the field, once the DSL is parsed, whatever the data (Issue #1575) | `"cute kitten"`, `python` |
 | `^weight` | No | Score weight (default: 1.0). A number too large for a 32-bit float is rejected with `InvalidArgument` (HTTP 400) before any clause is embedded; see [Weights](search/vector_search.md#weights) for the range (Issue #1552) | `^0.8` |
 
 Versions before 0.6.0 marked a vector clause with `~` (`content:~"cute kitten"`). The marker is no longer part of the syntax: both `VectorQueryParser` and the unified parser reject a vector clause whose value starts with an unquoted `~`, with an error that names the marker (Issue #1495). Quote text that starts with `~`: `content:"~text"`.
@@ -411,12 +414,12 @@ The full vector grammar ([parser.pest](https://github.com/mosuka/laurus/blob/mai
 
 ```pest
 query          = { SOI ~ vector_clause+ ~ EOI }
-vector_clause  = { field_prefix ~ (quoted_text | unquoted_text) ~ boost? }
+vector_clause  = { field_prefix? ~ (quoted_text | plain_text) ~ boost? }
 field_prefix   = { field_name ~ ":" }
 field_name     = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 quoted_text    = ${ "\"" ~ inner_text ~ "\"" }
-inner_text     = @{ (!("\"") ~ ANY)* }
-unquoted_text  = @{ (!(" " | "^" | "\"") ~ ANY)+ }
+inner_text     = @{ ("\\" ~ ANY | !("\"") ~ ANY)* }
+plain_text     = @{ (!(WHITESPACE | "\"" | "^") ~ ANY)+ }
 boost          = { "^" ~ float_value }
 float_value    = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 ```

@@ -96,6 +96,8 @@ path:"file:///notes/a.md"
 links:"https://example.com/a"
 ```
 
+引用符の中では、Lucene のクエリパーサーと同じく、バックスラッシュが次の 1 文字をどの文字でもそのままの文字にします。`"say \"hi\""` はフレーズ `say "hi"` に、`\\` はバックスラッシュになり、ほかの文字の前のバックスラッシュは、フィールドのアナライザーがフレーズを読む前に取り除かれます。このため `"C:\temp"` は `C:temp` を検索し、バックスラッシュを含むパスは `"C:\\temp"` と書きます。閉じの引用符の前にバックスラッシュがあるとフレーズが閉じず、クエリはパースエラーになります。引用符で囲んだ[範囲の境界](#範囲クエリ)と[ベクトルの値](#基本構文)も、同じくエスケープを読みます。Issue #1758 までは、引用符の中は次の `"` で終わり、中のバックスラッシュはそのまま 1 文字として残っていました。
+
 `SynonymGraphFilter` のように、フィールドのアナライザーが 1 つの位置に複数のトークンを積む場合、それらはその位置の代替語になります。`big` と `large` を同義語とすると、`"big"` はどちらかの語を含む文書にマッチし、`"a big dog"` は「a large dog」にもマッチします。1 つの位置の代替語は合算ではなく 1 つのブレンドされたターム（`SynonymQuery`）としてスコア付けされるため、`big` と `large` の両方を含む文書が `big` を 2 回含む文書より高いスコアになることはありません。複数語の同義語は代替語ごとに 1 つのフレーズになり、どれか 1 つがマッチすれば値がマッチします。`ml` と `machine learning` を同義語とすると、`"ml"` は `ml` か、フレーズ `machine learning` にマッチします。これらのフレーズは 1 つずつではなくグラフに沿ってまとめてマッチするので、値が生むフレーズの数に上限はなく、文書はいくつのフレーズを含んでも 1 つのフレーズとしてスコアが付きます。[同義語展開](analysis.md#同義語展開)を参照してください。
 
 2 位置以上のフレーズはタームの位置情報（ポジション）を比較します。ポジションは `term_vectors: true`（デフォルト）のフィールドにだけ保存されます。`term_vectors: false` のフィールドに対するフレーズは、0 件を返すのではなくクエリエラーで拒否されます。フィールドを指定しないフレーズがデフォルトフィールドに展開され、その中に `term_vectors: false` のフィールドが含まれる場合も同様です。上の `"ml"` のように、複数語の同義語でフレーズになる引用符付きの語も同様です。
@@ -151,7 +153,7 @@ price:[* TO 100]
 - `nan`、`inf`、`infinity` は、大文字小文字や符号にかかわらず、数ではなく単語です。開放する側には `*` を書きます（`price:[-inf TO 100]` ではなく `price:[* TO 100]`）。
 - 数の境界と、数でも `*` でもない境界を混ぜた範囲（`price:[100 TO abc]`、`price:[nan TO 100]`）は、パースエラー（HTTP 400）になります。以前は、そのような境界の側が開放されていました（Issue #1591）。
 - 64 ビット浮動小数点数に収まらない数（`1e400` など）は、無限大の境界にはならず、`InvalidArgument`（HTTP 400）で拒否されます。`0` と区別できないほど小さい数（`1e-400` など）は `0` になります。
-- 境界を引用符で囲んでも、種類は変わりません。`price:["100" TO 500]` は数値の範囲です。
+- 境界を引用符で囲んでも、種類は変わりません。`price:["100" TO 500]` は数値の範囲です。引用符で囲んだ境界は、[フレーズ](#フレーズクエリ)と同じくエスケープを読みます（Issue #1758）。
 
 #### 日付・日時の境界
 
@@ -307,6 +309,7 @@ geo_distance   = { ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
 geo_bbox       = { ^"geo_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
 phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
+phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity      = { "~" ~ number }
 fuzzy_term     = { term ~ "~" ~ fuzziness? ~ boost? }
 wildcard_term  = { wildcard_pattern ~ boost? }
@@ -331,7 +334,7 @@ field:"text"^weight
 | 要素 | 必須 | 説明 | 例 |
 | :--- | :---: | :--- | :--- |
 | `field:` | **はい** | 対象のベクトルフィールド名（スキーマでベクトルフィールドとして定義されている必要があります） | `content:` |
-| `"text"` または `text` | **はい** | エンベディングするテキスト（クォート付きまたはクォートなし）。統合 DSL では、クォートなしの値は空白か括弧で終わるので、`(content:cats)` はそのままグループを閉じる。空白や括弧を含めるときはクォートで囲む（Issue #1377）。エンベダーが `NaN` や無限大の成分を持つベクトルを返すと、句を埋め込んだ時点で検索は `InvalidArgument`（HTTP 400）で失敗する（Issue #1573）。フィールドと次元の違うベクトルを返した場合も、DSL を解析した時点で、データによらず同じく失敗する（Issue #1575） | `"cute kitten"`、`python` |
+| `"text"` または `text` | **はい** | エンベディングするテキスト（クォート付きまたはクォートなし）。統合 DSL では、クォートなしの値は空白か括弧で終わるので、`(content:cats)` はそのままグループを閉じる。空白や括弧を含めるときはクォートで囲む（Issue #1377）。クォートの中では、[フレーズ](#フレーズクエリ)と同じくバックスラッシュが次の 1 文字をそのままの文字にするので、`\"` はクォートを終えず、テキストはバックスラッシュを除いてエンベディングされる（Issue #1758）。エンベダーが `NaN` や無限大の成分を持つベクトルを返すと、句を埋め込んだ時点で検索は `InvalidArgument`（HTTP 400）で失敗する（Issue #1573）。フィールドと次元の違うベクトルを返した場合も、DSL を解析した時点で、データによらず同じく失敗する（Issue #1575） | `"cute kitten"`、`python` |
 | `^weight` | いいえ | スコアウェイト（デフォルト: 1.0）。32 ビットの浮動小数点数に収まらない数は、どの句も埋め込む前に `InvalidArgument`（HTTP 400）で拒否されます。範囲は[ウェイト](search/vector_search.md#ウェイト)を参照してください（Issue #1552） | `^0.8` |
 
 0.6.0 より前のバージョンでは、ベクトル句に `~` を付けていました（`content:~"cute kitten"`）。この記号はもう構文にありません。`VectorQueryParser` も統合パーサーも、値がクォートの外の `~` で始まるベクトル句を、記号を名指しするエラーで拒否します（Issue #1495）。`~` で始まるテキストはクォートで囲みます（`content:"~text"`）。
@@ -393,12 +396,12 @@ request.score_mode = VectorScoreMode::MaxSim;
 
 ```pest
 query          = { SOI ~ vector_clause+ ~ EOI }
-vector_clause  = { field_prefix ~ (quoted_text | unquoted_text) ~ boost? }
+vector_clause  = { field_prefix? ~ (quoted_text | plain_text) ~ boost? }
 field_prefix   = { field_name ~ ":" }
 field_name     = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 quoted_text    = ${ "\"" ~ inner_text ~ "\"" }
-unquoted_text  = @{ (!(WHITE_SPACE | "^" | "\"") ~ ANY)+ }
-inner_text     = @{ (!("\"") ~ ANY)* }
+inner_text     = @{ ("\\" ~ ANY | !("\"") ~ ANY)* }
+plain_text     = @{ (!(WHITESPACE | "\"" | "^") ~ ANY)+ }
 boost          = { "^" ~ float_value }
 float_value    = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 ```

@@ -74,8 +74,12 @@ range_value = { "*" | quoted_string | unquoted_value }
 unquoted_value = @{ (!WHITESPACE ~ !"TO" ~ !"]" ~ !"}" ~ ANY)+ }
 
 // Phrase queries: "hello world" or "hello world"~10
+// A backslash takes the next character literally, whatever it is, so `\"`
+// does not end the phrase (issue #1758), as in Lucene's `QUOTED`; the parser
+// drops the backslashes before the analysis. A quoted range bound and a
+// quoted vector value read the same way.
 phrase_query = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
-phrase_content = @{ (!"\"" ~ ANY)* }
+phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity = { "~" ~ number }
 
 // Fuzzy queries: term~2
@@ -128,9 +132,10 @@ escaped_char = @{ "\\" ~ special_char | normal_char }
 special_char = { "+" | "-" | "!" | "(" | ")" | "{" | "}" | "[" | "]" | "^" | "\"" | "~" | "*" | "?" | ":" | "\\" | "/" }
 normal_char = @{ LETTER | NUMBER | "_" | "-" | "'" }
 
-// Quoted string
+// Quoted string (a range bound), with the escapes of a phrase (issue #1758),
+// as in Lucene's `RANGE_QUOTED`
 quoted_string = { "\"" ~ quoted_content ~ "\"" }
-quoted_content = @{ (!"\"" ~ ANY)* }
+quoted_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 
 // Number
 number = @{ ASCII_DIGIT+ }
