@@ -46,8 +46,12 @@ use crate::lexical::core::field::NumericType;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::fuzzy::FuzzyQuery;
-use crate::lexical::query::geo::{GeoBoundingBoxQuery, GeoDistanceQuery, GeoPolygonQuery};
-use crate::lexical::query::geo3d::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery};
+use crate::lexical::query::geo::{
+    GeoBoundingBoxQuery, GeoDistanceQuery, GeoPolygonQuery, GeoPolylineQuery,
+};
+use crate::lexical::query::geo3d::{
+    Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery, Geo3dPolyline, Geo3dPolylineQuery,
+};
 use crate::lexical::query::graph_phrase::{
     GraphPhraseQuery, PhraseArc, complete_paths_with_origins,
 };
@@ -465,13 +469,41 @@ impl LexicalQueryParser {
                 Rule::geo3d_distance => return self.parse_geo3d_distance(inner, field),
                 Rule::geo3d_bbox => return self.parse_geo3d_bbox(inner, field),
                 Rule::geo3d_nearest => return self.parse_geo3d_nearest(inner, field),
+                Rule::geo3d_polyline => return self.parse_geo3d_polyline(inner, field),
                 _ => {}
             }
         }
         Err(LaurusError::parse(
-            "Invalid 3D geo query (expected geo3d_distance / geo3d_bbox / geo3d_nearest)"
+            "Invalid 3D geo query \
+             (expected geo3d_distance / geo3d_bbox / geo3d_nearest / geo3d_polyline)"
                 .to_string(),
         ))
+    }
+
+    /// `field:geo3d_polyline((x, y, z, ...), distance_m)`: the points within
+    /// `distance_m` metres of the straight segments through the vertices
+    /// (Issue #1596).
+    fn parse_geo3d_polyline(
+        &self,
+        pair: pest::iterators::Pair<Rule>,
+        field: &str,
+    ) -> Result<Box<dyn Query>> {
+        let (numbers, distance_m) = polyline_arguments(pair)?;
+        if numbers.len() % 3 != 0 {
+            return Err(LaurusError::parse(format!(
+                "geo3d_polyline expects x, y and z for each vertex, and has {} numbers",
+                numbers.len()
+            )));
+        }
+        let vertices = numbers
+            .chunks(3)
+            .map(|xyz| GeoEcefPoint::new(xyz[0], xyz[1], xyz[2]))
+            .collect();
+        let polyline = Geo3dPolyline::new(vertices)
+            .map_err(|e| LaurusError::parse(format!("invalid geo3d_polyline arguments: {e}")))?;
+        Ok(Box::new(Geo3dPolylineQuery::new(
+            field, polyline, distance_m,
+        )))
     }
 
     fn parse_geo3d_distance(
@@ -575,11 +607,36 @@ impl LexicalQueryParser {
                 Rule::geo_distance => return self.parse_geo_distance(inner, field),
                 Rule::geo_bbox => return self.parse_geo_bbox(inner, field),
                 Rule::geo_polygon => return self.parse_geo_polygon(inner, field),
+                Rule::geo_polyline => return self.parse_geo_polyline(inner, field),
                 _ => {}
             }
         }
         Err(LaurusError::parse(
-            "Invalid 2D geo query (expected geo_distance / geo_bbox / geo_polygon)".to_string(),
+            "Invalid 2D geo query \
+             (expected geo_distance / geo_bbox / geo_polygon / geo_polyline)"
+                .to_string(),
+        ))
+    }
+
+    /// `field:geo_polyline((lat, lon, ...), distance_m)`: the points within
+    /// `distance_m` metres of the polyline through the vertices, latitude
+    /// first as in the other geo functions (Issue #1596).
+    fn parse_geo_polyline(
+        &self,
+        pair: pest::iterators::Pair<Rule>,
+        field: &str,
+    ) -> Result<Box<dyn Query>> {
+        let (numbers, distance_m) = polyline_arguments(pair)?;
+        if numbers.len() % 2 != 0 {
+            return Err(LaurusError::parse(format!(
+                "geo_polyline expects pairs of latitude and longitude, and has {} numbers",
+                numbers.len()
+            )));
+        }
+        let vertices: Vec<(f64, f64)> = numbers.chunks(2).map(|pair| (pair[0], pair[1])).collect();
+        Ok(Box::new(
+            GeoPolylineQuery::within_distance(field, &vertices, distance_m)
+                .map_err(|e| LaurusError::parse(format!("invalid geo_polyline arguments: {e}")))?,
         ))
     }
 
@@ -592,7 +649,7 @@ impl LexicalQueryParser {
     ) -> Result<Box<dyn Query>> {
         let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
         for ring in pair.into_inner() {
-            if ring.as_rule() != Rule::geo_ring {
+            if ring.as_rule() != Rule::geo_vertices {
                 continue;
             }
             let numbers = collect_signed_floats(ring)?;
@@ -1442,6 +1499,34 @@ fn group_tokens_by_position(tokens: Vec<Token>) -> Vec<PositionTerms> {
 /// and [`LexicalQueryParser::parse_geo3d_bbox`] which both take only
 /// floats; `geo3d_nearest` mixes floats with an `unsigned_int` and
 /// inlines its own walk.
+/// The arguments of `geo_polyline` and `geo3d_polyline`: the numbers of the
+/// vertices, and the distance after them.
+fn polyline_arguments(pair: pest::iterators::Pair<Rule>) -> Result<(Vec<f64>, f64)> {
+    let mut numbers = Vec::new();
+    let mut distance = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::geo_vertices => numbers = collect_signed_floats(inner)?,
+            Rule::signed_float => {
+                let s = inner.as_str();
+                distance.push(
+                    s.parse::<f64>()
+                        .map_err(|e| LaurusError::parse(format!("invalid float '{s}': {e}")))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    // The grammar gives one list of vertices and one distance.
+    match distance.as_slice() {
+        [distance] => Ok((numbers, *distance)),
+        _ => Err(LaurusError::parse(format!(
+            "a polyline expects its vertices and one distance, and has {} distances",
+            distance.len()
+        ))),
+    }
+}
+
 fn collect_signed_floats(pair: pest::iterators::Pair<Rule>) -> Result<Vec<f64>> {
     let mut out = Vec::new();
     for inner in pair.into_inner() {

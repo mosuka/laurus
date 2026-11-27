@@ -41,7 +41,11 @@ field_value = { geo3d_query | geo_query | range_query | phrase_query | fuzzy_ter
 //   field:geo3d_distance(x, y, z, distance_m)
 //   field:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)
 //   field:geo3d_nearest(x, y, z, k)
-geo3d_query = { geo3d_distance | geo3d_bbox | geo3d_nearest }
+//   field:geo3d_polyline((x, y, z, x, y, z, ...), distance_m)
+// A polyline's vertices are joined in order by straight segments (issue
+// #1596).
+geo3d_query = { geo3d_distance | geo3d_bbox | geo3d_nearest | geo3d_polyline }
+geo3d_polyline = { ^"geo3d_polyline" ~ "(" ~ geo_vertices ~ "," ~ signed_float ~ ")" }
 geo3d_distance = {
     ^"geo3d_distance" ~ "(" ~ signed_float ~ "," ~ signed_float ~ "," ~ signed_float ~ "," ~ signed_float ~ ")"
 }
@@ -52,15 +56,20 @@ geo3d_nearest = {
     ^"geo3d_nearest" ~ "(" ~ signed_float ~ "," ~ signed_float ~ "," ~ signed_float ~ "," ~ unsigned_int ~ ")"
 }
 
-// 2D geo queries (latitude / longitude in degrees, distance in km):
+// 2D geo queries (latitude / longitude in degrees, distance in metres):
 //   field:geo_distance(lat, lon, distance_m)
 //   field:geo_bbox(min_lat, min_lon, max_lat, max_lon)
 //   field:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
+//   field:geo_polyline((lat, lon, lat, lon, ...), distance_m)
 // A polygon's first ring is the exterior and the others are holes, each a
-// list of latitude and longitude pairs (issue #1596).
-geo_query = { geo_distance | geo_bbox | geo_polygon }
-geo_polygon = { ^"geo_polygon" ~ "(" ~ geo_ring ~ ("," ~ geo_ring)* ~ ")" }
-geo_ring = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
+// list of latitude and longitude pairs; a polyline's vertices are joined in
+// order by great-circle arcs (issue #1596).
+geo_query = { geo_distance | geo_bbox | geo_polygon | geo_polyline }
+geo_polygon = { ^"geo_polygon" ~ "(" ~ geo_vertices ~ ("," ~ geo_vertices)* ~ ")" }
+geo_polyline = { ^"geo_polyline" ~ "(" ~ geo_vertices ~ "," ~ signed_float ~ ")" }
+// The coordinates of vertices, in parentheses: of a ring of `geo_polygon`,
+// or of `geo_polyline` and `geo3d_polyline`.
+geo_vertices = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
 geo_distance = {
     ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float ~ "," ~ signed_float ~ ")"
 }

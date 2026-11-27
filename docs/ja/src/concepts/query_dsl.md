@@ -189,13 +189,14 @@ created_at:{2024-01-01 TO 2025-01-01}
 
 ### 2D 地理クエリ（`geo_*`)
 
-3 種類の関数形式を `Geo`（2D 緯度 / 経度）フィールドに対して使えます。
+4 種類の関数形式を `Geo`（2D 緯度 / 経度）フィールドに対して使えます。
 緯度・経度は度単位、距離はメートル単位の符号付き浮動小数点数：
 
 ```text
 location:geo_distance(lat, lon, distance_m)
 location:geo_bbox(min_lat, min_lon, max_lat, max_lon)
 location:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
+location:geo_polyline((lat, lon, lat, lon, ...), distance_m)
 ```
 
 | 形式 | 動作 |
@@ -203,6 +204,7 @@ location:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
 | `geo_distance(lat, lon, distance_m)` | 中心 `(lat, lon)` から `distance_m` メートル以内の格納済み座標を返す |
 | `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | 緯度・経度の矩形（端を含む）に含まれる格納済み座標を返す。`min_lon > max_lon` のときはボックスが日付変更線（±180°）をまたぐ（GeoJSON と同じ）。端がちょうど ±180° のときは、どちらの符号で保存された点にもマッチする |
 | `geo_polygon((lat, lon, ...), (lat, lon, ...), ...)` | 多角形の中の格納済み座標を返す（Issue #1596）。最初の環が外周、続く環が穴で、それぞれ緯度と経度の組の並び（閉じていてもいなくてもよく、異なる点が 3 つ以上）。Lucene と同じく、外周の辺と頂点の上の点はマッチし、穴の辺と頂点の上の点はマッチしない。辺は 2 つの頂点の間の近いほうを通るので、170 度から -170 度への辺は日付変更線をまたぐ。180 度より広い辺には間に頂点を置く必要があり、極を囲む環は拒否する。点数はどの一致も boost の値 |
+| `geo_polyline((lat, lon, ...), distance_m)` | 頂点を順につないだ折れ線から `distance_m` メートル以内の格納済み座標を返す（Issue #1596）。頂点は 1 つ以上の緯度と経度の組。距離は `geo_distance` と同じく地表の距離で、各辺は 2 つの頂点の間の短いほうの大円の弧。垂線の足が辺の外に出る点は近い端までを測るので、端と角は丸くなる。多角形の辺は緯度・経度の上の直線だが、折れ線の辺は大円に沿うので、`(10, 0)` から `(10, 170)` への辺は北緯 63.7 度の近くを通る。頂点が 1 つなら `geo_distance` と同じ。対蹠点（とそこから約 640 m 以内）を結ぶ辺は、最短の弧が 1 つに決まらないので拒否する。日付変更線をまたぐ辺に特別な書き方は要らない。点数は `1 - d / distance_m`（`d` は最も近い点の距離） |
 
 例：
 
@@ -222,6 +224,9 @@ location:geo_polygon((35.0, 139.0, 35.0, 140.0, 36.0, 140.0, 36.0, 139.0),
 
 # 太平洋の上: 170 度から -170 度への辺が日付変更線をまたぐ
 location:geo_polygon((-20.0, 170.0, -20.0, -170.0, -10.0, -170.0, -10.0, 170.0))
+
+# 東京から名古屋を経て大阪へ向かう経路から 2 km 以内
+location:geo_polyline((35.68, 139.76, 35.17, 136.91, 34.69, 135.50), 2000)
 ```
 
 > クエリ対象フィールドはスキーマで `Geo` フィールドとして宣言されている必要が
@@ -229,13 +234,14 @@ location:geo_polygon((-20.0, 170.0, -20.0, -170.0, -10.0, -170.0, -10.0, 170.0))
 
 ### 3D 地理クエリ（`geo3d_*`）
 
-3 種類の関数形式を `Geo3d`（3D ECEF 直交座標）フィールドに対して使えます。
+4 種類の関数形式を `Geo3d`（3D ECEF 直交座標）フィールドに対して使えます。
 `k` 以外の引数はすべてメートル単位の符号付き浮動小数点数、`k` のみ符号なし整数：
 
 ```text
 position:geo3d_distance(x, y, z, distance_m)
 position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)
 position:geo3d_nearest(x, y, z, k)
+position:geo3d_polyline((x, y, z, x, y, z, ...), distance_m)
 ```
 
 | 形式 | 動作 |
@@ -243,6 +249,7 @@ position:geo3d_nearest(x, y, z, k)
 | `geo3d_distance(x, y, z, distance_m)` | `(x, y, z)` から `distance_m` メートル以内の格納済みポイントを返す |
 | `geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | 軸並行 3D ボックスに含まれる格納済みポイントを返す |
 | `geo3d_nearest(x, y, z, k)` | `(x, y, z)` に最も近い `k` 件をユークリッド距離順で返す |
+| `geo3d_polyline((x, y, z, ...), distance_m)` | 頂点 `(x, y, z)`（1 つ以上）を順につないだ線分から `distance_m` メートル以内の格納済みポイントを返す（Issue #1596）。辺は弦なので、長さ `L` の辺の中ほどは地表から約 `L² / 8R` 下を通る（100 km の辺で 196 m）。頂点が 1 つなら `geo3d_distance` と同じ。点数は `1 - d / distance_m`（`d` は最も近い点の距離） |
 
 例：
 
@@ -255,6 +262,9 @@ position:geo3d_bbox(-4000000, 3300000, 3650000, -3900000, 3400000, 3750000)
 
 # 最も近い 10 件
 position:geo3d_nearest(-3955182, 3350553, 3700276, 10)
+
+# 飛行経路から 500 m 以内（ECEF 座標）
+position:geo3d_polyline((-3955182, 3350553, 3700276, -3940000, 3360000, 3710000), 500)
 ```
 
 > クエリ対象フィールドはスキーマで `Geo3d` として宣言されている必要があります。
@@ -304,7 +314,7 @@ not_op         = @{ "NOT" ~ !keyword_tail }
 field_query    = { field ~ ":" ~ field_value }
 field_value    = { geo3d_query | geo_query | range_query | phrase_query
                  | fuzzy_term | wildcard_term | simple_term }
-geo3d_query    = { geo3d_distance | geo3d_bbox | geo3d_nearest }
+geo3d_query    = { geo3d_distance | geo3d_bbox | geo3d_nearest | geo3d_polyline }
 geo3d_distance = { ^"geo3d_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
 geo3d_bbox     = { ^"geo3d_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
@@ -312,13 +322,15 @@ geo3d_bbox     = { ^"geo3d_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ signed_float ~ "," ~ signed_float ~ ")" }
 geo3d_nearest  = { ^"geo3d_nearest" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ unsigned_int ~ ")" }
-geo_query      = { geo_distance | geo_bbox | geo_polygon }
+geo3d_polyline = { ^"geo3d_polyline" ~ "(" ~ geo_vertices ~ "," ~ signed_float ~ ")" }
+geo_query      = { geo_distance | geo_bbox | geo_polygon | geo_polyline }
 geo_distance   = { ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ ")" }
 geo_bbox       = { ^"geo_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
-geo_polygon    = { ^"geo_polygon" ~ "(" ~ geo_ring ~ ("," ~ geo_ring)* ~ ")" }
-geo_ring       = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
+geo_polygon    = { ^"geo_polygon" ~ "(" ~ geo_vertices ~ ("," ~ geo_vertices)* ~ ")" }
+geo_polyline   = { ^"geo_polyline" ~ "(" ~ geo_vertices ~ "," ~ signed_float ~ ")" }
+geo_vertices   = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
 phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
 phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity      = { "~" ~ number }

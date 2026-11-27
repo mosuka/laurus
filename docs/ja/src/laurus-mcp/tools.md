@@ -78,7 +78,7 @@ schema_json: {"fields": {"title": {"Text": {}}, "body": {"Text": {}}}}
 }
 ```
 
-座標系については [3D 地理検索 (ECEF)](../concepts/geo3d.md) を参照してください。`Geo3d` フィールドは `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` の DSL 形式で検索できます（後述の **search** ツールを参照）。
+座標系については [3D 地理検索 (ECEF)](../concepts/geo3d.md) を参照してください。`Geo3d` フィールドは `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` / `geo3d_polyline` の DSL 形式で検索できます（後述の **search** ツールを参照）。
 
 ---
 
@@ -413,6 +413,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `position:geo3d_distance(x, y, z, distance_m)` | `(x, y, z)` を中心とした最大距離（メートル単位）の球 |
 | `position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | 3D 軸並行バウンディングボックス |
 | `position:geo3d_nearest(x, y, z, k)` | `(x, y, z)` に最も近い k 個の近傍点 |
+| `position:geo3d_polyline((x, y, z, ...), distance_m)` | 頂点 `(x, y, z)` を順につないだ線分から `distance_m` メートル以内 |
 
 `position` はフィールド名で、スキーマで宣言した実際の `Geo3d` 型フィールドに置き換えてください。完全な DSL 構文は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-地理クエリgeo3d_) を参照してください。
 

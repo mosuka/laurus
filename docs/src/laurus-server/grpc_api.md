@@ -611,11 +611,12 @@ At least one of `query` or `query_vectors` must be provided.
 
 ### 3D Geographic Queries
 
-3D ECEF geographic queries are expressed in the lexical DSL string passed via `SearchRequest.query`. There is no dedicated message type — the same DSL forms used by the core library work over gRPC. Three forms are available (see [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic-queries-geo3d_) for full syntax):
+3D ECEF geographic queries are expressed in the lexical DSL string passed via `SearchRequest.query`. There is no dedicated message type — the same DSL forms used by the core library work over gRPC. Four forms are available (see [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic-queries-geo3d_) for full syntax):
 
 - `position:geo3d_distance(x, y, z, distance_m)` — sphere centered at `(x, y, z)` with maximum distance in meters
 - `position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` — 3D axis-aligned bounding box
 - `position:geo3d_nearest(x, y, z, k)` — k nearest neighbours to `(x, y, z)`
+- `position:geo3d_polyline((x, y, z, ...), distance_m)` — within `distance_m` meters of the straight segments through the vertices `(x, y, z)`, in order
 
 `position` is the field name; substitute the actual `Geo3d`-typed field declared in your schema. All numeric arguments are signed `double` values; `k` is an unsigned integer.
 

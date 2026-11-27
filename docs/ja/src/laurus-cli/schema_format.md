@@ -206,7 +206,7 @@ doc_values = true
 
 #### Geo3d
 
-3D Earth-Centered Earth-Fixed (ECEF) 直交座標系の点フィールド（x / y / z はメートル単位）。`geo3d_distance`（球）、`geo3d_bbox`（3D AABB）、`geo3d_nearest`（k-NN）クエリをサポートします。座標系および `wgs84_to_ecef` / `ecef_to_wgs84` の変換ユーティリティについては [3D 地理検索 (ECEF)](../concepts/geo3d.md) を参照してください。
+3D Earth-Centered Earth-Fixed (ECEF) 直交座標系の点フィールド（x / y / z はメートル単位）。`geo3d_distance`（球）、`geo3d_bbox`（3D AABB）、`geo3d_nearest`（k-NN）、`geo3d_polyline`（折れ線から距離以内）クエリをサポートします。座標系および `wgs84_to_ecef` / `ecef_to_wgs84` の変換ユーティリティについては [3D 地理検索 (ECEF)](../concepts/geo3d.md) を参照してください。
 
 ```toml
 [fields.position.Geo3d]
@@ -218,9 +218,9 @@ doc_values = true
 
 | オプション | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | 3D 地理クエリ（`geo3d_distance`、`geo3d_bbox`、`geo3d_nearest`）を有効にする |
+| `indexed` | `bool` | `true` | 3D 地理クエリ（`geo3d_distance`、`geo3d_bbox`、`geo3d_nearest`、`geo3d_polyline`）を有効にする |
 | `stored` | `bool` | `true` | 元の `(x, y, z)` 値を保存する |
-| `multi_valued` | `bool` | `false` | ポイントの配列を受け付け、`geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` クエリは**いずれかのポイント**が条件を満たせばマッチ（Lucene 流の "any match"）。スコアはドキュメント内で最も近いポイントで決まる |
+| `multi_valued` | `bool` | `false` | ポイントの配列を受け付け、`geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` / `geo3d_polyline` クエリは**いずれかのポイント**が条件を満たせばマッチ（Lucene 流の "any match"）。スコアはドキュメント内で最も近いポイントで決まる |
 | `doc_values` | `bool` | `true` | 詳細は後述の [共通オプション: `doc_values`](#共通オプション-doc_values) を参照 |
 
 #### Bytes

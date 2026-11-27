@@ -3,9 +3,10 @@
 //! Covers `BKDReader::range_search` (the legacy axis-aligned API) and
 //! `BKDReader::intersect` (the visitor-driven primitive that 3D distance,
 //! k-NN, and other custom-shape queries will be built on) across 1D, 2D,
-//! and 3D datasets at 10k / 100k / 1M points, and `GeoPolygonQuery`
-//! (Issue #1596) against `GeoBoundingBoxQuery` over the same extent, through
-//! a `LexicalStore` of 100k `Geo` points.
+//! and 3D datasets at 10k / 100k / 1M points, and, through a `LexicalStore`
+//! of 100k points (Issue #1596): `GeoPolygonQuery` against
+//! `GeoBoundingBoxQuery` over the same extent, and `GeoPolylineQuery` and
+//! `Geo3dPolylineQuery` against the distance query of their field type.
 //!
 //! # Running
 //!
@@ -21,6 +22,7 @@
 //! cargo bench --bench bkd_bench -- range_search/3d/100000
 //! cargo bench --bench bkd_bench -- intersect_counting
 //! cargo bench --bench bkd_bench -- geo_polygon_count
+//! cargo bench --bench bkd_bench -- polyline_count
 //! ```
 //!
 //! Compile-only smoke check (skips the runtime, used by CI):
@@ -36,14 +38,18 @@
 mod common;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use laurus::lexical::core::field::{FieldOption, GeoOption};
+use laurus::lexical::core::field::{FieldOption, Geo3dOption, GeoOption};
 use laurus::lexical::index::structures::aabb::AABB;
 use laurus::lexical::index::structures::bkd_tree::{BKDReader, BKDTree, BKDWriter};
 use laurus::lexical::index::structures::visitor::{CellRelation, IntersectVisitor};
-use laurus::lexical::query::{GeoBoundingBoxQuery, GeoPoint, GeoPolygonQuery, Query};
+use laurus::lexical::query::{
+    Geo3dDistanceQuery, Geo3dPolyline, Geo3dPolylineQuery, GeoBoundingBoxQuery, GeoDistanceQuery,
+    GeoPoint, GeoPolygonQuery, GeoPolylineQuery, Query,
+};
 use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore};
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
+use laurus::util::ecef::wgs84_to_ecef;
 use laurus::{DataValue, Document};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -297,11 +303,129 @@ fn bench_geo_polygon_count(c: &mut Criterion) {
     group.finish();
 }
 
+/// A `LexicalStore` of the points of [`build_geo_store`] on the surface in
+/// ECEF, in a `Geo3d` field `position`, in one segment with a BKD tree.
+fn build_geo3d_store(n: usize) -> LexicalStore {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder()
+        .add_field("position", FieldOption::Geo3d(Geo3dOption::default()))
+        .build();
+    let store = LexicalStore::new(storage, config).unwrap();
+    let mut rng_state: u64 = DEFAULT_SEED;
+    for id in 0..n as u64 {
+        let lat = 30.0 + lcg_next(&mut rng_state) * 0.015;
+        let lon = 130.0 + lcg_next(&mut rng_state) * 0.015;
+        let doc = Document::builder()
+            .add_field("position", DataValue::GeoEcef(wgs84_to_ecef(lat, lon, 0.0)))
+            .build();
+        store.upsert_document(id, doc).unwrap();
+    }
+    store.commit().unwrap();
+    store
+}
+
+/// A zigzag of `vertices` vertices across latitudes 33 to 42 and longitudes
+/// 133 to 142.
+fn zigzag(vertices: usize) -> Vec<(f64, f64)> {
+    (0..vertices)
+        .map(|i| {
+            let t = i as f64 / (vertices - 1).max(1) as f64;
+            (if i % 2 == 0 { 33.0 } else { 42.0 }, 133.0 + 9.0 * t)
+        })
+        .collect()
+}
+
+/// Count `queries` over `store` in the group `name`.
+fn bench_counts(
+    c: &mut Criterion,
+    name: &str,
+    n: usize,
+    store: &LexicalStore,
+    queries: &[(&str, Box<dyn Query>)],
+) {
+    let mut group = c.benchmark_group(name);
+    group.throughput(Throughput::Elements(n as u64));
+    for (label, query) in queries {
+        group.bench_function(BenchmarkId::from_parameter(format!("{label}/{n}")), |b| {
+            b.iter(|| {
+                let request = LexicalSearchRequest::new(query.clone_box());
+                black_box(store.count(black_box(request)).unwrap());
+            });
+        });
+    }
+    group.finish();
+}
+
+/// `GeoPolylineQuery` within 50 km against `GeoDistanceQuery` of the same
+/// radius: a single vertex (the circle), 2 vertices, and zigzags of 4 and 16
+/// vertices across the points. The polyline prunes by each edge's bounds,
+/// so a diagonal edge visits the cells of its whole bounding box.
+fn bench_geo_polyline_count(c: &mut Criterion) {
+    let n = 100_000;
+    let store = build_geo_store(n);
+    let distance_m = 50_000.0;
+    let polyline = |vertices: &[(f64, f64)]| -> Box<dyn Query> {
+        Box::new(GeoPolylineQuery::within_distance("location", vertices, distance_m).unwrap())
+    };
+    let queries: Vec<(&str, Box<dyn Query>)> = vec![
+        (
+            "geo_distance",
+            Box::new(GeoDistanceQuery::within_radius("location", 37.5, 137.5, distance_m).unwrap()),
+        ),
+        ("polyline_1_vertex", polyline(&[(37.5, 137.5)])),
+        (
+            "polyline_2_vertices",
+            polyline(&[(35.0, 135.0), (40.0, 140.0)]),
+        ),
+        ("polyline_4_vertices", polyline(&zigzag(4))),
+        ("polyline_16_vertices", polyline(&zigzag(16))),
+    ];
+    bench_counts(c, "geo_polyline_count", n, &store, &queries);
+}
+
+/// `Geo3dPolylineQuery` within 50 km against `Geo3dDistanceQuery` of the
+/// same radius, over the points of [`bench_geo_polyline_count`] in ECEF.
+fn bench_geo3d_polyline_count(c: &mut Criterion) {
+    let n = 100_000;
+    let store = build_geo3d_store(n);
+    let distance_m = 50_000.0;
+    let polyline = |vertices: &[(f64, f64)]| -> Box<dyn Query> {
+        let path = Geo3dPolyline::new(
+            vertices
+                .iter()
+                .map(|&(lat, lon)| wgs84_to_ecef(lat, lon, 0.0))
+                .collect(),
+        )
+        .unwrap();
+        Box::new(Geo3dPolylineQuery::new("position", path, distance_m))
+    };
+    let queries: Vec<(&str, Box<dyn Query>)> = vec![
+        (
+            "geo3d_distance",
+            Box::new(Geo3dDistanceQuery::new(
+                "position",
+                wgs84_to_ecef(37.5, 137.5, 0.0),
+                distance_m,
+            )),
+        ),
+        ("polyline_1_vertex", polyline(&[(37.5, 137.5)])),
+        (
+            "polyline_2_vertices",
+            polyline(&[(35.0, 135.0), (40.0, 140.0)]),
+        ),
+        ("polyline_4_vertices", polyline(&zigzag(4))),
+        ("polyline_16_vertices", polyline(&zigzag(16))),
+    ];
+    bench_counts(c, "geo3d_polyline_count", n, &store, &queries);
+}
+
 criterion_group!(
     benches,
     bench_range_search,
     bench_intersect_counting,
     bench_build,
-    bench_geo_polygon_count
+    bench_geo_polygon_count,
+    bench_geo_polyline_count,
+    bench_geo3d_polyline_count
 );
 criterion_main!(benches);

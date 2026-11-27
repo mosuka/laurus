@@ -330,39 +330,16 @@ impl GeoDistanceQuery {
         for (doc_id, point) in candidates {
             let distance = self.center.distance_to(&point);
             if distance <= self.distance_m {
-                let score = if distance == 0.0 {
-                    1.0
-                } else {
-                    // Simple inverse distance scoring
-                    (1.0 - (distance / self.distance_m)).max(0.0) as f32
-                };
-
                 matches.push(GeoMatch {
                     doc_id,
                     point,
                     distance_m: distance,
-                    relevance_score: score,
+                    relevance_score: distance_score(distance, self.distance_m),
                 });
             }
         }
 
-        // Multi-segment readers and multi-valued fields can produce
-        // duplicates; keep the closest point per document.
-        matches.sort_by(|a, b| {
-            a.doc_id
-                .cmp(&b.doc_id)
-                .then_with(|| a.distance_m.total_cmp(&b.distance_m))
-        });
-        matches.dedup_by_key(|m| m.doc_id);
-
-        // Sort by distance (closest first), then by relevance score
-        matches.sort_by(|a, b| {
-            a.distance_m
-                .total_cmp(&b.distance_m)
-                .then_with(|| b.relevance_score.total_cmp(&a.relevance_score))
-        });
-
-        Ok(matches)
+        Ok(closest_per_document(matches))
     }
 
     /// The lat/lon rectangle(s) enclosing the spherical cap of radius
@@ -384,8 +361,6 @@ impl GeoDistanceQuery {
     /// circle crossing the antimeridian, containing a pole, or large at high
     /// latitude lost the matches outside the box before the exact test ran.
     fn cap_bounds(&self) -> CapBounds {
-        const EARTH_RADIUS_M: f64 = 6_371_000.0;
-
         if self.distance_m.is_nan() || self.distance_m <= 0.0 {
             // Zero, negative or NaN radius: only the centre itself can match.
             return CapBounds {
@@ -424,23 +399,12 @@ impl GeoDistanceQuery {
             };
         }
 
-        let min_lon = self.center.lon - lon_delta;
-        let max_lon = self.center.lon + lon_delta;
-        // `<=` / `>=`: a range ending exactly on the antimeridian also
-        // covers the point stored with the other sign (-180 == 180).
-        let lon_ranges = if min_lon <= -180.0 {
-            vec![(-180.0, max_lon), (min_lon + 360.0, 180.0)]
-        } else if max_lon >= 180.0 {
-            vec![(min_lon, 180.0), (-180.0, max_lon - 360.0)]
-        } else {
-            vec![(min_lon, max_lon)]
-        };
-
-        CapBounds {
+        CapBounds::with_lon_span(
             min_lat,
             max_lat,
-            lon_ranges,
-        }
+            self.center.lon - lon_delta,
+            self.center.lon + lon_delta,
+        )
     }
 
     /// Get spatial candidates from the index within the cap bounds.
@@ -495,9 +459,39 @@ impl GeoDistanceQuery {
     }
 }
 
+/// The score of a match at `distance` metres of a query reaching `radius`
+/// metres: `1` at distance 0, falling linearly to `0` at the radius.
+fn distance_score(distance: f64, radius: f64) -> f32 {
+    if distance == 0.0 {
+        1.0
+    } else {
+        (1.0 - (distance / radius)).max(0.0) as f32
+    }
+}
+
+/// `matches` with the closest one per document only, closest first.
+/// Multi-segment readers and multi-valued fields can produce several
+/// matches per document.
+fn closest_per_document(mut matches: Vec<GeoMatch>) -> Vec<GeoMatch> {
+    matches.sort_by(|a, b| {
+        a.doc_id
+            .cmp(&b.doc_id)
+            .then_with(|| a.distance_m.total_cmp(&b.distance_m))
+    });
+    matches.dedup_by_key(|m| m.doc_id);
+    // Sort by distance (closest first), then by relevance score
+    matches.sort_by(|a, b| {
+        a.distance_m
+            .total_cmp(&b.distance_m)
+            .then_with(|| b.relevance_score.total_cmp(&a.relevance_score))
+    });
+    matches
+}
+
 /// Lat/lon bounds of a spherical cap: one latitude span and one or two
 /// closed longitude ranges (two when the cap crosses the antimeridian).
-/// Built by [`GeoDistanceQuery::cap_bounds`].
+/// Built by [`GeoDistanceQuery::cap_bounds`], and for each edge of a
+/// [`GeoPolyline`].
 #[derive(Debug, Clone, PartialEq)]
 struct CapBounds {
     min_lat: f64,
@@ -513,6 +507,40 @@ impl CapBounds {
             max_lat: 90.0,
             lon_ranges: vec![(-180.0, 180.0)],
         }
+    }
+
+    /// The bounds of the latitudes `[min_lat, max_lat]` and of the
+    /// longitudes eastward from `min_lon` to `max_lon`, which may go past
+    /// ±180 on one side and are split there; a span of 360 degrees or more
+    /// is every longitude.
+    fn with_lon_span(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Self {
+        // `<=` / `>=`: a range ending exactly on the antimeridian also
+        // covers the point stored with the other sign (-180 == 180).
+        let lon_ranges = if max_lon - min_lon >= 360.0 {
+            vec![(-180.0, 180.0)]
+        } else if min_lon <= -180.0 {
+            vec![(-180.0, max_lon), (min_lon + 360.0, 180.0)]
+        } else if max_lon >= 180.0 {
+            vec![(min_lon, 180.0), (-180.0, max_lon - 360.0)]
+        } else {
+            vec![(min_lon, max_lon)]
+        };
+        CapBounds {
+            min_lat,
+            max_lat,
+            lon_ranges,
+        }
+    }
+
+    /// Whether the bounds meet the closed cell from `min` to `max`
+    /// (`[lat, lon]`, longitudes within `[-180, 180]`).
+    fn meets(&self, min: &[f64], max: &[f64]) -> bool {
+        max[0] >= self.min_lat
+            && min[0] <= self.max_lat
+            && self
+                .lon_ranges
+                .iter()
+                .any(|&(min_lon, max_lon)| max[1] >= min_lon && min[1] <= max_lon)
     }
 
     /// Whether `point` lies inside the bounds (closed on every edge).
@@ -1631,6 +1659,558 @@ impl Query for GeoPolygonQuery {
         Some(format!(
             "geopolygon|{:?}|{:?}|{:?}",
             self.field, self.polygon.exterior, self.polygon.holes
+        ))
+    }
+}
+
+/// The radius of the sphere [`GeoPoint::distance_to`] measures on, in
+/// metres: the mean radius of the Earth.
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
+
+/// At or below this `|a × b|`, with `a · b > 0`, the two ends of an edge
+/// are one point (about 6 µm apart on the surface).
+const SAME_POINT_SINE: f64 = 1e-12;
+
+/// Below this `|a × b|`, with `a · b < 0`, the ends of an edge are within
+/// about 640 m of antipodal: no single shortest arc joins antipodal points,
+/// and the plane through ends this near them is too ill-conditioned.
+const NEAR_ANTIPODAL_SINE: f64 = 1e-4;
+
+type Vec3 = [f64; 3];
+
+fn dot(a: Vec3, b: Vec3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn norm(a: Vec3) -> f64 {
+    dot(a, a).sqrt()
+}
+
+/// The unit vector of `point` on the sphere.
+fn unit_vector(point: &GeoPoint) -> Vec3 {
+    let (lat, lon) = (point.lat.to_radians(), point.lon.to_radians());
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+}
+
+/// The great circle of an edge of a [`GeoPolyline`] whose ends are apart.
+#[derive(Debug, Clone, PartialEq)]
+struct EdgeArc {
+    /// The unit normal of the plane of the arc, the direction of `a × b`.
+    normal: Vec3,
+    /// `normal × a`: a point is past the start of the arc when it is on the
+    /// non-negative side of this.
+    after_start: Vec3,
+    /// `b × normal`: a point is before the end of the arc when it is on the
+    /// non-negative side of this.
+    before_end: Vec3,
+}
+
+/// An edge of a [`GeoPolyline`]: the shorter great-circle arc from `start`
+/// to `end`, or a point when they are one.
+#[derive(Debug, Clone, PartialEq)]
+struct PolylineEdge {
+    start: GeoPoint,
+    end: GeoPoint,
+    /// `None` for an edge of length 0.
+    arc: Option<EdgeArc>,
+}
+
+impl PolylineEdge {
+    /// The edge from `start` to `end`, the `index`-th of its polyline.
+    fn new(index: usize, start: GeoPoint, end: GeoPoint) -> Result<Self> {
+        let (a, b) = (unit_vector(&start), unit_vector(&end));
+        // `(b + a) × (b − a)` is `2 (a × b)`, and keeps a rounding error near
+        // the machine epsilon for a short edge (`b − a` is exact) and for
+        // one near antipodal (`b + a` is exact), where `a × b` loses it:
+        // the idea of S2's `RobustCrossProd`.
+        let doubled = cross(
+            [b[0] + a[0], b[1] + a[1], b[2] + a[2]],
+            [b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+        );
+        let length = norm(doubled);
+        let (sine, cosine) = (length / 2.0, dot(a, b));
+        let arc = if cosine > 0.0 && sine <= SAME_POINT_SINE {
+            None
+        } else if cosine < 0.0 && sine < NEAR_ANTIPODAL_SINE {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "edge {index} of the polyline, from ({}, {}) to ({}, {}), joins antipodal \
+                 points or points within about 640 m of them, which no single shortest arc \
+                 joins; add a vertex between them",
+                start.lat, start.lon, end.lat, end.lon
+            )));
+        } else {
+            let normal = [
+                doubled[0] / length,
+                doubled[1] / length,
+                doubled[2] / length,
+            ];
+            Some(EdgeArc {
+                normal,
+                after_start: cross(normal, a),
+                before_end: cross(b, normal),
+            })
+        };
+        Ok(PolylineEdge { start, end, arc })
+    }
+
+    /// The distance in metres from `point`, whose unit vector is `p`, to
+    /// the edge: to the arc's closest point when the foot of the
+    /// perpendicular is on the arc, and to the nearer end in any case.
+    fn distance_to(&self, point: &GeoPoint, p: Vec3) -> f64 {
+        let ends = self
+            .start
+            .distance_to(point)
+            .min(self.end.distance_to(point));
+        match &self.arc {
+            Some(arc) if dot(p, arc.after_start) >= 0.0 && dot(p, arc.before_end) >= 0.0 => {
+                // The angle between `p` and the plane of the arc.
+                let across = dot(p, arc.normal).abs();
+                let along = norm(cross(p, arc.normal));
+                ends.min(across.atan2(along) * EARTH_RADIUS_M)
+            }
+            _ => ends,
+        }
+    }
+
+    /// Conservative lat/lon bounds of the points within `delta` radians of
+    /// the edge on the sphere, padded by [`ON_EDGE_DEGREES`].
+    fn bounds(&self, delta: f64) -> CapBounds {
+        if delta >= std::f64::consts::PI {
+            return CapBounds::whole_sphere();
+        }
+        let delta_deg = delta.to_degrees();
+        let mut south = self.start.lat.min(self.end.lat);
+        let mut north = self.start.lat.max(self.end.lat);
+        if let Some(arc) = &self.arc {
+            // The great circle reaches `acos(|n_z|)` at its northernmost
+            // point, the north pole projected on its plane, `z − n_z n`.
+            // That point is on the arc when it is on the non-negative side
+            // of both `n × a` and `b × n`, and its dot product with them is
+            // their `z` component; the southernmost point is its opposite.
+            let top = arc.normal[2].abs().min(1.0).acos().to_degrees();
+            if arc.after_start[2] >= 0.0 && arc.before_end[2] >= 0.0 {
+                north = north.max(top);
+            }
+            if arc.after_start[2] <= 0.0 && arc.before_end[2] <= 0.0 {
+                south = south.min(-top);
+            }
+        }
+        let min_lat = (south - delta_deg - ON_EDGE_DEGREES).max(-90.0);
+        let max_lat = (north + delta_deg + ON_EDGE_DEGREES).min(90.0);
+        let mut d_lon = self.end.lon - self.start.lon;
+        if d_lon > 180.0 {
+            d_lon -= 360.0;
+        } else if d_lon < -180.0 {
+            d_lon += 360.0;
+        }
+        let highest = south.abs().max(north.abs());
+        if highest + delta_deg >= 90.0 - ON_EDGE_DEGREES || d_lon.abs() >= 180.0 - ON_EDGE_DEGREES {
+            // The bounds reach a pole, or the edge goes over one: every
+            // meridian passes near it.
+            return CapBounds {
+                min_lat,
+                max_lat,
+                lon_ranges: vec![(-180.0, 180.0)],
+            };
+        }
+        // Along an arc that does not pass a pole the longitude changes
+        // monotonically, the shorter way. A cap of radius δ at latitude φ
+        // spans `asin(sin δ / cos φ)` either way, which grows with |φ|.
+        let widen = (delta.sin() / highest.to_radians().cos())
+            .min(1.0)
+            .asin()
+            .to_degrees()
+            + ON_EDGE_DEGREES;
+        let (west, east) = if d_lon >= 0.0 {
+            (self.start.lon, self.start.lon + d_lon)
+        } else {
+            (self.start.lon + d_lon, self.start.lon)
+        };
+        CapBounds::with_lon_span(min_lat, max_lat, west - widen, east + widen)
+    }
+}
+
+/// A polyline on the surface: vertices of latitudes and longitudes joined in
+/// order, for [`GeoPolylineQuery`] (Issue #1596).
+///
+/// Each edge is the shorter great-circle arc between its vertices, so the
+/// distance from a point to the polyline is on the surface, as
+/// [`GeoPoint::distance_to`]'s: to the closest point of an arc, or to an end
+/// past it, so the ends and corners are round. A polygon's edges, unlike
+/// these, are straight lines in latitude and longitude (see
+/// [`GeoPolygon`]): the arc between two points at 10°N, 170 degrees of
+/// longitude apart, rises to about 63.7°N midway.
+///
+/// A single vertex is a point, and repeated vertices are fine: an edge of
+/// length 0 is its point. An edge between antipodal points, or points
+/// within about 640 m of them, is rejected, since no single shortest arc
+/// joins them; an edge across the antimeridian needs nothing special.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoPolyline {
+    /// The vertices as given.
+    vertices: Vec<GeoPoint>,
+    /// The edges in order; a single vertex is one edge of length 0.
+    edges: Vec<PolylineEdge>,
+}
+
+impl GeoPolyline {
+    /// Create a polyline through `vertices`, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError)
+    /// if there is no vertex, a coordinate is not a latitude in `[-90, 90]`
+    /// or a longitude in `[-180, 180]`, or an edge joins antipodal points
+    /// or points within about 640 m of them.
+    pub fn new(vertices: Vec<GeoPoint>) -> Result<Self> {
+        if vertices.is_empty() {
+            return Err(crate::error::LaurusError::invalid_argument(
+                "a polyline needs at least one vertex".to_string(),
+            ));
+        }
+        for (i, vertex) in vertices.iter().enumerate() {
+            if !(-90.0..=90.0).contains(&vertex.lat) {
+                return Err(crate::error::LaurusError::invalid_argument(format!(
+                    "vertex {i} of the polyline has the latitude {}, which is not within [-90, 90]",
+                    vertex.lat
+                )));
+            }
+            if !(-180.0..=180.0).contains(&vertex.lon) {
+                return Err(crate::error::LaurusError::invalid_argument(format!(
+                    "vertex {i} of the polyline has the longitude {}, which is not within \
+                     [-180, 180]",
+                    vertex.lon
+                )));
+            }
+        }
+        let edges = if let [vertex] = vertices.as_slice() {
+            vec![PolylineEdge::new(0, *vertex, *vertex)?]
+        } else {
+            vertices
+                .windows(2)
+                .enumerate()
+                .map(|(i, edge)| PolylineEdge::new(i, edge[0], edge[1]))
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(GeoPolyline { vertices, edges })
+    }
+
+    /// The vertices, in order.
+    pub fn vertices(&self) -> &[GeoPoint] {
+        &self.vertices
+    }
+
+    /// The distance in metres from `point` to the polyline, on the sphere
+    /// of [`GeoPoint::distance_to`]. For a single vertex it is exactly
+    /// `vertex.distance_to(point)`.
+    pub fn distance_to(&self, point: &GeoPoint) -> f64 {
+        let p = unit_vector(point);
+        self.edges
+            .iter()
+            .map(|edge| edge.distance_to(point, p))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// For each edge, the bounds of the points within `distance_m` of it.
+    fn edge_bounds(&self, distance_m: f64) -> Vec<CapBounds> {
+        let delta = distance_m / EARTH_RADIUS_M;
+        self.edges.iter().map(|edge| edge.bounds(delta)).collect()
+    }
+
+    /// The distance from `point` to the edges whose `bounds` hold it, or
+    /// `None` when none does: such a point is farther from every edge than
+    /// the distance the bounds were made for.
+    fn distance_within(&self, point: &GeoPoint, bounds: &[CapBounds]) -> Option<f64> {
+        let p = unit_vector(point);
+        self.edges
+            .iter()
+            .zip(bounds)
+            .filter(|(_, bounds)| bounds.contains(point))
+            .map(|(edge, _)| edge.distance_to(point, p))
+            .reduce(f64::min)
+    }
+}
+
+/// [`IntersectVisitor`] collecting the points within a distance of a
+/// [`GeoPolyline`], with their distances. The score needs every point's
+/// distance, so `compare` never returns [`CellRelation::Inside`], as
+/// [`GeoBoxPointsVisitor`] does not.
+#[derive(Debug)]
+struct GeoPolylineVisitor<'a> {
+    polyline: &'a GeoPolyline,
+    /// The bounds of each edge, from [`GeoPolyline::edge_bounds`].
+    bounds: &'a [CapBounds],
+    /// The latitudes every bound lies within.
+    min_lat: f64,
+    max_lat: f64,
+    distance_m: f64,
+    /// `(doc_id, point, distance)` of every point within the distance.
+    hits: Vec<(u64, GeoPoint, f64)>,
+    /// How many points were tested one by one, for the pruning test.
+    #[cfg(test)]
+    visited: usize,
+}
+
+impl<'a> GeoPolylineVisitor<'a> {
+    fn new(polyline: &'a GeoPolyline, bounds: &'a [CapBounds], distance_m: f64) -> Self {
+        GeoPolylineVisitor {
+            polyline,
+            bounds,
+            min_lat: bounds
+                .iter()
+                .map(|b| b.min_lat)
+                .fold(f64::INFINITY, f64::min),
+            max_lat: bounds
+                .iter()
+                .map(|b| b.max_lat)
+                .fold(f64::NEG_INFINITY, f64::max),
+            distance_m,
+            hits: Vec::new(),
+            #[cfg(test)]
+            visited: 0,
+        }
+    }
+}
+
+impl IntersectVisitor for GeoPolylineVisitor<'_> {
+    fn compare(&self, cell: &AABB) -> CellRelation {
+        debug_assert_eq!(cell.num_dims(), 2, "GeoPolylineVisitor expects a 2D BKD");
+        let (min, max) = (cell.min(), cell.max());
+        if max[0] < self.min_lat || min[0] > self.max_lat {
+            return CellRelation::Outside;
+        }
+        if self.bounds.iter().any(|bounds| bounds.meets(min, max)) {
+            // Never Inside: the score needs each point's distance.
+            CellRelation::Crosses
+        } else {
+            CellRelation::Outside
+        }
+    }
+
+    fn visit_inside(&mut self, _doc_id: u64) {
+        // Unreachable: `compare` never returns Inside, and a doc id alone
+        // has no distance to score by.
+    }
+
+    fn visit(&mut self, doc_id: u64, point: &[f64]) {
+        #[cfg(test)]
+        {
+            self.visited += 1;
+        }
+        let point = GeoPoint::new(point[0], point[1]);
+        if let Some(distance) = self.polyline.distance_within(&point, self.bounds)
+            && distance <= self.distance_m
+        {
+            self.hits.push((doc_id, point, distance));
+        }
+    }
+}
+
+/// A query for the documents with a point of a `Geo` field within a
+/// distance of a [`GeoPolyline`] (Issue #1596): along a road, a railway, a
+/// river or a route.
+///
+/// The distance is measured on the surface, as [`GeoDistanceQuery`]'s, and
+/// the score is the same: `1 - d / distance_m`, `d` being the distance of
+/// the document's closest point to the polyline. A single vertex finds the
+/// documents, and gives the scores, that [`GeoDistanceQuery`] does.
+///
+/// # Example
+///
+/// ```rust
+/// use laurus::lexical::query::GeoPolylineQuery;
+///
+/// // Within 2 km of a route from Tokyo through Nagoya to Osaka, latitude
+/// // first.
+/// let query = GeoPolylineQuery::within_distance(
+///     "location",
+///     &[(35.68, 139.76), (35.17, 136.91), (34.69, 135.50)],
+///     2_000.0,
+/// )
+/// .unwrap();
+/// ```
+#[derive(Debug, Clone)]
+pub struct GeoPolylineQuery {
+    /// Field containing geographical coordinates.
+    field: String,
+    /// The polyline.
+    polyline: GeoPolyline,
+    /// The maximum distance from the polyline, in metres.
+    distance_m: f64,
+    /// Boost factor for the query.
+    boost: f32,
+}
+
+impl GeoPolylineQuery {
+    /// Create a query for the points within `distance_m` metres of
+    /// `polyline`.
+    pub fn new<F: Into<String>>(field: F, polyline: GeoPolyline, distance_m: f64) -> Self {
+        GeoPolylineQuery {
+            field: field.into(),
+            polyline,
+            distance_m,
+            boost: 1.0,
+        }
+    }
+
+    /// Create a query from `(lat, lon)` vertices, in order, and a distance
+    /// in metres.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`GeoPolyline::new`] returns.
+    pub fn within_distance<F: Into<String>>(
+        field: F,
+        vertices: &[(f64, f64)],
+        distance_m: f64,
+    ) -> Result<Self> {
+        let polyline = GeoPolyline::new(
+            vertices
+                .iter()
+                .map(|&(lat, lon)| GeoPoint { lat, lon })
+                .collect(),
+        )?;
+        Ok(GeoPolylineQuery::new(field, polyline, distance_m))
+    }
+
+    /// Set the boost factor.
+    pub fn with_boost(mut self, boost: f32) -> Self {
+        self.boost = boost;
+        self
+    }
+
+    /// Get the field name.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// Get the polyline.
+    pub fn polyline(&self) -> &GeoPolyline {
+        &self.polyline
+    }
+
+    /// Get the maximum distance from the polyline, in metres.
+    pub fn distance_m(&self) -> f64 {
+        self.distance_m
+    }
+
+    /// The documents with a point within the distance, each once with its
+    /// closest point, closest first.
+    pub fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<GeoMatch>> {
+        let mut found: Vec<(u64, GeoPoint, f64)> = Vec::new();
+        // A negative or NaN distance holds nothing, as for
+        // `GeoDistanceQuery`.
+        if self.distance_m >= 0.0 {
+            let bounds = self.polyline.edge_bounds(self.distance_m);
+            if let Some(bkd_tree) = reader.get_bkd_tree(&self.field)? {
+                let mut visitor = GeoPolylineVisitor::new(&self.polyline, &bounds, self.distance_m);
+                bkd_tree.intersect(&mut visitor)?;
+                found = visitor.hits;
+            } else {
+                // Without a BKD, the stored values of the documents present
+                // in this reader; a multi-valued field gives every point.
+                for doc_id in scan_doc_ids(reader)? {
+                    if let Some(doc) = reader.document(doc_id)?
+                        && let Some(value) = doc.get_field(&self.field)
+                    {
+                        for point in stored_geo_points(value) {
+                            if let Some(distance) = self.polyline.distance_within(&point, &bounds)
+                                && distance <= self.distance_m
+                            {
+                                found.push((doc_id, point, distance));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let matches = found
+            .into_iter()
+            .map(|(doc_id, point, distance)| GeoMatch {
+                doc_id,
+                point,
+                distance_m: distance,
+                relevance_score: distance_score(distance, self.distance_m),
+            })
+            .collect();
+        Ok(closest_per_document(matches))
+    }
+}
+
+impl Query for GeoPolylineQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
+    fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
+        Ok(Box::new(GeoMatcher::new(self.find_matches(reader)?)))
+    }
+
+    fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
+        Ok(Box::new(GeoScorer::new(
+            self.find_matches(reader)?,
+            self.boost,
+        )))
+    }
+
+    fn matcher_scorer(
+        &self,
+        reader: &dyn LexicalIndexReader,
+    ) -> Result<(Box<dyn Matcher>, Box<dyn Scorer>)> {
+        // One traversal for both, as `GeoDistanceQuery` does (#996).
+        let matches = self.find_matches(reader)?;
+        Ok((
+            Box::new(GeoMatcher::new(matches.clone())),
+            Box::new(GeoScorer::new(matches, self.boost)),
+        ))
+    }
+
+    fn boost(&self) -> f32 {
+        self.boost
+    }
+
+    fn set_boost(&mut self, boost: f32) {
+        self.boost = boost;
+    }
+
+    fn clone_box(&self) -> Box<dyn Query> {
+        Box::new(self.clone())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "GeoPolylineQuery(field: {}, vertices: {:?}, distance: {}m)",
+            self.field, self.polyline.vertices, self.distance_m
+        )
+    }
+
+    fn is_empty(&self, _reader: &dyn LexicalIndexReader) -> Result<bool> {
+        Ok(self.distance_m <= 0.0)
+    }
+
+    fn cost(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
+        // The same shape as `GeoDistanceQuery::cost`.
+        Ok(reader.doc_count().saturating_mul(2))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn cache_key(&self) -> Option<String> {
+        // Field, vertices and distance determine the matched set; the boost
+        // is score-only and excluded.
+        Some(format!(
+            "geopolyline|{:?}|{:?}|{:?}",
+            self.field, self.polyline.vertices, self.distance_m
         ))
     }
 }
@@ -3049,6 +3629,316 @@ mod tests {
                 visited * 10 < n as usize
             };
             if !pruned {
+                wrong.push(format!(
+                    "{name}: tested {visited} of {n} points one by one, for {} hits",
+                    found.len()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    fn polyline(vertices: &[(f64, f64)]) -> GeoPolyline {
+        GeoPolyline::new(
+            vertices
+                .iter()
+                .map(|&(lat, lon)| GeoPoint::new(lat, lon))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    /// The point `distance` radians from `from` in the direction `bearing`
+    /// (radians clockwise from north), on the unit sphere.
+    fn destination(from: &GeoPoint, bearing: f64, distance: f64) -> GeoPoint {
+        let (lat, lon) = (from.lat.to_radians(), from.lon.to_radians());
+        let lat2 = (lat.sin() * distance.cos() + lat.cos() * distance.sin() * bearing.cos())
+            .clamp(-1.0, 1.0)
+            .asin();
+        let lon2 = lon
+            + (bearing.sin() * distance.sin() * lat.cos())
+                .atan2(distance.cos() - lat.sin() * lat2.sin());
+        let mut lon2 = lon2.to_degrees();
+        while lon2 > 180.0 {
+            lon2 -= 360.0;
+        }
+        while lon2 < -180.0 {
+            lon2 += 360.0;
+        }
+        GeoPoint::new(lat2.to_degrees().clamp(-90.0, 90.0), lon2)
+    }
+
+    /// The point a fraction `t` of the way along the arc from `a` to `b`.
+    fn along(a: &GeoPoint, b: &GeoPoint, t: f64) -> GeoPoint {
+        let (va, vb) = (unit_vector(a), unit_vector(b));
+        let angle = norm(cross(va, vb)).atan2(dot(va, vb));
+        if angle < 1e-15 {
+            return *a;
+        }
+        let (wa, wb) = (
+            ((1.0 - t) * angle).sin() / angle.sin(),
+            (t * angle).sin() / angle.sin(),
+        );
+        let v = [
+            wa * va[0] + wb * vb[0],
+            wa * va[1] + wb * vb[1],
+            wa * va[2] + wb * vb[2],
+        ];
+        GeoPoint::new(
+            v[2].atan2(v[0].hypot(v[1])).to_degrees(),
+            v[1].atan2(v[0]).to_degrees(),
+        )
+    }
+
+    /// Issue #1596: distances with an exact answer: over the inside of an
+    /// equatorial edge, beside a meridian, past an end, to a single vertex,
+    /// to an edge of length 0, and beside an edge 1 cm long.
+    #[test]
+    fn a_polyline_measures_exact_distances() {
+        let radius = EARTH_RADIUS_M;
+        let mut wrong = Vec::new();
+        let mut check = |name: &str, found: f64, expected: f64, tolerance: f64| {
+            if (found - expected).abs() > tolerance {
+                wrong.push(format!("{name}: {found}, expected {expected}"));
+            }
+        };
+        let equator = polyline(&[(0.0, 10.0), (0.0, 40.0)]);
+        check(
+            "over an equatorial edge",
+            equator.distance_to(&GeoPoint::new(1.5, 25.0)),
+            1.5_f64.to_radians() * radius,
+            1e-6,
+        );
+        check(
+            "past its end",
+            equator.distance_to(&GeoPoint::new(0.0, 45.0)),
+            GeoPoint::new(0.0, 40.0).distance_to(&GeoPoint::new(0.0, 45.0)),
+            1e-6,
+        );
+        let meridian = polyline(&[(10.0, 20.0), (50.0, 20.0)]);
+        check(
+            "beside a meridian",
+            meridian.distance_to(&GeoPoint::new(30.0, 21.0)),
+            (30.0_f64.to_radians().cos() * 1.0_f64.to_radians().sin()).asin() * radius,
+            1e-6,
+        );
+        let vertex = GeoPoint::new(35.5, 139.5);
+        let point = GeoPoint::new(35.7, 139.9);
+        check(
+            "a single vertex, exactly",
+            polyline(&[(35.5, 139.5)]).distance_to(&point),
+            vertex.distance_to(&point),
+            0.0,
+        );
+        check(
+            "an edge of length 0 on the antimeridian",
+            polyline(&[(0.0, 180.0), (0.0, -180.0)]).distance_to(&GeoPoint::new(0.0, 170.0)),
+            10.0_f64.to_radians() * radius,
+            1e-6,
+        );
+        // About 111 m north of the middle of an edge 9 mm long: as far as
+        // from its ends, within a millimetre.
+        let short = polyline(&[(35.0, 139.0), (35.0, 139.000_000_1)]);
+        let beside = GeoPoint::new(35.001, 139.000_000_05);
+        check(
+            "beside an edge 9 mm long",
+            short.distance_to(&beside),
+            GeoPoint::new(35.0, 139.0).distance_to(&beside),
+            1e-3,
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1596: an edge's bounds hold the arc's highest latitude between
+    /// its vertices, every longitude for an edge over or at a pole, and both
+    /// sides of the antimeridian for an edge across it.
+    #[test]
+    fn an_edge_s_bounds_hold_its_arc() {
+        let delta = 1_000.0 / EARTH_RADIUS_M;
+        let bounds = |vertices: &[(f64, f64)]| polyline(vertices).edge_bounds(1_000.0)[0].clone();
+        let mut wrong = Vec::new();
+
+        let high = bounds(&[(10.0, 0.0), (10.0, 170.0)]);
+        if high.max_lat < 63.69 || !high.contains(&GeoPoint::new(63.69, 85.0)) {
+            wrong.push(format!("an arc rising to 63.7°N: {high:?}"));
+        }
+        let south = bounds(&[(-10.0, 0.0), (-10.0, 170.0)]);
+        if south.min_lat > -63.69 || !south.contains(&GeoPoint::new(-63.69, 85.0)) {
+            wrong.push(format!("an arc sinking to 63.7°S: {south:?}"));
+        }
+        for vertices in [
+            [(70.0, 30.0), (70.0, -150.0)],
+            [(-70.0, 30.0), (-70.0, -150.0)],
+            [(90.0, 123.0), (70.0, -40.0)],
+            [(-90.0, 0.0), (-89.9999, 10.0)],
+        ] {
+            let b = bounds(&vertices);
+            if b.lon_ranges != [(-180.0, 180.0)] {
+                wrong.push(format!("{vertices:?} over or at a pole: {b:?}"));
+            }
+        }
+        let across = bounds(&[(-15.0, 179.5), (-15.0, -179.5)]);
+        for lon in [179.6, 180.0, -180.0, -179.6] {
+            if !across.contains(&GeoPoint::new(-15.0, lon)) {
+                wrong.push(format!("across the antimeridian, at {lon}: {across:?}"));
+            }
+        }
+        if across.contains(&GeoPoint::new(-15.0, 0.0)) {
+            wrong.push(format!("across the antimeridian, holding 0: {across:?}"));
+        }
+        let equator = bounds(&[(0.0, 10.0), (0.0, 40.0)]);
+        let half = delta.to_degrees();
+        if equator.max_lat > half + 1e-6 || equator.min_lat < -half - 1e-6 {
+            wrong.push(format!("an equatorial edge: {equator:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1596: every point within the distance of an edge lies inside
+    /// the edge's bounds, so no cell holding one is pruned, and is measured
+    /// within the distance: points walked from a random point of the arc in
+    /// a random direction, by the distance or less, over awkward edges and
+    /// random ones.
+    #[test]
+    fn no_point_within_the_distance_is_outside_its_bounds() {
+        let mut state = 21_u64;
+        let mut edges: Vec<[(f64, f64); 2]> = vec![
+            [(10.0, 0.0), (10.0, 170.0)],
+            [(70.0, 30.0), (70.0, -150.0)],
+            [(-70.0, 30.0), (-70.0, -150.0)],
+            [(90.0, 123.0), (70.0, -40.0)],
+            [(-90.0, 0.0), (-60.0, 77.0)],
+            [(0.0, 10.0), (0.0, 40.0)],
+            [(10.0, 20.0), (50.0, 20.0)],
+            [(-15.0, 179.5), (-15.0, -179.5)],
+            [(0.0, 180.0), (0.0, -180.0)],
+            [(35.0, 139.0), (35.0, 139.000_000_1)],
+            [(0.0, 0.0), (0.0, 179.99)],
+            [(20.0, 60.0), (20.0, 60.0)],
+        ];
+        while edges.len() < 300 {
+            let a = (
+                -90.0 + 180.0 * uniform(&mut state),
+                -180.0 + 360.0 * uniform(&mut state),
+            );
+            let b = (
+                -90.0 + 180.0 * uniform(&mut state),
+                -180.0 + 360.0 * uniform(&mut state),
+            );
+            let (va, vb) = (
+                unit_vector(&GeoPoint::new(a.0, a.1)),
+                unit_vector(&GeoPoint::new(b.0, b.1)),
+            );
+            if dot(va, vb) > -0.999 {
+                edges.push([a, b]);
+            }
+        }
+        let mut wrong = Vec::new();
+        for (i, edge) in edges.iter().enumerate() {
+            let line = polyline(edge);
+            let (a, b) = (line.vertices[0], line.vertices[1]);
+            for distance_m in [0.0, 50.0, 30_000.0, 800_000.0, 5_000_000.0] {
+                let bounds = line.edge_bounds(distance_m);
+                for _ in 0..40 {
+                    let on_arc = along(&a, &b, uniform(&mut state));
+                    let walk = if uniform(&mut state) < 0.2 {
+                        distance_m
+                    } else {
+                        distance_m * uniform(&mut state)
+                    };
+                    let bearing = std::f64::consts::TAU * uniform(&mut state);
+                    let point = destination(&on_arc, bearing, walk / EARTH_RADIUS_M);
+                    let measured = line.distance_within(&point, &bounds);
+                    match measured {
+                        None => wrong.push(format!(
+                            "edge {i} {edge:?} within {distance_m} m: {point:?}, {walk} m from \
+                             {on_arc:?}, outside {:?}",
+                            bounds[0]
+                        )),
+                        Some(d) if d > walk + 1e-3 => wrong.push(format!(
+                            "edge {i} {edge:?}: {point:?} measured {d} m, walked {walk} m"
+                        )),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} mistakes: {:#?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(20)]
+        );
+    }
+
+    /// Issue #1596: through a real BKD, a polyline finds exactly the points
+    /// within the distance, testing far fewer points one by one than there
+    /// are.
+    #[test]
+    fn a_polyline_prunes_the_bkd() {
+        use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree, BKDWriter};
+        use crate::storage::Storage;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let n = 20_000_u64;
+        let mut state = 12_u64;
+        let points: Vec<[f64; 2]> = (0..n)
+            .map(|_| {
+                [
+                    -60.0 + 120.0 * uniform(&mut state),
+                    -180.0 + 360.0 * uniform(&mut state),
+                ]
+            })
+            .collect();
+        let storage = std::sync::Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("geo.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 2).with_block_size(64);
+            let flat: Vec<f64> = points.iter().flatten().copied().collect();
+            let doc_ids: Vec<u64> = (0..n).collect();
+            writer.write(&flat, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let tree = BKDReader::open(storage, "geo.bkd").unwrap();
+
+        let mut wrong = Vec::new();
+        for (name, line, distance_m) in [
+            (
+                "zigzag",
+                polyline(&[
+                    (-20.0, -40.0),
+                    (-10.0, -30.0),
+                    (-15.0, -20.0),
+                    (-5.0, -10.0),
+                ]),
+                100_000.0,
+            ),
+            (
+                "across the antimeridian",
+                polyline(&[(-30.0, 165.0), (-10.0, 179.0), (0.0, -170.0)]),
+                100_000.0,
+            ),
+        ] {
+            let bounds = line.edge_bounds(distance_m);
+            let mut visitor = GeoPolylineVisitor::new(&line, &bounds, distance_m);
+            tree.intersect(&mut visitor).unwrap();
+            let visited = visitor.visited;
+            let mut found: Vec<u64> = visitor.hits.iter().map(|(id, _, _)| *id).collect();
+            found.sort_unstable();
+            let expected: Vec<u64> = (0..n)
+                .filter(|&id| {
+                    let [lat, lon] = points[id as usize];
+                    line.distance_to(&GeoPoint::new(lat, lon)) <= distance_m
+                })
+                .collect();
+            if found != expected || expected.is_empty() {
+                wrong.push(format!(
+                    "{name}: found {} ids, expected {}",
+                    found.len(),
+                    expected.len()
+                ));
+            }
+            if visited * 10 >= n as usize {
                 wrong.push(format!(
                     "{name}: tested {visited} of {n} points one by one, for {} hits",
                     found.len()

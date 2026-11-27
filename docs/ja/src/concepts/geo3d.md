@@ -114,7 +114,7 @@ let (lat, lon, height) = ecef_to_wgs84(&p);
 
 ## クエリ種別
 
-`Geo3d` フィールドを対象とするクエリは 3 種類ある。いずれも 3D BKD-Tree
+`Geo3d` フィールドを対象とするクエリは 4 種類ある。いずれも 3D BKD-Tree
 を共有する [`IntersectVisitor`](bkd_tree.md#intersectvisitor-プロトコル)
 の実装である。
 
@@ -192,6 +192,36 @@ k-NN ビジタは `compare` から `CellRelation::Inside` を返さない —
 `Outside` か `Crosses` のみ — ので、すべての候補がその座標と一緒に `visit`
 へ届けられ、k-NN の順序付けに真の距離を使える。
 
+### 折れ線 — `Geo3dPolylineQuery`
+
+頂点を順につないだ線分から `distance_m` メートル以内に保存済みのポイントが
+あるドキュメントを返す。飛行経路、トンネル、ケーブルの近くを探すときに使う
+（Issue #1596）。スコアは球と同じく、最も近いポイントによる
+`1 - distance / radius`（`[0, 1]` に収める）。頂点が 1 つなら球のクエリと
+同じになる。
+
+```rust
+use laurus::lexical::query::geo3d::{Geo3dPolyline, Geo3dPolylineQuery};
+use laurus::util::ecef::wgs84_to_ecef;
+
+// 高度 1,000 m の飛行経路から 500 m 以内
+let path = Geo3dPolyline::new(vec![
+    wgs84_to_ecef(35.0, 139.0, 1_000.0),
+    wgs84_to_ecef(35.4, 139.6, 1_000.0),
+])?;
+let query = Geo3dPolylineQuery::new("position", path, 500.0);
+```
+
+線分は弦なので、地表の 2 点を結ぶ線分は地表より下を通り、長さ `L` の線分の
+中ほどで約 `L² / 8R` 沈む（100 km で 196 m、1,000 km で約 20 km）。長い距離を
+地表に沿わせたい経路には、頂点を増やすか、辺が地表の大円の弧になる 2D の
+`Geo` フィールドと `GeoPolylineQuery` を使う。`Geo3dPolyline::new` は 1 つ
+以上の頂点を受け（同じ頂点が続いてもよい）、NaN と無限大の座標を拒否する。
+
+`compare` は、どの線分も、距離だけ四方に広げたセル（セルから距離以内の点を
+すべて含む箱）と交わらなければ `Outside`、交われば `Crosses` を返し、
+`Inside` は返さない。球と同じく、スコアに各ポイントの距離が要るためである。
+
 ## Query DSL
 
 `Geo3d` クエリは統一 Query DSL からも使える（[Query DSL → Geo3d 関数](query_dsl.md#3d-地理クエリgeo3d_)
@@ -201,6 +231,7 @@ k-NN ビジタは `compare` から `CellRelation::Inside` を返さない —
 position:geo3d_distance(-3955182, 3350553, 3700276, 5000)
 position:geo3d_bbox(-4000000, 3300000, 3650000, -3900000, 3400000, 3750000)
 position:geo3d_nearest(-3955182, 3350553, 3700276, 10)
+position:geo3d_polyline((-3955182, 3350553, 3700276, -3940000, 3360000, 3710000), 500)
 ```
 
 | 形式 | 引数 |
@@ -208,6 +239,7 @@ position:geo3d_nearest(-3955182, 3350553, 3700276, 10)
 | `geo3d_distance(x, y, z, distance_m)` | 中心 `(x, y, z)` と最大距離（m） |
 | `geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | AABB の対角の 2 隅 |
 | `geo3d_nearest(x, y, z, k)` | 中心 `(x, y, z)` と整数 `k` |
+| `geo3d_polyline((x, y, z, ...), distance_m)` | 括弧で囲んだ 1 つ以上の頂点 `(x, y, z)` と最大距離（m） |
 
 数値引数はすべて符号付き浮動小数。`geo3d_nearest` の `k` のみ符号なし整数。
 
@@ -278,4 +310,3 @@ MCP サーバーも同じ規約に従う。
   プロットし、`geo3d_bbox` と `geo3d_nearest` を実演します。
 
 [`AABB::min_distance_sq_to_point`]: https://github.com/mosuka/laurus/blob/main/laurus/src/lexical/index/structures/aabb.rs
-[`AABB::max_distance_sq_to_point`]: https://github.com/mosuka/laurus/blob/main/laurus/src/lexical/index/structures/aabb.rs

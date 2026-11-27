@@ -114,7 +114,7 @@ so external code can reference the exact values laurus uses.
 
 ## Query Types
 
-Three query types target `Geo3d` fields. All three are
+Four query types target `Geo3d` fields. All four are
 [`IntersectVisitor`](bkd_tree.md#query-the-intersectvisitor-protocol) implementations
 on top of the shared 3D BKD-Tree.
 
@@ -193,6 +193,39 @@ The k-NN visitor never returns `CellRelation::Inside` from `compare` —
 only `Outside` or `Crosses` — so every candidate is delivered to `visit`
 with its exact coordinates, ensuring k-NN ordering uses the true distance.
 
+### Polyline — `Geo3dPolylineQuery`
+
+Find every document whose stored point lies within `distance_m` metres of
+the straight segments through a polyline's vertices, in order: a flight
+path, a tunnel or a cable (Issue #1596). Score is `1 - distance / radius`,
+clamped to `[0, 1]`, by the closest point, as for the sphere; a single vertex
+is the sphere query.
+
+```rust
+use laurus::lexical::query::geo3d::{Geo3dPolyline, Geo3dPolylineQuery};
+use laurus::util::ecef::wgs84_to_ecef;
+
+// Within 500 m of a flight path at 1,000 m
+let path = Geo3dPolyline::new(vec![
+    wgs84_to_ecef(35.0, 139.0, 1_000.0),
+    wgs84_to_ecef(35.4, 139.6, 1_000.0),
+])?;
+let query = Geo3dPolylineQuery::new("position", path, 500.0);
+```
+
+A segment is a chord: between two points on the surface it runs below it,
+by about `L² / 8R` midway for a segment of length `L`, 196 m for 100 km and
+about 20 km for 1,000 km. A path that should follow the surface over long
+distances needs more vertices, or a 2D `Geo` field and `GeoPolylineQuery`,
+whose edges are great-circle arcs on the surface. `Geo3dPolyline::new` takes
+one vertex or more, repeated vertices included, and rejects a NaN or
+infinite coordinate.
+
+`compare` returns `Outside` when no segment meets the cell widened by the
+distance on every side (a box that holds every point within the distance of
+the cell), and `Crosses` otherwise, never `Inside`: as for the sphere, the
+score needs each point's distance.
+
 ## Query DSL
 
 `Geo3d` queries are also exposed in the unified Query DSL (see
@@ -202,6 +235,7 @@ with its exact coordinates, ensuring k-NN ordering uses the true distance.
 position:geo3d_distance(-3955182, 3350553, 3700276, 5000)
 position:geo3d_bbox(-4000000, 3300000, 3650000, -3900000, 3400000, 3750000)
 position:geo3d_nearest(-3955182, 3350553, 3700276, 10)
+position:geo3d_polyline((-3955182, 3350553, 3700276, -3940000, 3360000, 3710000), 500)
 ```
 
 | Form | Arguments |
@@ -209,6 +243,7 @@ position:geo3d_nearest(-3955182, 3350553, 3700276, 10)
 | `geo3d_distance(x, y, z, distance_m)` | centre `(x, y, z)` and maximum distance in metres |
 | `geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | two opposite corners of the AABB |
 | `geo3d_nearest(x, y, z, k)` | centre `(x, y, z)` and the integer `k` |
+| `geo3d_polyline((x, y, z, ...), distance_m)` | the vertices `(x, y, z)` in parentheses, one or more, and the maximum distance in metres |
 
 All numeric arguments are signed floats; the `k` of `geo3d_nearest` is an
 unsigned integer.
@@ -279,4 +314,3 @@ to the engine; the MCP server uses the same convention.
   `geo3d_bbox` and `geo3d_nearest` queries.
 
 [`AABB::min_distance_sq_to_point`]: https://github.com/mosuka/laurus/blob/main/laurus/src/lexical/index/structures/aabb.rs
-[`AABB::max_distance_sq_to_point`]: https://github.com/mosuka/laurus/blob/main/laurus/src/lexical/index/structures/aabb.rs

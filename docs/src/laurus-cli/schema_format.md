@@ -206,7 +206,7 @@ doc_values = true
 
 #### Geo3d
 
-3D Earth-Centered Earth-Fixed (ECEF) Cartesian point field (x / y / z in meters). Supports the `geo3d_distance` (sphere), `geo3d_bbox` (3D AABB), and `geo3d_nearest` (k-NN) queries. See [3D Geographic Search (ECEF)](../concepts/geo3d.md) for the coordinate system and the `wgs84_to_ecef` / `ecef_to_wgs84` conversion utilities.
+3D Earth-Centered Earth-Fixed (ECEF) Cartesian point field (x / y / z in meters). Supports the `geo3d_distance` (sphere), `geo3d_bbox` (3D AABB), `geo3d_nearest` (k-NN), and `geo3d_polyline` (within a distance of a polyline) queries. See [3D Geographic Search (ECEF)](../concepts/geo3d.md) for the coordinate system and the `wgs84_to_ecef` / `ecef_to_wgs84` conversion utilities.
 
 ```toml
 [fields.position.Geo3d]
@@ -218,9 +218,9 @@ doc_values = true
 
 | Option | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `indexed` | `bool` | `true` | Enables 3D geo queries (`geo3d_distance`, `geo3d_bbox`, `geo3d_nearest`) |
+| `indexed` | `bool` | `true` | Enables 3D geo queries (`geo3d_distance`, `geo3d_bbox`, `geo3d_nearest`, `geo3d_polyline`) |
 | `stored` | `bool` | `true` | Stores the original `(x, y, z)` value |
-| `multi_valued` | `bool` | `false` | Accept arrays of points; `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` queries match if **any** point satisfies the predicate (Lucene-style "any match"), scoring the document by its closest point |
+| `multi_valued` | `bool` | `false` | Accept arrays of points; `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` / `geo3d_polyline` queries match if **any** point satisfies the predicate (Lucene-style "any match"), scoring the document by its closest point |
 | `doc_values` | `bool` | `true` | See [Common option: `doc_values`](#common-option-doc_values) below |
 
 #### Bytes
