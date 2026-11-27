@@ -18,10 +18,21 @@ use crate::lexical::reader::LexicalIndexReader;
 
 /// A query that matches documents containing terms that match a wildcard pattern.
 ///
-/// Supports the following wildcards:
-/// - `*` matches zero or more characters
-/// - `?` matches exactly one character
-/// - `\*` and `\?` match literal `*` and `?` characters
+/// A pattern reads as in Lucene's `WildcardQuery`, whole terms against the
+/// whole pattern:
+/// - `*` matches zero or more characters, and `?` exactly one, line breaks
+///   included
+/// - a backslash takes the next character literally, whatever it is (`\*`,
+///   `\?` and `\\` match `*`, `?` and `\`, and `\d` matches `d`); at the end
+///   of a pattern it is a backslash itself
+/// - every other character matches itself, a special character of a regexp
+///   (`.`, `+`, `(`, `[`, `|` and others) too
+///
+/// No pattern is an error (Issue #1745), short of one so long that its
+/// regexp exceeds the size limit of the `regex` crate (100,000 `?`, for
+/// example; see [`WildcardQuery::new`]). The backslash used to be passed on
+/// to the regexp with the next character, so `\d` matched a digit and `\p`
+/// failed, and `*` and `?` did not match a line break.
 #[derive(Debug, Clone)]
 pub struct WildcardQuery {
     /// The field to search in.
@@ -39,10 +50,15 @@ pub struct WildcardQuery {
 
 impl WildcardQuery {
     /// Create a new wildcard query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an analysis error only when the pattern is so long that its
+    /// regexp exceeds the size limit of the `regex` crate.
     pub fn new<S: Into<String>>(field: S, pattern: S) -> Result<Self> {
         let field = field.into();
         let pattern = pattern.into();
-        let regex_pattern = Self::compile_pattern(&pattern)?;
+        let regex_pattern = Self::compile_pattern(&pattern);
         let regex = Regex::new(&regex_pattern).map_err(|e| {
             crate::error::LaurusError::analysis(format!("Invalid wildcard pattern: {e}"))
         })?;
@@ -83,59 +99,30 @@ impl WildcardQuery {
         self.rewrite_method
     }
 
-    /// Compile a wildcard pattern into a regex string.
-    fn compile_pattern(pattern: &str) -> Result<String> {
-        let mut regex_pattern = String::new();
-        regex_pattern.push('^'); // Match from the beginning
-
-        let chars: Vec<char> = pattern.chars().collect();
-        let mut i = 0;
-
-        while i < chars.len() {
-            match chars[i] {
-                '\\' => {
-                    // Handle escape sequences
-                    if i + 1 < chars.len() {
-                        match chars[i + 1] {
-                            '*' => {
-                                regex_pattern.push_str("\\*");
-                                i += 1; // Skip the escaped character
-                            }
-                            '?' => {
-                                regex_pattern.push_str("\\?");
-                                i += 1; // Skip the escaped character
-                            }
-                            c => {
-                                // Other escaped characters
-                                regex_pattern.push('\\');
-                                regex_pattern.push(c);
-                                i += 1; // Skip the escaped character
-                            }
-                        }
-                    } else {
-                        regex_pattern.push('\\');
-                    }
-                }
-                '*' => {
-                    regex_pattern.push_str(".*");
-                }
-                '?' => {
-                    regex_pattern.push('.');
-                }
-                // Regex special characters that need escaping
-                '^' | '$' | '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
-                    regex_pattern.push('\\');
-                    regex_pattern.push(chars[i]);
-                }
-                c => {
-                    regex_pattern.push(c);
-                }
-            }
-            i += 1;
+    /// The regexp of a wildcard pattern, read as in Lucene's
+    /// `WildcardQuery.toAutomaton` (see [`WildcardQuery`]).
+    ///
+    /// It matches whole strings (`\A` and `\z`), and `.` matches a line break
+    /// too (`s`). Every literal character goes in through `regex::escape`, so
+    /// the regexp is never invalid.
+    fn compile_pattern(pattern: &str) -> String {
+        fn push_literal(regex: &mut String, c: char) {
+            regex.push_str(&regex::escape(c.encode_utf8(&mut [0; 4])));
         }
 
-        regex_pattern.push('$'); // Match to the end
-        Ok(regex_pattern)
+        let mut regex = String::from(r"(?s)\A");
+        let mut chars = pattern.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '*' => regex.push_str(".*"),
+                '?' => regex.push('.'),
+                // The next character literally; a trailing backslash is one.
+                '\\' => push_literal(&mut regex, chars.next().unwrap_or('\\')),
+                c => push_literal(&mut regex, c),
+            }
+        }
+        regex.push_str(r"\z");
+        regex
     }
 
     /// Check if a term matches the wildcard pattern.
@@ -154,7 +141,7 @@ impl MultiTermQuery for WildcardQuery {
     }
 
     fn automaton(&self) -> Result<Box<dyn Automaton>> {
-        let pattern = Self::compile_pattern(&self.pattern)?;
+        let pattern = Self::compile_pattern(&self.pattern);
         Ok(Box::new(RegexAutomaton::from_regex(
             self.regex.as_ref().clone(),
             pattern,
@@ -295,5 +282,71 @@ mod tests {
         let query = WildcardQuery::new("field", "hello+world").unwrap();
         assert!(query.matches("hello+world"));
         assert!(!query.matches("helloworld"));
+    }
+
+    /// Issue #1745: a pattern reads as in Lucene's `WildcardQuery`. A
+    /// backslash takes the next character literally, and at the end is a
+    /// backslash itself; `*` and `?` match any characters, line breaks
+    /// included; every other character is itself, a special character of a
+    /// regexp too.
+    #[test]
+    fn a_pattern_reads_as_in_lucene() {
+        let mut wrong = Vec::new();
+        for (pattern, matching, not_matching) in [
+            (r"te\dt", "tedt", "te1t"),
+            (r"\a*", "abc", "\x07bc"),
+            (r"a\nb", "anb", "a\nb"),
+            (r"te\", "te\\", "te$"),
+            (r"te\*", "te*", "tex"),
+            (r"a\\b", "a\\b", "ab"),
+            ("a*b", "a\nb", "a\nc"),
+            ("a?b", "a\nb", "ab"),
+            ("a?", "a\r", "a"),
+            ("?", "é", "ée"),
+            ("ü?", "üé", "ü"),
+            ("te**", "te", "t"),
+            ("a.b", "a.b", "axb"),
+            ("a+b", "a+b", "aab"),
+            ("(a)", "(a)", "a"),
+            ("a|b", "a|b", "a"),
+            ("#a", "#a", "a"),
+            ("a&b", "a&b", "ab"),
+            ("a~b", "a~b", "ab"),
+            ("a-b", "a-b", "ab"),
+        ] {
+            let query = WildcardQuery::new("field", pattern).unwrap();
+            if !query.matches(matching) || query.matches(not_matching) {
+                wrong.push(format!(
+                    "{pattern:?}: matches {matching:?} {}, matches {not_matching:?} {}",
+                    query.matches(matching),
+                    query.matches(not_matching)
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1745: the term dictionary is still sought from the literal
+    /// start of a pattern, escapes read as their characters.
+    #[test]
+    fn the_seek_term_is_the_literal_start_of_the_pattern() {
+        let mut wrong = Vec::new();
+        for (pattern, expected) in [
+            ("te*", Some("te")),
+            (r"te\*x*", Some("te*x")),
+            (r"\a*", Some("a")),
+            (r"te\", Some("te\\")),
+            ("a.b*", Some("a.b")),
+            ("über?", Some("über")),
+            ("*a", None),
+            ("?a", None),
+        ] {
+            let query = WildcardQuery::new("field", pattern).unwrap();
+            let seek = query.automaton().unwrap().initial_seek_term();
+            if seek.as_deref() != expected {
+                wrong.push(format!("{pattern:?}: {seek:?}, expected {expected:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

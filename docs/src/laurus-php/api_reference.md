@@ -352,7 +352,7 @@ Approximate match allowing up to `$maxEdits` edit-distance errors. `$maxEdits` m
 new \Laurus\WildcardQuery(string $field, string $pattern)
 ```
 
-Pattern match. `*` matches any sequence of characters, `?` matches any single character.
+Pattern match. `*` matches any sequence of characters, `?` matches any single character, line breaks included. A backslash takes the next character literally, so `'te\*'` matches `te*`.
 
 ### NumericRangeQuery
 

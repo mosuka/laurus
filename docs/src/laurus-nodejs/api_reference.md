@@ -398,7 +398,8 @@ new WildcardQuery(field: string, pattern: string)
 ```
 
 Pattern match. `*` matches any sequence, `?` matches one
-character.
+character, line breaks included. A backslash takes the next character
+literally, so `"te\\*"` matches `te*`.
 
 ### NumericRangeQuery
 

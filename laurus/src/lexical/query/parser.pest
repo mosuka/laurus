@@ -83,12 +83,16 @@ fuzzy_term = { term ~ "~" ~ fuzziness? ~ boost? }
 fuzziness = { number }
 
 // Wildcard queries: te?t or test*
-// Use Unicode `LETTER | NUMBER` so CJK / Cyrillic / Greek terms are accepted
-// alongside ASCII. `LETTER` and `NUMBER` general categories together
-// cover the cases users actually write.
+// A wildcard takes the characters of a term (`escaped_char`: Unicode
+// letters and numbers, `_`, `-`, `'` and a backslash before a special
+// character) and `?` and `*`, as Lucene's `WILDTERM` does (issue #1745), so
+// `a-b*`, `it's*` and `te\*t*` are one wildcard each, and so is `foo*-bar`.
+// The pattern goes to `WildcardQuery` as written, which reads the escapes.
+// It used to take letters, numbers and `_` only, and end before any other
+// character, leaving a bare `*` as a clause of its own.
 wildcard_term = { wildcard_pattern ~ boost? }
 wildcard_pattern = @{
-    (LETTER | NUMBER | "_")* ~ wildcard_char ~ (LETTER | NUMBER | "_" | wildcard_char)*
+    escaped_char* ~ wildcard_char ~ (escaped_char | wildcard_char)*
 }
 wildcard_char = { "?" | "*" }
 

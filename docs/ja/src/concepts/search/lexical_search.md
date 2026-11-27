@@ -112,8 +112,11 @@ use laurus::lexical::query::wildcard::WildcardQuery;
 // '?' matches exactly one character, '*' matches zero or more
 let query = WildcardQuery::new("filename", "*.pdf")?;
 let query = WildcardQuery::new("body", "pro*")?;
-let query = WildcardQuery::new("body", "col?r")?;  // matches "color" and "colour"
+let query = WildcardQuery::new("body", "col?r")?;  // matches "color", not "colour"
+let query = WildcardQuery::new("body", r"why\?")?;  // matches "why?"
 ```
+
+パターンは Lucene の `WildcardQuery` と同じに読みます。`*` と `?` は、改行を含むどの文字にもマッチします。バックスラッシュは、次の 1 文字をどの文字でもそのままの文字にします（`\*`、`\?`、`\\` は `*`、`?`、`\` に、`\d` は `d` にマッチします）。パターンの末尾のバックスラッシュは、バックスラッシュそのものです。ほかの文字は、`.` や `+` も含めてその文字にマッチするので、正規表現の大きさの上限を超えるほど長いパターン（たとえば `?` が 10 万個）を除き、エラーになるパターンはありません。Issue #1745 までは、バックスラッシュが次の文字と一緒に正規表現に渡り、`te\dt` が `te1t` にマッチし、`a\pb` はエラーになっていました。
 
 ### PrefixQuery
 

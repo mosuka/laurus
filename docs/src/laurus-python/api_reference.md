@@ -377,7 +377,7 @@ Approximate match allowing up to `max_edits` edit-distance errors. `max_edits` i
 WildcardQuery(field: str, pattern: str)
 ```
 
-Pattern match. `*` matches any sequence of characters, `?` matches any single character.
+Pattern match. `*` matches any sequence of characters, `?` matches any single character, line breaks included. A backslash takes the next character literally, so `r"te\*"` matches `te*`.
 
 ### NumericRangeQuery
 

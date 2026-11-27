@@ -301,7 +301,8 @@ impl RbFuzzyQuery {
 
 /// Wildcard pattern lexical query (`Laurus::WildcardQuery`).
 ///
-/// `*` matches any sequence, `?` matches any single character.
+/// `*` matches any sequence, `?` matches any single character. A backslash
+/// takes the next character literally (`\*` matches `*`).
 #[magnus::wrap(class = "Laurus::WildcardQuery")]
 pub struct RbWildcardQuery {
     pub field: String,

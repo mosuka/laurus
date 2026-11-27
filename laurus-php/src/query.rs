@@ -348,7 +348,8 @@ impl PhpFuzzyQuery {
 
 /// Wildcard pattern lexical query (`Laurus\WildcardQuery`).
 ///
-/// `*` matches any sequence, `?` matches any single character.
+/// `*` matches any sequence, `?` matches any single character. A backslash
+/// takes the next character literally (`\*` matches `*`).
 #[php_class]
 #[php(name = "Laurus\\WildcardQuery")]
 pub struct PhpWildcardQuery {

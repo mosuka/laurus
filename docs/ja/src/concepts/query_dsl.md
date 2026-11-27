@@ -120,6 +120,8 @@ te?t
 test*
 ```
 
+どちらも、改行を含むどの文字にもマッチします。ワイルドカードはタームと同じ文字（`-`、`'`、エスケープした特殊文字を含む）を受けるので、Lucene と同じく、`a-b*`、`it's*`、`foo*-bar` はそれぞれ 1 つのワイルドカードです。`bar` を除くには、`-` の前に空白を入れます（`foo* -bar`）。DSL の特殊文字（`+ - ! ( ) { } [ ] ^ " ~ * ? : \ /`）の前のバックスラッシュは、その文字をそのままの文字にします。`te\*t*` は `te*t` で始まるタームにマッチします。Issue #1745 までは、ワイルドカードが文字・数字・`_` 以外の文字の手前で終わり、残った単独の `*` が既定のフィールドのすべてのタームにマッチしていました。また、`*` と `?` は改行にマッチしませんでした。
+
 ワイルドカードは、マッチするタームがいくつあっても、そのどれかを含むすべてのドキュメントにマッチします。スコアはどのマッチもブーストの値です（`^` で指定しなければ `1.0`）。以前は、マッチしたタームのうち文書頻度の低い 50 個のドキュメントだけが見つかっていました（Issue #1740）。マッチするタームが多いほど検索に時間がかかり、`?` か `*` で始まるパターンは、そのフィールドのすべてのタームと比べられます。
 
 ### 範囲クエリ
@@ -281,10 +283,11 @@ query          = { SOI ~ boolean_query ~ EOI }
 boolean_query  = { clause ~ (boolean_op ~ clause | clause)* }
 clause         = { required_clause | prohibited_clause | sub_clause }
 required_clause   = { "+" ~ sub_clause }
-prohibited_clause = { "-" ~ sub_clause }
+prohibited_clause = { ("-" | not_op) ~ sub_clause }
 sub_clause     = { grouped_query | field_query | term_query }
 grouped_query  = { "(" ~ boolean_query ~ ")" ~ boost? }
-boolean_op     = { ^"AND" | ^"OR" }
+boolean_op     = @{ ("AND" | "OR") ~ !keyword_tail }
+not_op         = @{ "NOT" ~ !keyword_tail }
 field_query    = { field ~ ":" ~ field_value }
 field_value    = { geo3d_query | geo_query | range_query | phrase_query
                  | fuzzy_term | wildcard_term | simple_term }
@@ -305,6 +308,8 @@ phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
 proximity      = { "~" ~ number }
 fuzzy_term     = { term ~ "~" ~ fuzziness? ~ boost? }
 wildcard_term  = { wildcard_pattern ~ boost? }
+wildcard_pattern = @{ escaped_char* ~ wildcard_char
+                    ~ (escaped_char | wildcard_char)* }
 simple_term    = { term ~ boost? }
 boost          = { "^" ~ boost_value }
 ```
