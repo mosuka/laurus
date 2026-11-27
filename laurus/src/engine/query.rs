@@ -53,6 +53,11 @@ use crate::vector::query::parser::{VectorQueryParser, removed_marker_error};
 /// lookbehind, so callers put this in a group before the field name.
 const NON_FIELD_NAME_CHAR: &str = r"[^A-Za-z0-9_.]";
 
+/// A quoted string of the DSL, as both query grammars read it: a backslash
+/// takes the next character literally, so `\"` does not end the string
+/// (Issue #1758). It used to end at the next `"`.
+const QUOTED_STRING: &str = r#""(?:[^"\\]|\\[\s\S])*""#;
+
 /// Unified query parser that composes lexical and vector parsers.
 ///
 /// Parses a single DSL string into a [`SearchRequest`] by splitting the input
@@ -272,7 +277,9 @@ impl UnifiedQueryParser {
     ///
     /// Only what the lexical grammar reads as a clause is a vector clause
     /// (Issue #1751): `embedding:x` inside a quoted lexical phrase is the
-    /// phrase's text and stays in the lexical part.
+    /// phrase's text and stays in the lexical part. A quoted value reads its
+    /// escapes as a lexical phrase does, so `embedding:"say \"hi\""` is one
+    /// clause (Issue #1758).
     ///
     /// # Errors
     ///
@@ -312,10 +319,11 @@ impl UnifiedQueryParser {
         // An unquoted value also ends at `(` / `)` (Issue #1377): they group
         // clauses in the DSL and end a lexical term too, so
         // `(content:cats)` closes its group instead of taking `cats)` as the
-        // value. A quoted value may contain them.
+        // value. A quoted value may contain them, and `\"` (Issue #1758).
         let clause_pattern = format!(
-            r#"(^|{boundary})(\+)?((?:{fields}):(?:"[^"]*"|[^\s"^~\[\{{()]+)(?:\^[\d]+(?:\.[\d]+)?)?)"#,
+            r#"(^|{boundary})(\+)?((?:{fields}):(?:{quoted}|[^\s"^~\[\{{()]+)(?:\^[\d]+(?:\.[\d]+)?)?)"#,
             boundary = NON_FIELD_NAME_CHAR,
+            quoted = QUOTED_STRING,
             fields = fields_pattern,
         );
         let vector_re = Regex::new(&clause_pattern).unwrap();
@@ -464,8 +472,9 @@ impl UnifiedQueryParser {
         // name the marker. Most queries have no `:~`, so they skip the regex.
         if input.contains(":~") {
             let marker_pattern = format!(
-                r#"(?:^|{boundary})((?:{fields}):~(?:"[^"]*"|[^\s"]*))"#,
+                r#"(?:^|{boundary})((?:{fields}):~(?:{quoted}|[^\s"]*))"#,
                 boundary = NON_FIELD_NAME_CHAR,
+                quoted = QUOTED_STRING,
                 fields = fields_pattern,
             );
             let marker_re = Regex::new(&marker_pattern).unwrap();
@@ -476,8 +485,9 @@ impl UnifiedQueryParser {
 
         // Proximity/fuzzy: vector_field:value~[digits]
         let tilde_pattern = format!(
-            r#"(?:^|{boundary})((?:{fields})(?::(?:"[^"]*"|[^\s"^~]+)(?:\^[\d]+(?:\.[\d]+)?)?))(~[\d]*)"#,
+            r#"(?:^|{boundary})((?:{fields})(?::(?:{quoted}|[^\s"^~]+)(?:\^[\d]+(?:\.[\d]+)?)?))(~[\d]*)"#,
             boundary = NON_FIELD_NAME_CHAR,
+            quoted = QUOTED_STRING,
             fields = fields_pattern,
         );
         let tilde_re = Regex::new(&tilde_pattern).unwrap();
@@ -1477,5 +1487,47 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("'content:cats'"), "got: {msg}");
+    }
+
+    /// Issue #1758: a quoted vector value reads its escapes as a phrase
+    /// does, so `\"` does not end it: the clause is split off whole, and the
+    /// checks for `~` name the whole clause.
+    #[tokio::test]
+    async fn test_quoted_vector_value_with_an_escaped_quote() {
+        let parser = make_parser();
+        let mut wrong = Vec::new();
+        let query = r#"content:"say \"hi\"" title:x"#;
+        match parser.split_query(query) {
+            Ok((lexical, vector, _)) => {
+                let expected = (Some("title:x"), Some(r#"content:"say \"hi\"""#));
+                if (lexical.as_deref(), vector.as_deref()) != expected {
+                    wrong.push(format!("{query}: {lexical:?} and {vector:?}"));
+                }
+            }
+            Err(e) => wrong.push(format!("{query}: {e}")),
+        }
+        for (query, kind, clause) in [
+            (
+                r#"content:"a \" b"~2"#,
+                "Proximity/fuzzy modifier",
+                r#"'content:"a \" b"'"#,
+            ),
+            (
+                r#"content:~"a \" b""#,
+                "'~' marker",
+                r#"'content:~"a \" b"'"#,
+            ),
+        ] {
+            match parser.parse(query).await {
+                Ok(_) => wrong.push(format!("{query}: parsed")),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains(kind) || !msg.contains(clause) {
+                        wrong.push(format!("{query}: {msg}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

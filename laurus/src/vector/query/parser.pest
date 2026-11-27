@@ -13,8 +13,11 @@ field_prefix = { field_name ~ ":" }
 
 field_name = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | ".")* }
 
+// A backslash takes the next character literally, so `\"` does not end the
+// text, as in a lexical phrase (issue #1758); the parser drops the
+// backslashes before the text is embedded.
 quoted_text = ${ "\"" ~ inner_text ~ "\"" }
-inner_text = @{ (!("\"") ~ ANY)* }
+inner_text = @{ ("\\" ~ ANY | !("\"") ~ ANY)* }
 
 plain_text = @{ (!(WHITESPACE | "\"" | "^") ~ ANY)+ }
 
