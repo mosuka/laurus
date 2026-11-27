@@ -74,9 +74,12 @@ async fn search(
         let result = engine
             .search(builder.limit(100).build())
             .await
-            .map(|hits| {
-                let mut hits: Vec<(String, f32)> =
-                    hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
+            .map(|response| {
+                let mut hits: Vec<(String, f32)> = response
+                    .results
+                    .into_iter()
+                    .map(|hit| (hit.id, hit.score))
+                    .collect();
                 hits.sort_by(|a, b| a.0.cmp(&b.0));
                 hits
             })
