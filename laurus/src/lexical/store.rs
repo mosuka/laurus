@@ -673,7 +673,7 @@ impl LexicalStore {
     ///
     /// ```rust,no_run
     /// use laurus::lexical::core::document::Document;
-    /// use laurus::lexical::search::searcher::LexicalSearchRequest;
+    /// use laurus::lexical::search::searcher::{LexicalSearchRequest, TrackTotalHits};
     /// use laurus::lexical::query::term::TermQuery;
     /// # use laurus::lexical::store::LexicalStore;
     /// # use laurus::lexical::store::config::LexicalIndexConfig;
@@ -690,10 +690,11 @@ impl LexicalStore {
     /// // Using DSL string
     /// let request = LexicalSearchRequest::from_dsl("title:hello")
     ///     .limit(10)
-    ///     .min_score(0.5);
+    ///     .min_score(0.5)
+    ///     .track_total_hits(TrackTotalHits::Exact);
     /// let results = engine.search(request).unwrap();
     ///
-    /// println!("Found {} documents", results.total_hits);
+    /// println!("Found {} documents", results.total_hits.unwrap().value);
     /// for hit in results.hits {
     ///     println!("Doc ID: {}, Score: {}", hit.doc_id, hit.score);
     /// }
@@ -1267,6 +1268,7 @@ mod tests {
     use super::*;
     use crate::lexical::query::Query;
     use crate::lexical::query::term::TermQuery;
+    use crate::lexical::search::searcher::TrackTotalHits;
     use crate::lexical::store::config::LexicalIndexConfig;
     use crate::storage::file::{FileStorage, FileStorageConfig};
     use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
@@ -2128,11 +2130,11 @@ mod tests {
         let engine = LexicalStore::new(storage, config).unwrap();
 
         let query = Box::new(TermQuery::new("title", "hello")) as Box<dyn Query>;
-        let request = LexicalSearchRequest::new(query);
+        let request = LexicalSearchRequest::new(query).track_total_hits(TrackTotalHits::Exact);
         let results = engine.search(request).unwrap();
 
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
         assert_eq!(results.max_score, 0.0);
     }
 
@@ -2537,12 +2539,13 @@ mod tests {
         let request = LexicalSearchRequest::new(query)
             .limit(5)
             .min_score(0.5)
-            .load_documents(false);
+            .load_documents(false)
+            .track_total_hits(TrackTotalHits::Exact);
 
         let results = engine.search(request).unwrap();
 
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
     }
 
     #[test]
@@ -2573,11 +2576,13 @@ mod tests {
 
         // QueryParser analyzes "Hello" to "hello" before creating TermQuery
         let query = parser.parse("Hello").unwrap();
-        let results = engine.search(LexicalSearchRequest::new(query)).unwrap();
+        let results = engine
+            .search(LexicalSearchRequest::new(query).track_total_hits(TrackTotalHits::Exact))
+            .unwrap();
 
         // Should find the document
         assert_eq!(results.hits.len(), 1);
-        assert_eq!(results.total_hits, 1);
+        assert_eq!(results.total_hits.unwrap().value, 1);
     }
 
     #[test]

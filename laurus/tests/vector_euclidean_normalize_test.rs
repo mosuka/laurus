@@ -71,7 +71,7 @@ async fn top_hit_for_euclidean_field() -> laurus::Result<String> {
         .limit(1)
         .build();
 
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     assert_eq!(results.len(), 1, "expected exactly 1 hit");
     Ok(results[0].id.clone())
 }

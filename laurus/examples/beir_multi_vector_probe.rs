@@ -656,7 +656,7 @@ fn request(
 /// Run `request` and return its `(doc id, score)` ranking and wall time.
 async fn search(engine: &Engine, request: SearchRequest) -> AnyResult<(Vec<(String, f32)>, f64)> {
     let started = Instant::now();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     let millis = started.elapsed().as_secs_f64() * 1e3;
     Ok((
         results.into_iter().map(|r| (r.id, r.score)).collect(),

@@ -91,7 +91,10 @@ async fn search_term(engine: &Engine, term: &str) -> laurus::Result<Vec<laurus::
         ))))
         .limit(10)
         .build();
-    engine.search(request).await
+    engine
+        .search(request)
+        .await
+        .map(|response| response.results)
 }
 
 /// Search for the term carried only by document 0.
@@ -246,7 +249,7 @@ async fn uncommitted_documents_are_invisible_to_count() -> laurus::Result<()> {
         ))))
         .limit(10)
         .build();
-    let hits = engine.search(request).await?;
+    let hits = engine.search(request).await?.results;
     assert!(
         hits.is_empty(),
         "uncommitted documents must not be counted either, got {} hit(s)",

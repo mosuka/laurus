@@ -18,7 +18,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 ## クエリタイプ
@@ -434,7 +434,9 @@ Lexical 検索の動作パラメータは `SearchRequestBuilder` のメソッド
 フィールドソート検索（`sort_by: Field { .. }`）は常に全候補ドキュメントを走査します。
 スコアソートで利用可能な block-max ベースの早期終了とは異なり、フィールドソートには早期終了が
 ありません。これにより返るヒットは早期終了による近似ではなく真の top-K であることが保証され、
-`total_hits` も走査打ち切りによる件数ではなく真のマッチ数を反映します。
+`track_total_hits` で総数を求めたときは、セグメントがいくつあっても上限より下の総数が正確になります。
+スコアソートの検索も、上限に届くまで打ち切らないことで、上限まで正確に数えます
+（[総ヒット数](../../laurus/engine.md#総ヒット数)参照）。
 
 `timeout_ms` を設定すると、時間予算は検索の**実行中に協調的に**適用されます。スキャンループ
 （マルチセグメント fanout の各セグメントを含む）が定期的に deadline をチェックし、予算を使い切った時点で

@@ -86,14 +86,14 @@ async fn assert_rerank_end_to_end(
         "commit with rerank_storage: Some(F32) must emit {sidecar_name}"
     );
 
-    let with_rerank = engine.search(vector_request(Some(4))).await?;
+    let with_rerank = engine.search(vector_request(Some(4))).await?.results;
     assert_eq!(with_rerank.len(), 1, "expected exactly 1 hit");
     assert_eq!(
         with_rerank[0].id, "doc1",
         "doc1 is the closest match under exact f32 distances"
     );
 
-    let without_rerank = engine.search(vector_request(None)).await?;
+    let without_rerank = engine.search(vector_request(None)).await?.results;
     assert_eq!(without_rerank[0].id, "doc1");
     assert_ne!(
         with_rerank[0].score.to_bits(),
@@ -160,10 +160,12 @@ async fn assert_fieldless_rerank_matches_routed(field_option: FieldOption) -> la
             Some(vec!["embedding".to_string()]),
             Some(4),
         ))
-        .await?;
+        .await?
+        .results;
     let fieldless = engine
         .search(vector_request_for_fields(None, Some(4)))
-        .await?;
+        .await?
+        .results;
 
     assert_eq!(
         routed[0].id, "doc1",
@@ -179,7 +181,10 @@ async fn assert_fieldless_rerank_matches_routed(field_option: FieldOption) -> la
         "a field-less query must apply the same exact-f32 rerank score as the field-routed one"
     );
 
-    let fieldless_without_rerank = engine.search(vector_request_for_fields(None, None)).await?;
+    let fieldless_without_rerank = engine
+        .search(vector_request_for_fields(None, None))
+        .await?
+        .results;
     assert_ne!(
         fieldless[0].score.to_bits(),
         fieldless_without_rerank[0].score.to_bits(),
@@ -241,8 +246,8 @@ async fn flat_and_ivf_rerank_factor_falls_back_silently_on_stage1_field() -> lau
         let engine = Engine::new(storage, schema).await?;
         ingest(&engine).await?;
 
-        let with_factor = engine.search(vector_request(Some(4))).await?;
-        let without = engine.search(vector_request(None)).await?;
+        let with_factor = engine.search(vector_request(Some(4))).await?.results;
+        let without = engine.search(vector_request(None)).await?.results;
         assert_eq!(with_factor[0].id, "doc1");
         assert_eq!(
             with_factor[0].score.to_bits(),
@@ -291,7 +296,7 @@ async fn segmented_flat_rerank_orders_across_segments() -> laurus::Result<()> {
     engine.commit().await?;
     assert!(storage.file_exists("vector/embedding/segment_000001.flat.f32"));
 
-    let hits = engine.search(vector_request(Some(4))).await?;
+    let hits = engine.search(vector_request(Some(4))).await?.results;
     assert_eq!(hits[0].id, "doc1", "cross-segment rerank must find doc1");
     Ok(())
 }

@@ -91,7 +91,8 @@ async fn lexical_field_boosts_are_accepted() {
                     .build(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 1);
     }
 }
@@ -123,7 +124,8 @@ async fn out_of_range_boosts_and_min_scores_are_rejected() {
         for (shape, builder) in requests() {
             let result = engine
                 .search(builder.add_field_boost("title", boost).build())
-                .await;
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
                 wrong.push(format!(
                     "{shape} boost {boost}: {:?}",
@@ -137,7 +139,8 @@ async fn out_of_range_boosts_and_min_scores_are_rejected() {
         for (shape, builder) in requests() {
             let result = engine
                 .search(builder.lexical_min_score(min_score).build())
-                .await;
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
                 wrong.push(format!(
                     "{shape} min_score {min_score}: {:?}",
@@ -191,7 +194,8 @@ async fn zero_boost_and_negative_min_score_keep_the_hits() {
                     .build(),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .results,
     );
     assert_eq!(
         zero,
@@ -208,8 +212,8 @@ async fn zero_boost_and_negative_min_score_keep_the_hits() {
                 .build(),
         )
     };
-    let at_zero = hits(search_with_min_score(0.0).await.unwrap());
-    let negative = hits(search_with_min_score(-1.0).await.unwrap());
+    let at_zero = hits(search_with_min_score(0.0).await.unwrap().results);
+    let negative = hits(search_with_min_score(-1.0).await.unwrap().results);
     assert_eq!(at_zero.len(), 2, "{at_zero:?}");
     assert_eq!(negative, at_zero);
 }
@@ -251,7 +255,10 @@ async fn a_dsl_boost_too_large_for_an_f32_is_rejected() {
                     .filter_query(nothing()),
             ),
         ] {
-            let result = engine.search(builder.build()).await;
+            let result = engine
+                .search(builder.build())
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(expected)) {
                 wrong.push(format!("{shape} {dsl}: {:?}", result.map(|r| r.len())));
             }
@@ -263,7 +270,8 @@ async fn a_dsl_boost_too_large_for_an_f32_is_rejected() {
         let results = engine
             .search(SearchRequestBuilder::new().query_dsl(dsl).build())
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 1, "{dsl}");
     }
 }
@@ -311,7 +319,10 @@ async fn a_bad_query_object_boost_is_rejected() {
                     .filter_query(rust_term(boost)),
             ),
         ] {
-            let result = engine.search(builder.build()).await;
+            let result = engine
+                .search(builder.build())
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
                 wrong.push(format!("{shape} {boost}: {:?}", result.map(|r| r.len())));
             }
@@ -342,7 +353,10 @@ async fn a_boost_times_a_field_boost_too_large_for_an_f32_is_rejected() {
             product().filter_query(nothing),
         ),
     ] {
-        let result = engine.search(builder.build()).await;
+        let result = engine
+            .search(builder.build())
+            .await
+            .map(|response| response.results);
         if !matches!(&result, Err(LaurusError::InvalidArgument(m))
             if m.contains("query boost must be finite and at least 0, got inf"))
         {
@@ -360,7 +374,8 @@ async fn a_boost_times_a_field_boost_too_large_for_an_f32_is_rejected() {
                 .build(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     assert_eq!(filtered.len(), 1);
 }
 
@@ -391,7 +406,10 @@ async fn a_zero_combined_fields_weight_is_rejected_whatever_the_data() {
                 .filter_query(nothing),
         ),
     ] {
-        let result = engine.search(builder.build()).await;
+        let result = engine
+            .search(builder.build())
+            .await
+            .map(|response| response.results);
         if !matches!(&result, Err(LaurusError::InvalidArgument(m))
             if m.contains("CombinedFields boost for field \"title\" must be finite and greater than 0"))
         {
@@ -439,7 +457,10 @@ async fn a_tie_breaker_outside_zero_to_one_is_rejected() {
                     .filter_query(nothing()),
             ),
         ] {
-            let result = engine.search(builder.build()).await;
+            let result = engine
+                .search(builder.build())
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
                 wrong.push(format!(
                     "{shape} {tie_breaker}: {:?}",
@@ -458,7 +479,8 @@ async fn a_tie_breaker_outside_zero_to_one_is_rejected() {
                     .build(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 1, "{tie_breaker}");
     }
 }
@@ -496,6 +518,7 @@ async fn scores(engine: &Engine, dsl: &str, parallel: bool) -> Vec<(String, f32)
         )
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|r| (r.id, r.score))
         .collect();

@@ -68,7 +68,8 @@ impl SearchServiceTrait for SearchService {
         let results = engine
             .search(search_request)
             .await
-            .map_err(error::to_status)?;
+            .map_err(error::to_status)?
+            .results;
         let results: Vec<SearchResult> = results
             .iter()
             .map(search_convert::result_to_proto)
@@ -95,7 +96,8 @@ impl SearchServiceTrait for SearchService {
         let results = engine
             .search(search_request)
             .await
-            .map_err(error::to_status)?;
+            .map_err(error::to_status)?
+            .results;
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
@@ -159,6 +161,7 @@ impl SearchServiceTrait for SearchService {
             .into_iter()
             .map(|per_query_results| SearchResponse {
                 results: per_query_results
+                    .results
                     .iter()
                     .map(search_convert::result_to_proto)
                     .collect(),

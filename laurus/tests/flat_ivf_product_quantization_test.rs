@@ -69,6 +69,7 @@ async fn search_ids(engine: &Engine) -> Vec<String> {
         .search(request)
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| hit.id)
         .collect()

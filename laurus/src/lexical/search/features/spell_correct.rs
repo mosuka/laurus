@@ -4,8 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::lexical::query::LexicalSearchResults;
-use crate::lexical::search::searcher::LexicalSearchRequest;
+use crate::lexical::search::searcher::{LexicalSearchRequest, TrackTotalHits};
 use crate::lexical::store::LexicalStore;
+
+/// The value of a search's total, 0 when it counted none (Issue #1472).
+fn total_value(results: &LexicalSearchResults) -> u64 {
+    results.total_hits.map_or(0, |total| total.value)
+}
 use crate::spelling::corrector::{
     CorrectionResult, CorrectorConfig, DidYouMean, SpellingCorrector,
 };
@@ -208,9 +213,11 @@ impl SpellCorrectedSearchEngine {
         // query already returns enough hits.
         let parser = LexicalQueryParser::new(analyzer).with_default_field(default_field);
         let query = parser.parse(query_str)?;
-        let original_results = self.engine.search(LexicalSearchRequest::new(query))?;
+        let original_results = self
+            .engine
+            .search(LexicalSearchRequest::new(query).track_total_hits(self.track_total_hits()))?;
 
-        let should_correct = self.should_invoke_corrector(original_results.total_hits);
+        let should_correct = self.should_invoke_corrector(total_value(&original_results));
         let correction = if should_correct {
             self.corrector.correct(query_str)
         } else {
@@ -271,9 +278,11 @@ impl SpellCorrectedSearchEngine {
         // rationale, #411).
         let parser = LexicalQueryParser::new(analyzer);
         let query = parser.parse_field(field, query_str)?;
-        let original_results = self.engine.search(LexicalSearchRequest::new(query))?;
+        let original_results = self
+            .engine
+            .search(LexicalSearchRequest::new(query).track_total_hits(self.track_total_hits()))?;
 
-        let should_correct = self.should_invoke_corrector(original_results.total_hits);
+        let should_correct = self.should_invoke_corrector(total_value(&original_results));
         let correction = if should_correct {
             self.corrector.correct(query_str)
         } else {
@@ -305,6 +314,29 @@ impl SpellCorrectedSearchEngine {
         spell_results.did_you_mean = did_you_mean;
 
         Ok(spell_results)
+    }
+
+    /// How many matches the original query must count for the two
+    /// decisions on its hit count (Issue #1472): the larger of the
+    /// [`SpellCorrectStrategy::OnLowResults`] threshold and, with
+    /// `retry_with_correction`, `min_results_for_suggestions`. Counted
+    /// exactly up to it, a total below either is exact, and one that
+    /// reaches it compares as not below either. Without either decision,
+    /// no total is counted.
+    fn track_total_hits(&self) -> TrackTotalHits {
+        let on_low = match self.config.strategy {
+            SpellCorrectStrategy::OnLowResults { threshold } => threshold,
+            _ => 0,
+        };
+        let retry = if self.config.retry_with_correction {
+            self.config.min_results_for_suggestions as u64
+        } else {
+            0
+        };
+        match on_low.max(retry) {
+            0 => TrackTotalHits::Disabled,
+            n => TrackTotalHits::UpTo(n),
+        }
     }
 
     /// Decide whether to invoke the (expensive) spelling corrector
@@ -392,7 +424,7 @@ impl SpellCorrectedSearchEngine {
         if self.config.retry_with_correction {
             // Use correction if original query has few results and correction confidence is high
             let has_few_results =
-                original_results.total_hits < self.config.min_results_for_suggestions as u64;
+                total_value(original_results) < self.config.min_results_for_suggestions as u64;
             let high_confidence = correction.confidence > 0.7;
 
             if has_few_results && high_confidence {
@@ -495,6 +527,52 @@ mod tests {
         assert!(wrapper.should_invoke_corrector(9));
         assert!(!wrapper.should_invoke_corrector(10)); // at threshold (exclusive)
         assert!(!wrapper.should_invoke_corrector(50));
+    }
+
+    /// Issue #1472: the gate counts the original query's matches exactly up
+    /// to its threshold. Before, it read a top-10 search's count, which
+    /// block-max pruning keeps far below the number of matches, so a query
+    /// with many matches looked like one with few and was corrected.
+    #[test]
+    fn the_low_results_gate_counts_the_matches_up_to_its_threshold() {
+        use crate::data::Document;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let engine = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        // 128 short documents with `alpha` four times, then 1,000 long ones
+        // with it once: a top-10 search prunes the later blocks.
+        let filler: String = (0..40).map(|i| format!(" filler{i}")).collect();
+        for i in 0..1_128u64 {
+            let body = if i < 128 {
+                "alpha alpha alpha alpha".to_string()
+            } else {
+                format!("alpha{filler}")
+            };
+            engine
+                .upsert_document(i, Document::builder().add_text("body", body).build())
+                .unwrap();
+        }
+        engine.commit().unwrap();
+        let mut spell_engine = SpellCorrectedSearchEngine::new(engine);
+        spell_engine.config.retry_with_correction = false;
+        // `helo` matches nothing and has a correction; `alpha` matches all
+        // 1,128 documents.
+        let mut corrected = |threshold: u64| {
+            spell_engine.config.strategy = SpellCorrectStrategy::OnLowResults { threshold };
+            spell_engine
+                .search_with_correction("alpha helo", "body")
+                .unwrap()
+                .correction
+                .has_suggestions()
+        };
+        // Control: more than the matches, so the corrector runs.
+        assert!(
+            corrected(5_000),
+            "the corrector suggests nothing for `helo`"
+        );
+        // Fewer than the matches: no correction.
+        assert!(!corrected(500));
     }
 
     #[test]
@@ -613,7 +691,7 @@ mod tests {
 
         let results = LexicalSearchResults {
             hits: vec![],
-            total_hits: 0,
+            total_hits: Some(crate::lexical::search::searcher::TotalHits::exact(0)),
             max_score: 0.0,
             // search_time field doesn't exist in SearchResults
         };

@@ -98,7 +98,8 @@ async fn vector_fields_routes_a_field_less_vector_query() {
     let all = engine
         .search(SearchRequestBuilder::new().vector_query(query()).build())
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     assert_eq!(sorted_ids(&all), vec!["in_a", "in_b"]);
 
     let only_a = engine
@@ -109,7 +110,8 @@ async fn vector_fields_routes_a_field_less_vector_query() {
                 .build(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     assert_eq!(sorted_ids(&only_a), vec!["in_a"]);
 }
 
@@ -129,7 +131,8 @@ async fn vector_min_score_applies_to_a_dsl_vector_clause() {
     let all = engine
         .search(SearchRequestBuilder::new().query_dsl("vec:\"x\"").build())
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     assert_eq!(sorted_ids(&all), vec!["far", "near"]);
 
     let filtered = engine
@@ -140,7 +143,8 @@ async fn vector_min_score_applies_to_a_dsl_vector_clause() {
                 .build(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     assert_eq!(sorted_ids(&filtered), vec!["near"]);
 }
 
@@ -275,7 +279,10 @@ async fn a_bad_query_vector_weight_is_rejected_whatever_the_data() {
     let mut accepted = Vec::new();
     for (shape, request) in &shapes {
         for weight in BAD_WEIGHTS {
-            let result = engine.search(request(weight)).await;
+            let result = engine
+                .search(request(weight))
+                .await
+                .map(|response| response.results);
             if !is_weight_error(&result) {
                 accepted.push(format!("{shape}: {weight} -> {result:?}"));
             }
@@ -308,7 +315,8 @@ async fn a_bad_payload_weight_is_rejected_before_embedding() {
                 ]))
                 .build(),
         )
-        .await;
+        .await
+        .map(|response| response.results);
     assert!(is_weight_error(&result), "{result:?}");
     assert_eq!(
         embedder.calls.load(Ordering::SeqCst),
@@ -333,7 +341,8 @@ async fn a_dsl_vector_weight_too_large_for_an_f32_is_rejected() {
                 .filter_query(nothing())
                 .build(),
         )
-        .await;
+        .await
+        .map(|response| response.results);
     assert!(is_weight_error(&result), "{result:?}");
     assert_eq!(
         embedder.calls.load(Ordering::SeqCst),
@@ -390,6 +399,7 @@ async fn a_zero_or_positive_weight_scales_the_scores() {
                 )
                 .await
                 .unwrap()
+                .results
                 .into_iter()
                 .map(|hit| (hit.id, hit.score))
                 .collect();
@@ -466,7 +476,10 @@ async fn a_non_finite_query_vector_component_is_rejected_whatever_the_data() {
     let mut accepted = Vec::new();
     for (shape, request) in &shapes {
         for component in BAD_COMPONENTS {
-            let result = engine.search(request(component)).await;
+            let result = engine
+                .search(request(component))
+                .await
+                .map(|response| response.results);
             if !is_component_error(&result) {
                 accepted.push(format!("{shape}: {component} -> {result:?}"));
             }
@@ -652,7 +665,10 @@ async fn a_query_vector_of_another_dimension_is_rejected_whatever_the_data() {
     let mut accepted = Vec::new();
     for (shape, request) in &shapes {
         for dimension in BAD_DIMENSIONS {
-            let result = engine.search(request(dimension)).await;
+            let result = engine
+                .search(request(dimension))
+                .await
+                .map(|response| response.results);
             if !is_dimension_error(&result, "query vector 0", dimension as usize) {
                 accepted.push(format!("{shape}: {dimension} -> {result:?}"));
             }
@@ -671,9 +687,10 @@ async fn a_query_vector_of_another_dimension_is_rejected_whatever_the_data() {
                 .build(),
         )
         .await
-        .expect("a query vector that names no field is not checked");
+        .expect("a query vector that names no field is not checked")
+        .results;
     assert!(unnamed.is_empty(), "no field has 3 dimensions: {unnamed:?}");
-    let fitting = engine.search(named(2.0).build()).await.unwrap();
+    let fitting = engine.search(named(2.0).build()).await.unwrap().results;
     assert_eq!(sorted_ids(&fitting), vec!["doc1", "doc2"]);
 }
 
@@ -714,7 +731,10 @@ async fn an_embedded_query_vector_of_another_dimension_is_rejected() {
 
     let mut accepted = Vec::new();
     for (shape, request) in requests {
-        let result = engine.search(request).await;
+        let result = engine
+            .search(request)
+            .await
+            .map(|response| response.results);
         if !is_dimension_error(&result, "the embedding of a query", 3) {
             accepted.push(format!("{shape} -> {result:?}"));
         }

@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use crate::error::Result;
 use crate::lexical::query::SearchHit;
@@ -82,6 +84,43 @@ pub trait Collector: Send + Debug {
     fn requested_top_k(&self) -> Option<usize> {
         None
     }
+
+    /// The number of matches this collector counts exactly before it lets
+    /// the searcher prune (Issue #1472), or `None` when it is not asked
+    /// for a total. The per-segment fanout passes it on to each segment's
+    /// collector, so that every segment counts its matches too.
+    fn total_hits_threshold(&self) -> Option<u64> {
+        None
+    }
+
+    /// Replace [`Self::total_hits`] with a count made elsewhere: the
+    /// per-segment fanout sets the sum of its segments' counts, since the
+    /// caller's collector sees only the hits they forward (Issue #1472).
+    /// The default ignores it.
+    ///
+    /// # Arguments
+    ///
+    /// * `total` - The number of matches counted.
+    fn set_total_hits(&mut self, _total: u64) {}
+}
+
+/// How often a segment of a per-segment fanout adds its count to the count
+/// it shares with the other segments (Issue #1472).
+const SHARED_COUNT_EVERY: u64 = 256;
+
+/// The count of matches a segment of a per-segment fanout shares with the
+/// others, so that the index as a whole counts up to the threshold before
+/// any segment prunes (Issue #1472), as Lucene's `HitsThresholdChecker`
+/// does for the slices of a search.
+#[derive(Debug)]
+struct SharedCount {
+    /// Matches counted by all the segments and added so far.
+    total: Arc<AtomicU64>,
+    /// Matches counted here and not added to `total` yet.
+    pending: u64,
+    /// Set once `total` and `pending` have reached the threshold, after
+    /// which `total` is not read again.
+    reached: AtomicBool,
 }
 
 /// A collector that keeps the top N documents by score.
@@ -93,8 +132,19 @@ pub struct TopDocsCollector {
     min_score: f32,
     /// Collected hits (min-heap based on score).
     hits: BinaryHeap<ScoredDoc>,
-    /// Total number of documents processed.
+    /// Number of documents collected at or above `min_score`.
     total_hits: u64,
+    /// The number of matches to count exactly before pruning
+    /// (Issue #1472), or `None` when no total is asked for.
+    total_hits_threshold: Option<u64>,
+    /// `total_hits` must reach this before [`Collector::min_competitive`]
+    /// lets the searcher skip anything: `max(max_docs, threshold)`. Without
+    /// a threshold, or with a count shared across segments, it is
+    /// `max_docs`, which is when the heap is full.
+    prune_after: u64,
+    /// The count shared with the other segments of a per-segment fanout,
+    /// which must reach the threshold before this segment prunes.
+    shared: Option<SharedCount>,
 }
 
 /// A scored document for use in the heap.
@@ -319,11 +369,17 @@ impl<'a> TopFieldCollector<'a> {
 
 impl<'a> Collector for TopFieldCollector<'a> {
     fn collect(&mut self, doc_id: u64, score: f32) -> Result<()> {
+        // A document below `min_score` is not a match of the search, so it
+        // is not counted (Issue #1472); one above it is, with a zero limit
+        // too.
+        if score < self.min_score {
+            return Ok(());
+        }
         self.total_hits += 1;
 
         // Both gates sit ahead of the reader access on purpose: a
         // zero-limit or below-threshold hit must not cost a lookup.
-        if self.top_k.capacity() == 0 || score < self.min_score {
+        if self.top_k.capacity() == 0 {
             return Ok(());
         }
 
@@ -503,12 +559,7 @@ impl Ord for ScoredDoc {
 impl TopDocsCollector {
     /// Create a new top docs collector.
     pub fn new(max_docs: usize) -> Self {
-        TopDocsCollector {
-            max_docs,
-            min_score: 0.0,
-            hits: BinaryHeap::new(),
-            total_hits: 0,
-        }
+        Self::with_min_score(max_docs, 0.0)
     }
 
     /// Create a new top docs collector with minimum score threshold.
@@ -518,7 +569,44 @@ impl TopDocsCollector {
             min_score,
             hits: BinaryHeap::new(),
             total_hits: 0,
+            total_hits_threshold: None,
+            prune_after: max_docs as u64,
+            shared: None,
         }
+    }
+
+    /// Count this segment's matches into `total`, which the other segments
+    /// of a per-segment fanout share (Issue #1472): the segment prunes only
+    /// once its heap is full and `total` has reached the threshold given to
+    /// [`Self::with_total_hits_threshold`], so the index as a whole, not
+    /// each segment, counts up to it. Call it after setting the threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `total` - The count shared by the segments, starting at 0.
+    pub(crate) fn with_shared_total_hits(mut self, total: Arc<AtomicU64>) -> Self {
+        self.prune_after = self.max_docs as u64;
+        self.shared = Some(SharedCount {
+            total,
+            pending: 0,
+            reached: AtomicBool::new(false),
+        });
+        self
+    }
+
+    /// Count the first `threshold` matches exactly before letting the
+    /// searcher prune (Issue #1472): [`Collector::min_competitive`] stays
+    /// at negative infinity until [`Collector::total_hits`] reaches
+    /// `max(max_docs, threshold)`. `u64::MAX` counts every match; `None`
+    /// prunes as soon as the heap is full, as without this call.
+    ///
+    /// # Arguments
+    ///
+    /// * `threshold` - The number of matches to count exactly, or `None`.
+    pub fn with_total_hits_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.total_hits_threshold = threshold;
+        self.prune_after = (self.max_docs as u64).max(threshold.unwrap_or(0));
+        self
     }
 
     /// Get the maximum number of documents to collect.
@@ -541,11 +629,20 @@ impl TopDocsCollector {
 
 impl Collector for TopDocsCollector {
     fn collect(&mut self, doc_id: u64, score: f32) -> Result<()> {
-        self.total_hits += 1;
-
-        // Check minimum score threshold
+        // Check minimum score threshold. A document below it is not a
+        // match of the search, so it is not counted (Issue #1472).
         if score < self.min_score {
             return Ok(());
+        }
+        self.total_hits += 1;
+        if let Some(shared) = &mut self.shared {
+            shared.pending += 1;
+            if shared.pending == SHARED_COUNT_EVERY {
+                shared
+                    .total
+                    .fetch_add(shared.pending, AtomicOrdering::Relaxed);
+                shared.pending = 0;
+            }
         }
 
         let scored_doc = ScoredDoc { doc_id, score };
@@ -617,11 +714,26 @@ impl Collector for TopDocsCollector {
         // bound is too loose at `k1 + 1`). The correctness fix +
         // MaxScore activation lands together with the block-max index
         // format in the next PR (#403 PR-B onward).
-        if self.hits.len() < self.max_docs {
-            f32::NEG_INFINITY
-        } else {
-            self.hits.peek().map(|d| d.score).unwrap_or(self.min_score)
+        //
+        // Every document counted is pushed while the heap has room, so
+        // without a threshold `total_hits < prune_after` is
+        // `hits.len() < max_docs`. With one, nothing is skipped until the
+        // first `threshold` matches are counted (Issue #1472).
+        if self.total_hits < self.prune_after {
+            return f32::NEG_INFINITY;
         }
+        // In a per-segment fanout, the segments together count up to the
+        // threshold before any of them prunes.
+        if let Some(shared) = &self.shared
+            && !shared.reached.load(AtomicOrdering::Relaxed)
+        {
+            let counted = shared.total.load(AtomicOrdering::Relaxed) + shared.pending;
+            if counted < self.total_hits_threshold.unwrap_or(0) {
+                return f32::NEG_INFINITY;
+            }
+            shared.reached.store(true, AtomicOrdering::Relaxed);
+        }
+        self.hits.peek().map(|d| d.score).unwrap_or(self.min_score)
     }
 
     fn bmw_capable(&self) -> bool {
@@ -632,9 +744,21 @@ impl Collector for TopDocsCollector {
         Some(self.max_docs)
     }
 
+    fn total_hits_threshold(&self) -> Option<u64> {
+        self.total_hits_threshold
+    }
+
+    fn set_total_hits(&mut self, total: u64) {
+        self.total_hits = total;
+    }
+
     fn reset(&mut self) {
         self.hits.clear();
         self.total_hits = 0;
+        if let Some(shared) = &mut self.shared {
+            shared.pending = 0;
+            shared.reached.store(false, AtomicOrdering::Relaxed);
+        }
     }
 }
 
@@ -841,7 +965,9 @@ mod tests {
         collector.collect(2, 0.8).unwrap(); // Above threshold
         collector.collect(3, 0.6).unwrap(); // Above threshold
 
-        assert_eq!(collector.total_hits(), 3);
+        // Only the documents at or above `min_score` are counted
+        // (Issue #1472).
+        assert_eq!(collector.total_hits(), 2);
 
         let results = collector.results();
         assert_eq!(results.len(), 2); // Only 2 above threshold
@@ -1740,5 +1866,123 @@ mod tests {
     fn field_top_k_is_reader_free() {
         fn assert_static_send<T: 'static + Send>() {}
         assert_static_send::<FieldTopK>();
+    }
+
+    // ── Counting up to a threshold (Issue #1472) ────────────────────────
+
+    /// The `min_competitive` of `collector` after it collects `n`
+    /// documents of descending scores, one value per document.
+    fn floors_after_each(collector: &mut TopDocsCollector, n: u64) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                collector.collect(i, 10.0 - i as f32 * 0.1).unwrap();
+                collector.min_competitive()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_a_threshold_the_floor_is_finite_once_the_heap_is_full() {
+        let mut collector = TopDocsCollector::new(3);
+        let floors = floors_after_each(&mut collector, 5);
+        assert!(floors[..2].iter().all(|f| *f == f32::NEG_INFINITY));
+        assert!(floors[2..].iter().all(|f| f.is_finite()), "{floors:?}");
+    }
+
+    #[test]
+    fn a_threshold_keeps_the_floor_at_negative_infinity_until_it_is_counted() {
+        let mut collector = TopDocsCollector::new(3).with_total_hits_threshold(Some(5));
+        let floors = floors_after_each(&mut collector, 7);
+        // Full after 3, but nothing may be skipped before 5 are counted.
+        assert!(
+            floors[..4].iter().all(|f| *f == f32::NEG_INFINITY),
+            "{floors:?}"
+        );
+        assert!(floors[4..].iter().all(|f| f.is_finite()), "{floors:?}");
+        assert_eq!(collector.total_hits(), 7);
+    }
+
+    #[test]
+    fn an_exact_count_never_lets_the_searcher_skip() {
+        let mut collector = TopDocsCollector::new(3).with_total_hits_threshold(Some(u64::MAX));
+        let floors = floors_after_each(&mut collector, 50);
+        assert!(floors.iter().all(|f| *f == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn a_threshold_below_the_heap_size_prunes_once_the_heap_is_full() {
+        let mut collector = TopDocsCollector::new(3).with_total_hits_threshold(Some(1));
+        let floors = floors_after_each(&mut collector, 4);
+        assert!(floors[..2].iter().all(|f| *f == f32::NEG_INFINITY));
+        assert!(floors[2..].iter().all(|f| f.is_finite()), "{floors:?}");
+    }
+
+    #[test]
+    fn a_document_below_min_score_is_not_counted_towards_the_threshold() {
+        let mut collector =
+            TopDocsCollector::with_min_score(1, 0.5).with_total_hits_threshold(Some(2));
+        collector.collect(1, 0.9).unwrap();
+        collector.collect(2, 0.1).unwrap();
+        collector.collect(3, 0.2).unwrap();
+        assert_eq!(collector.total_hits(), 1);
+        assert_eq!(collector.min_competitive(), f32::NEG_INFINITY);
+        collector.collect(4, 0.8).unwrap();
+        assert_eq!(collector.total_hits(), 2);
+        assert!(collector.min_competitive().is_finite());
+    }
+
+    #[test]
+    fn a_shared_count_holds_every_segment_until_the_segments_reach_the_threshold() {
+        let total = Arc::new(AtomicU64::new(0));
+        let new = || {
+            TopDocsCollector::new(2)
+                .with_total_hits_threshold(Some(SHARED_COUNT_EVERY * 2))
+                .with_shared_total_hits(total.clone())
+        };
+        let mut first = new();
+        let mut second = new();
+        // Each segment's heap is full long before the threshold.
+        for i in 0..SHARED_COUNT_EVERY {
+            first.collect(i, 1.0).unwrap();
+            assert_eq!(first.min_competitive(), f32::NEG_INFINITY);
+        }
+        assert_eq!(total.load(AtomicOrdering::Relaxed), SHARED_COUNT_EVERY);
+        for i in 0..SHARED_COUNT_EVERY - 1 {
+            second.collect(i, 1.0).unwrap();
+            assert_eq!(second.min_competitive(), f32::NEG_INFINITY);
+        }
+        // The last document reaches the threshold, counted with what the
+        // second segment has not added yet.
+        second.collect(SHARED_COUNT_EVERY, 1.0).unwrap();
+        assert!(second.min_competitive().is_finite());
+        assert!(first.min_competitive().is_finite());
+        assert_eq!(
+            first.total_hits() + second.total_hits(),
+            SHARED_COUNT_EVERY * 2
+        );
+    }
+
+    #[test]
+    fn set_total_hits_replaces_the_count() {
+        let mut collector = TopDocsCollector::new(3).with_total_hits_threshold(Some(10));
+        collector.collect(1, 1.0).unwrap();
+        collector.set_total_hits(42);
+        assert_eq!(collector.total_hits(), 42);
+    }
+
+    #[test]
+    fn a_top_field_collector_counts_only_documents_at_or_above_min_score() {
+        use crate::lexical::core::field::FieldValue;
+
+        let values: Vec<(u64, FieldValue)> =
+            (1..=3).map(|i| (i, FieldValue::Int64(i as i64))).collect();
+        let reader = FieldValueMockReader::new(&values);
+        let mut collector =
+            TopFieldCollector::with_min_score(0, 0.5, "value".to_string(), true, &reader);
+        collector.collect(1, 0.9).unwrap();
+        collector.collect(2, 0.1).unwrap();
+        collector.collect(3, 0.6).unwrap();
+        // A zero limit still counts the matches.
+        assert_eq!(collector.total_hits(), 2);
     }
 }

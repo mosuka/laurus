@@ -253,7 +253,7 @@ async fn test_field_less_vector_search_skips_multi_vector_fields() -> Result<()>
             .build()
     };
 
-    let results = engine.search(query(None)).await?;
+    let results = engine.search(query(None)).await?.results;
     let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids.len(), 2, "each document once, from `vec` only: {ids:?}");
     assert_eq!(ids[0], "a");
@@ -861,7 +861,8 @@ async fn check_binary_rescore(
                 .limit(100)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(results.len(), documents);
 
     // The rescore normalizes the query of a Cosine field the same way.
@@ -989,7 +990,8 @@ async fn test_f32_rescore_at_a_fixed_width_dimension() -> Result<()> {
                 .limit(100)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(results.len(), 16);
     // The rescore scores on rayon's pool; other tests may add to the count,
     // but without the dispatch nothing would.
@@ -1066,7 +1068,8 @@ async fn test_f32_rescore_at_a_block4_dimension() -> Result<()> {
                 .limit(100)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(results.len(), 16);
     // The rescore scores on rayon's pool; other tests may add to the count,
     // but without the dispatch nothing would.
@@ -1138,7 +1141,8 @@ async fn test_decoded_rescore_of_documents_of_different_lengths_matches_a_fresh_
                     .limit(100)
                     .build(),
             )
-            .await?;
+            .await?
+            .results;
         assert_eq!(results.len(), 64, "{kind:?}");
 
         let mut flat = Vec::new();

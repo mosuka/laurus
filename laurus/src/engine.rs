@@ -1075,6 +1075,8 @@ struct FirstStage {
     fusion_algorithm: FusionAlgorithm,
     /// Which documents a hybrid search keeps.
     hybrid_mode: self::search::HybridMode,
+    /// How many matches the request counts for its total (Issue #1472).
+    track_total_hits: self::search::TrackTotalHits,
 }
 
 /// One run of a [`FirstStage`]: the ranking, and how many hits each list
@@ -1086,6 +1088,8 @@ struct RankedRound {
     lexical: Option<self::grouping::ListCount>,
     /// The vector list's counts, if the search has one.
     vector: Option<self::grouping::ListCount>,
+    /// The search's total, if the request asked for one (Issue #1472).
+    total_hits: Option<self::search::TotalHits>,
 }
 
 /// Combine lexical and vector hits into one ranking, best first.
@@ -3476,6 +3480,9 @@ impl Engine {
                         timeout_ms: lexical_options.timeout_ms,
                         parallel: lexical_options.parallel,
                         sort_by: lexical_options.sort_by.clone(),
+                        // Set from the engine request in `rank_round` (Issue #1472).
+                        track_total_hits:
+                            crate::lexical::search::searcher::TrackTotalHits::Disabled,
                     },
                     field_boosts: lexical_options.field_boosts.clone(),
                 };
@@ -3499,6 +3506,9 @@ impl Engine {
                         timeout_ms: lexical_options.timeout_ms,
                         parallel: lexical_options.parallel,
                         sort_by: lexical_options.sort_by.clone(),
+                        // Set from the engine request in `rank_round` (Issue #1472).
+                        track_total_hits:
+                            crate::lexical::search::searcher::TrackTotalHits::Disabled,
                     },
                     field_boosts: lexical_options.field_boosts.clone(),
                 };
@@ -4418,7 +4428,7 @@ impl Engine {
     pub async fn search(
         &self,
         request: self::search::SearchRequest,
-    ) -> Result<Vec<self::search::SearchResult>> {
+    ) -> Result<self::search::SearchResponse> {
         // 0a. Resolve query to internal search components
         //
         // When the query is a DSL string, parse it with UnifiedQueryParser to
@@ -4437,7 +4447,23 @@ impl Engine {
             vector_options,
             rescore: request_rescore,
             group_by: request_group_by,
+            track_total_hits: request_track_total_hits,
         } = request;
+
+        // Issue #1472: a threshold of 0 would count nothing and still ask
+        // every search to count.
+        if request_track_total_hits == self::search::TrackTotalHits::UpTo(0) {
+            return Err(LaurusError::invalid_argument(
+                "track_total_hits must count at least 1 match, got UpTo(0)",
+            ));
+        }
+        // The total of a search that finds nothing before it ranks.
+        let no_matches = || self::search::SearchResponse {
+            results: Vec::new(),
+            total_hits: request_track_total_hits
+                .threshold()
+                .map(|_| self::search::TotalHits::exact(0)),
+        };
 
         self.validate_field_boosts(&lexical_options.field_boosts)?;
         // Issue #1540: checked whether or not the request has a lexical or a
@@ -4592,8 +4618,15 @@ impl Engine {
         // what the same search with `limit` 1 rejects (Issue #1592); it
         // used to return right after `grouping::validate`, before the DSL,
         // the boosts and the rescore were checked.
-        if request_group_by.is_some() && request_limit == 0 {
-            return Ok(Vec::new());
+        // A search that asks for a total goes on, to count it (Issue #1472).
+        if request_group_by.is_some()
+            && request_limit == 0
+            && request_track_total_hits == self::search::TrackTotalHits::Disabled
+        {
+            return Ok(self::search::SearchResponse {
+                results: Vec::new(),
+                total_hits: None,
+            });
         }
 
         // 0c. Pre-process Filter
@@ -4607,7 +4640,7 @@ impl Engine {
             let allowed = self.lexical.matching_doc_ids(filter_query.clone_box())?;
 
             if allowed.is_empty() {
-                return Ok(Vec::new());
+                return Ok(no_matches());
             }
 
             let new_lexical_query = user_lexical_query.as_ref().map(|user_query| {
@@ -4692,6 +4725,7 @@ impl Engine {
                 k: FusionAlgorithm::DEFAULT_RRF_K,
             }),
             hybrid_mode,
+            track_total_hits: request_track_total_hits,
         };
 
         let Some(group_by) = request_group_by else {
@@ -4705,6 +4739,7 @@ impl Engine {
             )?;
 
             // 5. Paginate once, then resolve ids and documents for the page only.
+            let total_hits = round.total_hits;
             let page: Vec<(u64, f32)> = round
                 .ranked
                 .into_iter()
@@ -4719,7 +4754,10 @@ impl Engine {
                 self.apply_highlights(&mut results, query.as_ref(), options)?;
             }
 
-            return Ok(results);
+            return Ok(self::search::SearchResponse {
+                results,
+                total_hits,
+            });
         };
 
         // 3–4 for a grouped search (Issue #1297): rank, rescore and group
@@ -4735,6 +4773,9 @@ impl Engine {
         let mut keys: ahash::AHashMap<u64, Option<crate::data::DataValue>> = ahash::AHashMap::new();
         let mut fetch_count = fetch_count;
         let mut previous_vector = None;
+        // The total of the search the groups are formed from, as the last
+        // round counted it (Issue #1472).
+        let mut total_hits;
         let groups = loop {
             let remaining_ms =
                 lexical_timeout_ms.map(|timeout| timeout.saturating_sub(timer.elapsed_ms()));
@@ -4744,6 +4785,7 @@ impl Engine {
                 remaining_ms,
                 rescore.as_ref().map(|rescore| (rescore, &mut scores)),
             )?;
+            total_hits = round.total_hits;
             self.resolve_group_keys(&group_by.field, &round.ranked, &mut keys)?;
             let groups =
                 self::grouping::group_ranked(&round.ranked, &keys, group_by.group_size, page_end);
@@ -4793,7 +4835,10 @@ impl Engine {
             leader.inner_hits = members.collect();
             grouped.push(leader);
         }
-        Ok(grouped)
+        Ok(self::search::SearchResponse {
+            results: grouped,
+            total_hits,
+        })
     }
 
     /// Run the first stage for `fetch_count` candidates, rank them, and
@@ -4838,6 +4883,7 @@ impl Engine {
             if lexical_timeout_ms.is_some() {
                 request.params.timeout_ms = lexical_timeout_ms;
             }
+            request.params.track_total_hits = stage.track_total_hits;
             request
         });
         let vec_req = stage.vector.as_ref().map(|template| {
@@ -4859,8 +4905,10 @@ impl Engine {
         let (lex_res, vec_res) = rayon::join(run_lexical, run_vector);
         #[cfg(not(feature = "native"))]
         let (lex_res, vec_res) = (run_lexical(), run_vector());
-        let lexical_hits = lex_res?.map(|r| r.hits).unwrap_or_default();
+        let (lexical_hits, lexical_total) =
+            lex_res?.map(|r| (r.hits, r.total_hits)).unwrap_or_default();
         let vector_hits = vec_res?.map(|r| r.hits).unwrap_or_default();
+        let vector_returned = vector_hits.len();
         let lexical = stage.lexical.as_ref().map(|_| self::grouping::ListCount {
             requested: list_limit,
             returned: lexical_hits.len(),
@@ -4872,6 +4920,16 @@ impl Engine {
 
         // 3. Rank: every mode reduces to one list of (doc id, score), best
         // first, before any page is cut or any document is read.
+        //
+        // The total (Issue #1472): a lexical search's is the lexical
+        // store's. An approximate vector search has no set of matches, so
+        // its total is at least what it ranked. A union keeps every lexical
+        // match, so its total is at least the larger of the lexical value
+        // and the fused candidates; an intersection keeps only some of them,
+        // so the lexical count bounds it from above, and its total is at
+        // least the fused candidates.
+        let tracking = stage.track_total_hits.threshold().is_some();
+        let mut total_hits = None;
         let ranked: Vec<(u64, f32)> = if stage.hybrid {
             let mut fused = fuse_scores(
                 lexical_hits,
@@ -4879,15 +4937,29 @@ impl Engine {
                 stage.fusion_algorithm,
                 stage.hybrid_mode,
             );
+            if tracking {
+                let fused_count = fused.len() as u64;
+                let value = match stage.hybrid_mode {
+                    self::search::HybridMode::Union => {
+                        fused_count.max(lexical_total.map_or(0, |total| total.value))
+                    }
+                    self::search::HybridMode::Intersection => fused_count,
+                };
+                total_hits = Some(self::search::TotalHits::at_least(value));
+            }
             fused.truncate(fetch_count);
             fused
-        } else if !vector_hits.is_empty() {
+        } else if stage.vector.is_some() {
+            if tracking {
+                total_hits = Some(self::search::TotalHits::at_least(vector_returned as u64));
+            }
             vector_hits
                 .into_iter()
                 .map(|h| (h.doc_id, h.score))
                 .collect()
         } else {
             // Only lexical results (or both empty).
+            total_hits = lexical_total;
             lexical_hits
                 .into_iter()
                 .map(|h| (h.doc_id, h.score))
@@ -4904,6 +4976,7 @@ impl Engine {
             ranked,
             lexical,
             vector,
+            total_hits,
         })
     }
 
@@ -5123,7 +5196,7 @@ impl Engine {
     pub async fn search_batch(
         &self,
         requests: Vec<self::search::SearchRequest>,
-    ) -> Result<Vec<Vec<self::search::SearchResult>>> {
+    ) -> Result<Vec<self::search::SearchResponse>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -6415,7 +6488,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("category:\"Rust Lang\""))
             .limit(10)
             .build();
-        let results = engine.search(request).await.unwrap();
+        let results = engine.search(request).await.unwrap().results;
         assert_eq!(
             results.len(),
             1,
@@ -6427,7 +6500,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("category:Rust"))
             .limit(10)
             .build();
-        let results = engine.search(request).await.unwrap();
+        let results = engine.search(request).await.unwrap().results;
         assert!(
             results.is_empty(),
             "Keyword analyzer should not match partial tokens"
@@ -6438,7 +6511,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("body:rust"))
             .limit(10)
             .build();
-        let results = engine.search(request).await.unwrap();
+        let results = engine.search(request).await.unwrap().results;
         assert_eq!(
             results.len(),
             1,
@@ -6492,7 +6565,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("content:hello"))
             .limit(10)
             .build();
-        let results = engine.search(request).await.unwrap();
+        let results = engine.search(request).await.unwrap().results;
         assert_eq!(
             results.len(),
             1,
@@ -6545,7 +6618,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("category:programming"))
             .limit(10)
             .build();
-        let results = engine.search(request).await.unwrap();
+        let results = engine.search(request).await.unwrap().results;
         assert_eq!(
             results.len(),
             1,
@@ -6593,7 +6666,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("title:group"))
             .limit(10)
             .build();
-        let results = engine.search(request).await.unwrap();
+        let results = engine.search(request).await.unwrap().results;
         assert_eq!(results.len(), 1, "group-committed doc must be searchable");
     }
 
@@ -7260,7 +7333,7 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(
-            engine.search(request).await.unwrap().len(),
+            engine.search(request).await.unwrap().results.len(),
             1,
             "default analyzer should tokenize and match a single word"
         );
@@ -7300,7 +7373,7 @@ mod tests {
             .limit(10)
             .build();
         assert!(
-            engine.search(request).await.unwrap().is_empty(),
+            engine.search(request).await.unwrap().results.is_empty(),
             "keyword analyzer must not match a partial token"
         );
 
@@ -7310,7 +7383,7 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(
-            engine.search(request).await.unwrap().len(),
+            engine.search(request).await.unwrap().results.len(),
             1,
             "keyword analyzer should match the exact stored phrase as one term"
         );
@@ -7358,7 +7431,7 @@ mod tests {
             .limit(10)
             .build();
         assert!(
-            engine.search(request).await.unwrap().is_empty(),
+            engine.search(request).await.unwrap().results.is_empty(),
             "an indexed: false field must not be searchable"
         );
 
@@ -7388,7 +7461,7 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(
-            engine.search(request).await.unwrap().len(),
+            engine.search(request).await.unwrap().results.len(),
             1,
             "indexed: false -> true must rebuild postings from the stored value, \
              even with no explicit analyzer override"
@@ -8382,7 +8455,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(bbox_dsl))
             .limit(10)
             .build();
-        let before = engine.search(request).await.unwrap();
+        let before = engine.search(request).await.unwrap().results;
         assert_eq!(before.len(), 1, "live doc should match the bbox");
 
         // Delete + commit. The doc is soft-deleted in the segment but
@@ -8394,7 +8467,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(bbox_dsl))
             .limit(10)
             .build();
-        let after = engine.search(request).await.unwrap();
+        let after = engine.search(request).await.unwrap().results;
         assert_eq!(
             after.len(),
             0,
@@ -8408,7 +8481,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(nearest_dsl))
             .limit(10)
             .build();
-        let after_nearest = engine.search(request).await.unwrap();
+        let after_nearest = engine.search(request).await.unwrap().results;
         assert_eq!(
             after_nearest.len(),
             0,
@@ -8421,7 +8494,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(distance_dsl))
             .limit(10)
             .build();
-        let after_distance = engine.search(request).await.unwrap();
+        let after_distance = engine.search(request).await.unwrap().results;
         assert_eq!(
             after_distance.len(),
             0,
@@ -8487,7 +8560,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(dsl))
             .limit(10)
             .build();
-        let hits = engine.search(request).await.unwrap();
+        let hits = engine.search(request).await.unwrap().results;
         assert_eq!(
             hits.len(),
             2,
@@ -8538,7 +8611,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(dsl))
             .limit(10)
             .build();
-        let hits = engine.search(request).await.unwrap();
+        let hits = engine.search(request).await.unwrap().results;
         assert_eq!(
             hits.len(),
             2,
@@ -8578,7 +8651,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(dsl))
             .limit(10)
             .build();
-        let hits = engine.search(request).await.unwrap();
+        let hits = engine.search(request).await.unwrap().results;
         assert_eq!(
             hits.len(),
             2,
@@ -8631,7 +8704,8 @@ mod tests {
         let hits = engine
             .search(search("date:{2024-01-01 TO 2024-12-31}"))
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(
             hits.len(),
             2,
@@ -8641,7 +8715,8 @@ mod tests {
         let hits = engine
             .search(search("date:[2024-06-01 TO 2024-12-31]"))
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(hits.len(), 1);
     }
 
@@ -8688,7 +8763,7 @@ mod tests {
             })
             .limit(4)
             .build();
-        let hits = engine.search(request).await.unwrap();
+        let hits = engine.search(request).await.unwrap().results;
 
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(
@@ -8714,7 +8789,8 @@ mod tests {
                     .build(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(baseline.len(), 4);
         let max_score = baseline
             .iter()
@@ -8731,7 +8807,8 @@ mod tests {
                     .build(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert!(
             filtered.is_empty(),
             "min_score above every score must exclude all hits; got {}",
@@ -8757,6 +8834,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .results
             .iter()
             .map(|h| h.id.clone())
             .collect();
@@ -8770,6 +8848,7 @@ mod tests {
             )
             .await
             .unwrap()
+            .results
             .iter()
             .map(|h| h.id.clone())
             .collect();
@@ -8830,7 +8909,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from(dsl))
             .limit(10)
             .build();
-        let hits = engine.search(request).await.unwrap();
+        let hits = engine.search(request).await.unwrap().results;
         assert_eq!(
             hits.len(),
             2,
@@ -9011,7 +9090,7 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(
-            engine.search(request).await.unwrap().len(),
+            engine.search(request).await.unwrap().results.len(),
             1,
             "an auto-committed doc must be searchable without an explicit commit"
         );
@@ -9083,7 +9162,7 @@ mod tests {
             .limit(10)
             .build();
         assert_eq!(
-            engine.search(request).await.unwrap().len(),
+            engine.search(request).await.unwrap().results.len(),
             1,
             "an Interval-committed doc must be searchable without an explicit commit"
         );
@@ -9485,14 +9564,14 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("title:alpha"))
             .limit(10)
             .build();
-        assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
+        assert_eq!(reopened.search(alpha).await.unwrap().results.len(), 1);
 
         let bravo = crate::engine::search::SearchRequestBuilder::new()
             .lexical_query(LexicalSearchQuery::from("title:bravo"))
             .limit(10)
             .build();
         assert_eq!(
-            reopened.search(bravo).await.unwrap().len(),
+            reopened.search(bravo).await.unwrap().results.len(),
             1,
             "the mutation caught mid-flight during commit must be recovered \
              from its retained WAL record (#876)"
@@ -9558,6 +9637,7 @@ mod tests {
             .search(request)
             .await
             .unwrap()
+            .results
             .into_iter()
             .map(|hit| hit.id)
             .collect()
@@ -10946,7 +11026,7 @@ mod tests {
             .lexical_query(LexicalSearchQuery::from("title:alpha"))
             .limit(10)
             .build();
-        assert_eq!(reopened.search(alpha).await.unwrap().len(), 1);
+        assert_eq!(reopened.search(alpha).await.unwrap().results.len(), 1);
     }
 
     /// Issue #1604: an index an older build left with a `NaN` in an indexed
@@ -11076,7 +11156,7 @@ mod tests {
                 .lexical_query(LexicalSearchQuery::from("title:alpha"))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap().len()
+            engine.search(request).await.unwrap().results.len()
         }
 
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(Default::default()));
@@ -11627,6 +11707,7 @@ mod tests {
             .search(request)
             .await
             .unwrap()
+            .results
             .iter()
             .filter(|hit| hit.id == id)
             .count()
@@ -12126,7 +12207,7 @@ mod tests {
                 ]))
                 .limit(3)
                 .build();
-            assert_eq!(engine.search(request).await.unwrap().len(), 3);
+            assert_eq!(engine.search(request).await.unwrap().results.len(), 3);
         }
     }
 

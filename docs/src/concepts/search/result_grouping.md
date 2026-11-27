@@ -26,7 +26,7 @@ let request = SearchRequestBuilder::new()
     .group_by(GroupBy::new("_id").group_size(3))
     .limit(10)
     .build();
-for result in engine.search(request).await? {
+for result in engine.search(request).await?.results {
     // The group's best chunk, then up to two more of the same document.
     println!("{} {}", result.id, result.score);
     for hit in &result.inner_hits {

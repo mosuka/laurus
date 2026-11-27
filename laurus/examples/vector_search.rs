@@ -121,7 +121,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -141,7 +142,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -168,7 +170,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -188,7 +191,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\nVector search example completed successfully!");

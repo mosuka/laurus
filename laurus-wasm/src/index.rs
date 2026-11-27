@@ -584,7 +584,12 @@ impl WasmIndex {
         request.rescore = parse_rescore_options(rescore, CONTEXT)?;
         request.group_by = parse_group_by_options(group_by, CONTEXT)?;
         request.fusion_algorithm = parse_fusion_options(fusion)?;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -618,7 +623,12 @@ impl WasmIndex {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
         let mut request = build_lexical_request(&query, limit, offset)?;
         request.lexical_options.highlight = highlight;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -658,7 +668,12 @@ impl WasmIndex {
         let query = JsQuery::DateTimeRangeQuery(JsDateTimeRangeQuery { field, min, max });
         let mut request = build_lexical_request(&query, limit, offset)?;
         request.lexical_options.highlight = highlight;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -698,7 +713,12 @@ impl WasmIndex {
             distance_m,
         });
         let request = build_lexical_request(&query, limit, offset)?;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -741,7 +761,12 @@ impl WasmIndex {
             max_z,
         });
         let request = build_lexical_request(&query, limit, offset)?;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -786,7 +811,12 @@ impl WasmIndex {
             max_radius_m,
         });
         let request = build_lexical_request(&query, limit, offset)?;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -828,7 +858,12 @@ impl WasmIndex {
         let mut request = build_vector_request(&query, limit, offset);
         request.rescore = rescore;
         request.group_by = group_by;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 
@@ -867,7 +902,12 @@ impl WasmIndex {
         let mut request = build_vector_request(&query, limit, offset);
         request.rescore = rescore;
         request.group_by = group_by;
-        let results = self.engine.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         search_results_to_js(results)
     }
 

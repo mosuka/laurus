@@ -1,6 +1,7 @@
 //! Searcher implementation for executing queries against an index.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use ahash::AHashMap;
@@ -28,7 +29,7 @@ use crate::lexical::query::term::TermQuery;
 use crate::lexical::query::{LexicalSearchResults, SearchHit};
 use crate::lexical::reader::LexicalIndexReader;
 use crate::lexical::search::searcher::{
-    LexicalSearchParams, LexicalSearchQuery, LexicalSearchRequest, SortField, SortOrder,
+    LexicalSearchParams, LexicalSearchQuery, LexicalSearchRequest, SortField, SortOrder, TotalHits,
 };
 
 /// Default capacity (entries) of the per-searcher parsed-DSL query cache
@@ -742,6 +743,20 @@ impl InvertedIndexSearcher {
         // each segment returns up to `top_k` so the merge has the
         // headroom to pick any combination of per-segment hits.
         let per_segment_k = collector.requested_top_k().unwrap_or(10);
+        // With a total asked for (Issue #1472), the segments count their
+        // matches at or above the caller's `min_score` into one shared
+        // count, and none of them prunes before it reaches the threshold,
+        // so the index as a whole counts up to it. The caller's collector
+        // sees only the forwarded hits, so the sum of the segments' counts
+        // replaces its own after the merge. Without one, each segment
+        // collects as before.
+        let total_hits_threshold = collector.total_hits_threshold();
+        let shared_total = total_hits_threshold.map(|_| Arc::new(AtomicU64::new(0)));
+        let segment_min_score = if total_hits_threshold.is_some() {
+            collector.min_score()
+        } else {
+            0.0
+        };
 
         let segments = inverted_reader.segment_readers().to_vec();
 
@@ -750,8 +765,8 @@ impl InvertedIndexSearcher {
         #[cfg(target_arch = "wasm32")]
         let segment_iter = segments.iter();
 
-        let per_segment_results: Vec<Result<Vec<SearchHit>>> = segment_iter
-            .map(|seg_arc| -> Result<Vec<SearchHit>> {
+        let per_segment_results: Vec<Result<(Vec<SearchHit>, u64)>> = segment_iter
+            .map(|seg_arc| -> Result<(Vec<SearchHit>, u64)> {
                 let view = PerSegmentReaderView::new(
                     seg_arc.clone(),
                     global_doc_count,
@@ -761,7 +776,12 @@ impl InvertedIndexSearcher {
                 );
                 let view_reader: Arc<dyn LexicalIndexReader> = Arc::new(view);
                 let temp_searcher = InvertedIndexSearcher::from_arc(view_reader);
-                let temp_collector = TopDocsCollector::new(per_segment_k);
+                let mut temp_collector =
+                    TopDocsCollector::with_min_score(per_segment_k, segment_min_score)
+                        .with_total_hits_threshold(total_hits_threshold);
+                if let Some(total) = &shared_total {
+                    temp_collector = temp_collector.with_shared_total_hits(total.clone());
+                }
                 // Propagate the deadline so each per-segment search aborts
                 // mid-flight too — segments run in parallel, so a single slow
                 // segment would otherwise leave the whole fanout unbounded
@@ -772,20 +792,29 @@ impl InvertedIndexSearcher {
                     false,
                     deadline,
                 )?;
-                Ok(collected.results())
+                Ok((collected.results(), collected.total_hits()))
             })
             .collect();
 
         // Merge per-segment top-K into the caller's collector. Errors
         // from any one segment short-circuit the whole search.
-        for hits in per_segment_results {
-            let hits = hits?;
+        let per_segment_results = per_segment_results
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let counted: u64 = per_segment_results.iter().map(|(_, n)| n).sum();
+        for (hits, _) in per_segment_results {
             for hit in hits {
                 collector.collect(hit.doc_id, hit.score)?;
                 if !collector.needs_more() {
-                    return Ok(collector);
+                    break;
                 }
             }
+            if !collector.needs_more() {
+                break;
+            }
+        }
+        if total_hits_threshold.is_some() {
+            collector.set_total_hits(counted);
         }
         Ok(collector)
     }
@@ -1233,9 +1262,10 @@ impl InvertedIndexSearcher {
         // instead of only being detected after the query has already run to
         // completion as the old post-hoc `elapsed()` check did.
         let deadline = Deadline::new(Timer::now(), timeout);
+        let threshold = params.track_total_hits.threshold();
 
         // Create collector based on sort type
-        let (mut hits, total_hits) = match &params.sort_by {
+        let (mut hits, counted) = match &params.sort_by {
             SortField::Field { name, order } => {
                 let ascending = matches!(order, SortOrder::Asc);
                 if self
@@ -1276,7 +1306,8 @@ impl InvertedIndexSearcher {
             }
             SortField::Score => {
                 // Use TopDocsCollector for score-based sorting
-                let collector = TopDocsCollector::with_min_score(params.limit, params.min_score);
+                let collector = TopDocsCollector::with_min_score(params.limit, params.min_score)
+                    .with_total_hits_threshold(threshold);
 
                 let result_collector = self.search_with_collector_deadline(
                     query,
@@ -1310,7 +1341,7 @@ impl InvertedIndexSearcher {
 
         Ok(LexicalSearchResults {
             hits,
-            total_hits,
+            total_hits: threshold.map(|t| TotalHits::from_count(counted, t)),
             max_score,
         })
     }
@@ -1358,10 +1389,11 @@ impl InvertedIndexSearcher {
         query.validate_boosts()?;
 
         // Check if query is empty
+        let threshold = request.params.track_total_hits.threshold();
         if query.is_empty(self.reader.as_ref())? {
             return Ok(LexicalSearchResults {
                 hits: Vec::new(),
-                total_hits: 0,
+                total_hits: threshold.map(|_| TotalHits::exact(0)),
                 max_score: 0.0,
             });
         }
@@ -1375,7 +1407,7 @@ impl InvertedIndexSearcher {
             match &request.params.sort_by {
                 SortField::Field { name, order } => {
                     let ascending = matches!(order, SortOrder::Asc);
-                    let (mut hits, total_hits) = if self
+                    let (mut hits, counted) = if self
                         .reader
                         .as_any()
                         .downcast_ref::<InvertedIndexReader>()
@@ -1420,9 +1452,11 @@ impl InvertedIndexSearcher {
                     // Calculate max score
                     let max_score = hits.iter().map(|hit| hit.score).fold(0.0f32, f32::max);
 
+                    // A field sort never prunes, so the count is exact; the
+                    // total caps it at the threshold all the same.
                     Ok(LexicalSearchResults {
                         hits,
-                        total_hits,
+                        total_hits: threshold.map(|t| TotalHits::from_count(counted, t)),
                         max_score,
                     })
                 }
@@ -1431,7 +1465,8 @@ impl InvertedIndexSearcher {
                     let collector = TopDocsCollector::with_min_score(
                         request.params.limit,
                         request.params.min_score,
-                    );
+                    )
+                    .with_total_hits_threshold(threshold);
                     let result_collector = self.search_with_collector_parallel(
                         query,
                         collector,
@@ -1439,7 +1474,7 @@ impl InvertedIndexSearcher {
                     )?;
 
                     let mut hits = result_collector.results();
-                    let total_hits = result_collector.total_hits();
+                    let counted = result_collector.total_hits();
 
                     // Load documents if requested
                     if request.params.load_documents {
@@ -1453,7 +1488,7 @@ impl InvertedIndexSearcher {
 
                     Ok(LexicalSearchResults {
                         hits,
-                        total_hits,
+                        total_hits: threshold.map(|t| TotalHits::from_count(counted, t)),
                         max_score,
                     })
                 }
@@ -1608,6 +1643,7 @@ mod tests {
     use crate::lexical::index::inverted::reader::{InvertedIndexReader, InvertedIndexReaderConfig};
     use crate::lexical::query::boolean::{BooleanQuery, BooleanQueryBuilder};
     use crate::lexical::query::term::TermQuery;
+    use crate::lexical::search::searcher::TrackTotalHits;
 
     use crate::storage::memory::MemoryStorage;
     use crate::storage::memory::MemoryStorageConfig;
@@ -1644,12 +1680,12 @@ mod tests {
         let searcher = create_test_searcher();
         let query = Box::new(TermQuery::new("title", "hello")) as Box<dyn Query>;
 
-        let request = LexicalSearchRequest::new(query);
+        let request = LexicalSearchRequest::new(query).track_total_hits(TrackTotalHits::Exact);
         let results = searcher.search(request).unwrap();
 
         // Should return empty results for non-existent terms
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
         assert_eq!(results.max_score, 0.0);
     }
 
@@ -1664,12 +1700,12 @@ mod tests {
                 .build(),
         ) as Box<dyn Query>;
 
-        let request = LexicalSearchRequest::new(query);
+        let request = LexicalSearchRequest::new(query).track_total_hits(TrackTotalHits::Exact);
         let results = searcher.search(request).unwrap();
 
         // Should return empty results for non-existent terms
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
         assert_eq!(results.max_score, 0.0);
     }
 
@@ -1681,13 +1717,14 @@ mod tests {
         let request = LexicalSearchRequest::new(query)
             .limit(5)
             .min_score(0.5)
-            .load_documents(false);
+            .load_documents(false)
+            .track_total_hits(TrackTotalHits::Exact);
 
         let results = searcher.search(request).unwrap();
 
         // Should respect configuration
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
     }
 
     #[test]
@@ -1706,13 +1743,15 @@ mod tests {
         let searcher = create_test_searcher();
         let query = Box::new(TermQuery::new("title", "hello")) as Box<dyn Query>;
 
-        let request = LexicalSearchRequest::new(query).timeout_ms(1000); // 1 second timeout
+        let request = LexicalSearchRequest::new(query)
+            .timeout_ms(1000) // 1 second timeout
+            .track_total_hits(TrackTotalHits::Exact);
 
         let results = searcher.search(request).unwrap();
 
         // Should complete within timeout
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
     }
 
     #[test]
@@ -2125,12 +2164,12 @@ mod tests {
         // Create a boolean query with no clauses (empty query)
         let query = Box::new(BooleanQuery::new()) as Box<dyn Query>;
 
-        let request = LexicalSearchRequest::new(query);
+        let request = LexicalSearchRequest::new(query).track_total_hits(TrackTotalHits::Exact);
         let results = searcher.search(request).unwrap();
 
         // Should return empty results for empty query
         assert_eq!(results.hits.len(), 0);
-        assert_eq!(results.total_hits, 0);
+        assert_eq!(results.total_hits.unwrap().value, 0);
         assert_eq!(results.max_score, 0.0);
     }
 

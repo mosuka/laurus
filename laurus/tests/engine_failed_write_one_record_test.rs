@@ -301,6 +301,7 @@ async fn nearest_is(engine: &Engine, id: &str, vector: [f32; 2]) -> bool {
         .search(request)
         .await
         .unwrap()
+        .results
         .iter()
         .any(|hit| hit.id == id)
 }

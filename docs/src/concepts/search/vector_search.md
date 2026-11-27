@@ -25,7 +25,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 The `QueryPayload` stores raw data (text, bytes, etc.) that will be embedded at search time using the configured embedder.
@@ -319,7 +319,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 The filter query runs first on the lexical index to identify allowed document IDs, then the vector search is restricted to those IDs.
@@ -452,7 +452,7 @@ let request = SearchRequestBuilder::new()
     )
     .limit(10)
     .build();
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 Without one, pass the query's token vectors, computed with the same model
@@ -634,7 +634,7 @@ async fn main() -> laurus::Result<()> {
             )
             .limit(5)
             .build()
-    ).await?;
+    ).await?.results;
 
     for r in &results {
         println!("{}: score={:.4}", r.id, r.score);

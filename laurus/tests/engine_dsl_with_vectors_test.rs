@@ -91,6 +91,7 @@ async fn ids(engine: &Engine, builder: SearchRequestBuilder) -> Vec<String> {
         .search(builder.build())
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|r| r.id)
         .collect();

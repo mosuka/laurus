@@ -64,7 +64,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 ### Query DSL
@@ -83,7 +83,7 @@ let unified = UnifiedQueryParser::new(
 
 // Lexical + vector in one query
 let request = unified.parse(r#"body:rust text_vec:"systems programming""#).await?;
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 Vector 句の識別はスキーマのフィールド型に基づいて行われます。ベクトルフィールドとして定義されたフィールド名を持つ句は Vector クエリとして、それ以外は Lexical クエリとして解析されます。
@@ -302,7 +302,7 @@ async fn main() -> laurus::Result<()> {
             .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
             .limit(10)
             .build()
-    ).await?;
+    ).await?.results;
 
     for r in &results {
         println!("{}: score={:.4}", r.id, r.score);

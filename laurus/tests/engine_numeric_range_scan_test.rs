@@ -84,6 +84,7 @@ async fn ids(engine: &Engine, request: SearchRequestBuilder) -> Result<Vec<Strin
     let mut ids: Vec<String> = engine
         .search(request.build())
         .await
+        .map(|response| response.results)
         .map_err(|e| e.to_string())?
         .into_iter()
         .map(|result| result.id)

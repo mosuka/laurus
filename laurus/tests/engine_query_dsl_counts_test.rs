@@ -80,7 +80,10 @@ async fn a_slop_or_fuzziness_too_large_for_a_u32_is_rejected() {
         ),
     ] {
         for (route, builder) in requests(dsl) {
-            let result = engine.search(builder.build()).await;
+            let result = engine
+                .search(builder.build())
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(expected)) {
                 wrong.push(format!("{route} {dsl}: {:?}", result.map(|r| r.len())));
             }
@@ -109,6 +112,7 @@ async fn the_largest_slop_and_a_large_fuzziness_search() {
             let found = engine
                 .search(builder.build())
                 .await
+                .map(|response| response.results)
                 .map(|results| results.len());
             if !matches!(found, Ok(n) if n == hits) {
                 wrong.push(format!("{route} {dsl}: {found:?}, expected {hits}"));

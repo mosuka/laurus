@@ -792,7 +792,8 @@ impl PyIndex {
         let engine = self.engine()?;
         let results = py
             .detach(|| self.rt.block_on(engine.search(request)))
-            .map_err(laurus_err)?;
+            .map_err(laurus_err)?
+            .results;
 
         results
             .into_iter()
@@ -873,6 +874,7 @@ impl PyIndex {
             .into_iter()
             .map(|per_query_results| {
                 per_query_results
+                    .results
                     .into_iter()
                     .map(|r| to_py_search_result(py, r))
                     .collect::<PyResult<Vec<_>>>()

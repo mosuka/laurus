@@ -15,7 +15,7 @@ let request = SearchRequestBuilder::new()
     .highlight_config(HighlightConfig::default().tag("em".to_string()))
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 for result in &results {
     if let Some(fragments) = result.highlights.get("body") {
         println!("{}", fragments.join(" ... "));

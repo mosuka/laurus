@@ -621,7 +621,8 @@ impl PhpIndex {
         let results = self
             .rt
             .block_on(engine.search(request))
-            .map_err(laurus_err)?;
+            .map_err(laurus_err)?
+            .results;
 
         Ok(results.into_iter().map(to_php_search_result).collect())
     }
@@ -714,6 +715,7 @@ impl PhpIndex {
             .into_iter()
             .map(|per_query_results| {
                 per_query_results
+                    .results
                     .into_iter()
                     .map(to_php_search_result)
                     .collect()

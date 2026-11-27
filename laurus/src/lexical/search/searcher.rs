@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use roaring::RoaringTreemap;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::lexical::core::field::FieldValue;
@@ -34,6 +35,105 @@ pub enum SortField {
     },
 }
 
+/// How many matches a search counts for its total (Issue #1472), as
+/// Elasticsearch's `track_total_hits` and Lucene's `totalHitsThreshold`
+/// choose it.
+///
+/// Counting has a cost: until the count reaches the threshold, the search
+/// cannot skip the documents that block-max pruning would skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TrackTotalHits {
+    /// No total: the search counts nothing more than it ranks, and reports
+    /// no total.
+    #[default]
+    Disabled,
+    /// Count the matches exactly up to `n`. From `n` matches on, the total
+    /// is [`TotalHits::at_least`]`(n)`. `n` must be at least 1.
+    UpTo(u64),
+    /// Count every match. This visits every match, as without pruning.
+    Exact,
+}
+
+impl TrackTotalHits {
+    /// The number of matches a collector counts before it prunes: `None`
+    /// for [`Self::Disabled`], `u64::MAX` for [`Self::Exact`].
+    ///
+    /// # Returns
+    ///
+    /// The threshold, or `None` when no total is asked for.
+    pub fn threshold(self) -> Option<u64> {
+        match self {
+            TrackTotalHits::Disabled => None,
+            TrackTotalHits::UpTo(n) => Some(n),
+            TrackTotalHits::Exact => Some(u64::MAX),
+        }
+    }
+}
+
+/// Whether a [`TotalHits`] value is the number of matches or a lower bound
+/// of it (Issue #1472), as Lucene's `TotalHits.Relation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TotalHitsRelation {
+    /// The value is the number of matches.
+    Exact,
+    /// The number of matches is at least the value.
+    AtLeast,
+}
+
+/// The total number of matches of a search (Issue #1472): a value, and
+/// whether it is exact or a lower bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TotalHits {
+    /// The number of matches, or a lower bound of it.
+    pub value: u64,
+    /// Whether `value` is exact or a lower bound.
+    pub relation: TotalHitsRelation,
+}
+
+impl TotalHits {
+    /// An exact total.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The number of matches.
+    pub fn exact(value: u64) -> Self {
+        TotalHits {
+            value,
+            relation: TotalHitsRelation::Exact,
+        }
+    }
+
+    /// A lower bound of the total.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - A number the matches are at least.
+    pub fn at_least(value: u64) -> Self {
+        TotalHits {
+            value,
+            relation: TotalHitsRelation::AtLeast,
+        }
+    }
+
+    /// The total of a search that counted `counted` matches with a
+    /// collector that does not prune before it has counted `threshold`.
+    /// Below the threshold nothing was skipped, so the count is exact;
+    /// from it on, the total is a lower bound, capped at the threshold so
+    /// that it does not depend on how far the search went past it.
+    ///
+    /// # Arguments
+    ///
+    /// * `counted` - The matches the search counted.
+    /// * `threshold` - The threshold it counted up to.
+    pub(crate) fn from_count(counted: u64, threshold: u64) -> Self {
+        if counted < threshold {
+            TotalHits::exact(counted)
+        } else {
+            TotalHits::at_least(threshold)
+        }
+    }
+}
+
 /// Configuration for search operations.
 #[derive(Debug, Clone)]
 pub struct LexicalSearchParams {
@@ -49,6 +149,9 @@ pub struct LexicalSearchParams {
     pub parallel: bool,
     /// Sort results by field or score.
     pub sort_by: SortField,
+    /// How many matches to count for the total (Issue #1472). The default,
+    /// [`TrackTotalHits::Disabled`], reports no total.
+    pub track_total_hits: TrackTotalHits,
 }
 
 impl Default for LexicalSearchParams {
@@ -60,6 +163,7 @@ impl Default for LexicalSearchParams {
             timeout_ms: None,
             parallel: false,
             sort_by: SortField::default(),
+            track_total_hits: TrackTotalHits::default(),
         }
     }
 }
@@ -204,6 +308,17 @@ impl LexicalSearchRequest {
     /// Enable parallel search.
     pub fn parallel(mut self, parallel: bool) -> Self {
         self.params.parallel = parallel;
+        self
+    }
+
+    /// Set how many matches to count for the total (Issue #1472).
+    ///
+    /// # Arguments
+    ///
+    /// * `track_total_hits` - [`TrackTotalHits::Disabled`] (the default),
+    ///   [`TrackTotalHits::UpTo`] or [`TrackTotalHits::Exact`].
+    pub fn track_total_hits(mut self, track_total_hits: TrackTotalHits) -> Self {
+        self.params.track_total_hits = track_total_hits;
         self
     }
 

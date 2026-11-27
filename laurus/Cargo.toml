@@ -223,6 +223,11 @@ test = true
 name = "beir_dense_probe"
 required-features = ["embeddings-candle"]
 
+# The cost of counting a lexical total up to a threshold on MS MARCO
+# (Issue #1472).
+[[example]]
+name = "total_hits_probe"
+
 [[bench]]
 name = "distance_bench"
 harness = false

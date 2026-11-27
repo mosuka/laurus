@@ -104,6 +104,7 @@ async fn ids(engine: &Engine, request: laurus::SearchRequest) -> Result<Vec<Stri
     let mut ids: Vec<String> = engine
         .search(request)
         .await?
+        .results
         .into_iter()
         .map(|hit| hit.id)
         .collect();

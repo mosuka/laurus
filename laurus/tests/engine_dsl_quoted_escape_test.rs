@@ -127,7 +127,11 @@ async fn wrong_lexical_cases(cases: &[(&str, Vec<&'static str>)]) -> Vec<String>
             ),
         ];
         for (route, builder) in routes {
-            match engine.search(builder.limit(100).build()).await {
+            match engine
+                .search(builder.limit(100).build())
+                .await
+                .map(|response| response.results)
+            {
                 Ok(hits) => {
                     if found(&hits) != expected {
                         wrong.push(format!(
@@ -191,7 +195,11 @@ async fn an_unclosed_phrase_is_a_parse_error() {
         ),
     ];
     for (route, builder) in routes {
-        if let Ok(hits) = engine.search(builder.limit(100).build()).await {
+        if let Ok(hits) = engine
+            .search(builder.limit(100).build())
+            .await
+            .map(|response| response.results)
+        {
             wrong.push(format!("'{dsl}' through {route}: found {:?}", found(&hits)));
         }
     }
@@ -223,7 +231,8 @@ async fn a_quoted_vector_value_reads_its_escapes() {
                     .limit(100)
                     .build(),
             )
-            .await;
+            .await
+            .map(|response| response.results);
         let texts = embedder.texts.lock().unwrap().clone();
         match result {
             Ok(hits) => {

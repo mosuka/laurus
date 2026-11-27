@@ -200,6 +200,7 @@ async fn engine_hits(engine: &Engine, request: SearchRequestBuilder) -> Vec<(u64
         .search(request.build())
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| {
             let id = hit
@@ -554,15 +555,16 @@ fn a_lexical_store_returns_each_document_once() {
                         LexicalSearchRequest::new(query())
                             .limit(1000)
                             .parallel(parallel)
-                            .sort_by_field_asc("n"),
+                            .sort_by_field_asc("n")
+                            .track_total_hits(laurus::TrackTotalHits::Exact),
                     )
                     .unwrap();
                 let ids: Vec<u64> = found.hits.iter().map(|hit| hit.doc_id).collect();
-                if ids != expected || found.total_hits != expected.len() as u64 {
+                if ids != expected || found.total_hits.unwrap().value != expected.len() as u64 {
                     failures.push(what(&format!(
                         "sorted by a field: {} hits, total {}, of {}",
                         ids.len(),
-                        found.total_hits,
+                        found.total_hits.unwrap().value,
                         expected.len()
                     )));
                 }

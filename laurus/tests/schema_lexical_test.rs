@@ -70,7 +70,7 @@ async fn test_schema_lexical_guardrails() -> Result<()> {
             "value1",
         ))))
         .build();
-    let res_a = engine.search(req_a).await?;
+    let res_a = engine.search(req_a).await?.results;
     assert_eq!(res_a.len(), 1, "Should find 'indexed_and_stored' field");
     let docs_a = engine.get_documents(&res_a[0].id).await?;
     let doc_a = &docs_a[0];
@@ -88,7 +88,7 @@ async fn test_schema_lexical_guardrails() -> Result<()> {
             "value2",
         ))))
         .build();
-    let res_b = engine.search(req_b).await?;
+    let res_b = engine.search(req_b).await?.results;
     assert_eq!(res_b.len(), 1, "Should find 'indexed_only' field");
     let docs_b = engine.get_documents(&res_b[0].id).await?;
     let doc_b = &docs_b[0];
@@ -104,7 +104,7 @@ async fn test_schema_lexical_guardrails() -> Result<()> {
             "value3",
         ))))
         .build();
-    let res_c = engine.search(req_c).await?;
+    let res_c = engine.search(req_c).await?.results;
     assert_eq!(
         res_c.len(),
         0,

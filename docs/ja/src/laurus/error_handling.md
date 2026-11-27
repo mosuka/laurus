@@ -60,8 +60,8 @@ use laurus::{Engine, LaurusError};
 
 async fn safe_search(engine: &Engine, query: &str) {
     match engine.search(/* request */).await {
-        Ok(results) => {
-            for result in results {
+        Ok(response) => {
+            for result in response.results {
                 println!("{}: {}", result.id, result.score);
             }
         }

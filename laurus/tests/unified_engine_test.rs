@@ -142,7 +142,7 @@ async fn test_unified_engine_concurrent_reads() -> laurus::Result<()> {
                     "title", "document",
                 ))))
                 .build();
-            let results = engine.search(req).await.unwrap();
+            let results = engine.search(req).await.unwrap().results;
             assert!(
                 !results.is_empty(),
                 "Task {i}: lexical search should return results"
@@ -157,7 +157,7 @@ async fn test_unified_engine_concurrent_reads() -> laurus::Result<()> {
                 }]))
                 .limit(3)
                 .build();
-            let results = engine.search(req).await.unwrap();
+            let results = engine.search(req).await.unwrap().results;
             assert!(
                 !results.is_empty(),
                 "Task {i}: vector search should return results"

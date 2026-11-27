@@ -48,6 +48,7 @@ async fn ids(engine: &Engine, query: Box<dyn Query>) -> Vec<String> {
         .search(request)
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| hit.id)
         .collect();

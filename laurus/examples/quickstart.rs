@@ -75,7 +75,8 @@ async fn main() -> laurus::Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // 5. Search for "language"
@@ -89,7 +90,8 @@ async fn main() -> laurus::Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     Ok(())

@@ -139,7 +139,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // Case B: Filtered Vector Search (category filter)
@@ -155,7 +156,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // Case C: Filtered Vector Search (numeric range)
@@ -178,7 +180,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // Case D: Lexical Search
@@ -193,7 +196,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // Case E: Hybrid Search (RRF Fusion)
@@ -212,7 +216,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -239,7 +244,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // Case G: Hybrid Search via DSL
@@ -248,21 +254,21 @@ async fn main() -> Result<()> {
         .parse("text:async text_vec:\"concurrent\"")
         .await?;
     request.limit = 3;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     common::print_search_results(&results);
 
     // Case H: Lexical-only via DSL
     println!("\n[H] Lexical DSL: text:ownership");
     let mut request = unified_parser.parse("text:ownership").await?;
     request.limit = 3;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     common::print_search_results(&results);
 
     // Case I: Vector-only via DSL
     println!("\n[I] Vector DSL: text_vec:\"type system\"");
     let mut request = unified_parser.parse("text_vec:\"type system\"").await?;
     request.limit = 3;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     common::print_search_results(&results);
 
     println!("\nSearch with Candle example completed successfully!");

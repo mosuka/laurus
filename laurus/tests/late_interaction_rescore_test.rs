@@ -145,10 +145,13 @@ fn lexical(rescore: Option<RescoreOptions>, offset: usize, limit: usize) -> Sear
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lexical_first_stage_is_reordered_by_late_interaction() -> Result<()> {
     let engine = engine(DistanceMetric::DotProduct).await?;
-    let baseline = engine.search(lexical(None, 0, 10)).await?;
+    let baseline = engine.search(lexical(None, 0, 10)).await?.results;
     assert_eq!(baseline.len(), 5);
 
-    let results = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    let results = engine
+        .search(lexical(Some(rescore(100)), 0, 10))
+        .await?
+        .results;
     assert_eq!(ids(&results), ["c", "b", "d", "a", "e"]);
     assert_ne!(ids(&baseline), ids(&results));
     let tokens = tokens_by_id();
@@ -160,7 +163,10 @@ async fn test_lexical_first_stage_is_reordered_by_late_interaction() -> Result<(
     // A one-hit page still comes from the whole window: the first stage
     // fetches window_size candidates, not just offset + limit.
     assert_ne!(baseline[0].id, "c");
-    let top = engine.search(lexical(Some(rescore(100)), 0, 1)).await?;
+    let top = engine
+        .search(lexical(Some(rescore(100)), 0, 1))
+        .await?
+        .results;
     assert_eq!(ids(&top), ["c"]);
     Ok(())
 }
@@ -176,7 +182,8 @@ async fn test_vector_first_stage_is_reordered() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(ids(&results), ["c", "b", "d", "a", "e"]);
     Ok(())
 }
@@ -201,7 +208,8 @@ async fn test_hybrid_first_stage_is_reordered_for_every_fusion() -> Result<()> {
                     .limit(10)
                     .build(),
             )
-            .await?;
+            .await?
+            .results;
         assert_eq!(ids(&results), ["c", "b", "d", "a", "e"], "{fusion:?}");
     }
 
@@ -214,16 +222,19 @@ async fn test_hybrid_first_stage_is_reordered_for_every_fusion() -> Result<()> {
         rescore: Some(rescore(100)),
         ..Default::default()
     };
-    assert_eq!(ids(&engine.search(intersection).await?), ["c"]);
+    assert_eq!(ids(&engine.search(intersection).await?.results), ["c"]);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_only_the_window_is_reordered() -> Result<()> {
     let engine = engine(DistanceMetric::DotProduct).await?;
-    let baseline = engine.search(lexical(None, 0, 10)).await?;
+    let baseline = engine.search(lexical(None, 0, 10)).await?.results;
     for window in [1, 2, 3, 5] {
-        let results = engine.search(lexical(Some(rescore(window)), 0, 10)).await?;
+        let results = engine
+            .search(lexical(Some(rescore(window)), 0, 10))
+            .await?
+            .results;
         assert_eq!(
             ids(&results),
             expected(&baseline, window),
@@ -240,21 +251,28 @@ async fn test_only_the_window_is_reordered() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pages_across_the_window_concatenate_to_one_ranking() -> Result<()> {
     let engine = engine(DistanceMetric::DotProduct).await?;
-    let baseline = engine.search(lexical(None, 0, 10)).await?;
-    let whole = ids(&engine.search(lexical(Some(rescore(3)), 0, 10)).await?);
+    let baseline = engine.search(lexical(None, 0, 10)).await?.results;
+    let whole = ids(&engine
+        .search(lexical(Some(rescore(3)), 0, 10))
+        .await?
+        .results);
     assert_eq!(whole, expected(&baseline, 3));
 
     let mut paged = Vec::new();
     for offset in [0, 2, 4] {
         paged.extend(ids(&engine
             .search(lexical(Some(rescore(3)), offset, 2))
-            .await?));
+            .await?
+            .results));
     }
     assert_eq!(paged, whole);
 
     // A page entirely beyond a smaller window still sees the reordered
     // ranking: the first stage fetches max(window, offset + limit).
-    let page = ids(&engine.search(lexical(Some(rescore(1)), 3, 2)).await?);
+    let page = ids(&engine
+        .search(lexical(Some(rescore(1)), 3, 2))
+        .await?
+        .results);
     assert_eq!(page, expected(&baseline, 1)[3..5]);
     Ok(())
 }
@@ -272,8 +290,11 @@ async fn test_candidates_without_token_vectors_follow_the_rescored_ones() -> Res
         .await?;
     engine.commit().await?;
 
-    let baseline = engine.search(lexical(None, 0, 10)).await?;
-    let results = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    let baseline = engine.search(lexical(None, 0, 10)).await?.results;
+    let results = engine
+        .search(lexical(Some(rescore(100)), 0, 10))
+        .await?
+        .results;
     assert_eq!(ids(&results), ["c", "b", "d", "a", "e", "f"]);
     let first_stage = baseline.iter().find(|r| r.id == "f").unwrap().score;
     assert_eq!(results[5].score, first_stage);
@@ -287,7 +308,10 @@ async fn test_rescore_reads_the_newest_vectors_and_respects_the_filter() -> Resu
         .put_document("a", doc("rust", [1.0, 0.0], &[[2.0, 2.0]]))
         .await?;
     engine.commit().await?;
-    let results = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    let results = engine
+        .search(lexical(Some(rescore(100)), 0, 10))
+        .await?
+        .results;
     assert_eq!(results[0].id, "a");
     assert!((results[0].score - 4.0).abs() < 1e-5);
 
@@ -299,7 +323,8 @@ async fn test_rescore_reads_the_newest_vectors_and_respects_the_filter() -> Resu
                 .rescore(rescore(100))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(ids(&filtered), ["c"]);
     Ok(())
 }
@@ -322,9 +347,12 @@ async fn test_ties_are_ordered_by_doc_id() -> Result<()> {
         .await?;
     engine.commit().await?;
 
-    let baseline = engine.search(lexical(None, 0, 10)).await?;
+    let baseline = engine.search(lexical(None, 0, 10)).await?.results;
     assert_eq!(ids(&baseline), ["x", "y"]);
-    let results = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    let results = engine
+        .search(lexical(Some(rescore(100)), 0, 10))
+        .await?
+        .results;
     assert_eq!(ids(&results), ["y", "x"]);
     assert_eq!(results[0].score, results[1].score);
     Ok(())
@@ -338,14 +366,23 @@ async fn test_search_batch_rescores_each_request() -> Result<()> {
             lexical(Some(rescore(100)), 0, 10),
             lexical(Some(rescore(2)), 0, 10),
         ])
-        .await?;
+        .await?
+        .into_iter()
+        .map(|response| response.results)
+        .collect::<Vec<_>>();
     assert_eq!(
         ids(&batch[0]),
-        ids(&engine.search(lexical(Some(rescore(100)), 0, 10)).await?)
+        ids(&engine
+            .search(lexical(Some(rescore(100)), 0, 10))
+            .await?
+            .results)
     );
     assert_eq!(
         ids(&batch[1]),
-        ids(&engine.search(lexical(Some(rescore(2)), 0, 10)).await?)
+        ids(&engine
+            .search(lexical(Some(rescore(2)), 0, 10))
+            .await?
+            .results)
     );
     Ok(())
 }
@@ -355,7 +392,10 @@ async fn test_search_batch_rescores_each_request() -> Result<()> {
 async fn test_cosine_rescore_ignores_query_scale() -> Result<()> {
     let engine = engine(DistanceMetric::Cosine).await?;
     let scaled: Vec<[f32; 2]> = QUERY.iter().map(|q| [q[0] * 3.0, q[1] * 3.0]).collect();
-    let plain = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    let plain = engine
+        .search(lexical(Some(rescore(100)), 0, 10))
+        .await?
+        .results;
     let request = lexical(
         Some(RescoreOptions::late_interaction(
             TOKENS,
@@ -364,7 +404,7 @@ async fn test_cosine_rescore_ignores_query_scale() -> Result<()> {
         0,
         10,
     );
-    let scaled = engine.search(request).await?;
+    let scaled = engine.search(request).await?.results;
     assert_eq!(ids(&plain), ids(&scaled));
     for (a, b) in plain.iter().zip(&scaled) {
         assert!((a.score - b.score).abs() < 1e-5, "{a:?} vs {b:?}");
@@ -528,8 +568,14 @@ async fn test_text_query_ranks_like_its_token_vectors() -> Result<()> {
     let embedder = Arc::new(QueryTextEmbedder::default());
     let engine = text_engine(embedder.clone(), false).await?;
 
-    let by_text = engine.search(lexical(Some(text_rescore()), 0, 10)).await?;
-    let by_vectors = engine.search(lexical(Some(rescore(100)), 0, 10)).await?;
+    let by_text = engine
+        .search(lexical(Some(text_rescore()), 0, 10))
+        .await?
+        .results;
+    let by_vectors = engine
+        .search(lexical(Some(rescore(100)), 0, 10))
+        .await?
+        .results;
     assert_eq!(ids(&by_text), ["c", "b", "d", "a", "e"]);
     assert_eq!(ids(&by_text), ids(&by_vectors));
     for (text, vectors) in by_text.iter().zip(&by_vectors) {
@@ -543,7 +589,10 @@ async fn test_text_query_ranks_like_its_token_vectors() -> Result<()> {
             lexical(Some(text_rescore()), 0, 10),
             lexical(Some(text_rescore().window_size(2)), 0, 10),
         ])
-        .await?;
+        .await?
+        .into_iter()
+        .map(|response| response.results)
+        .collect::<Vec<_>>();
     assert_eq!(ids(&batch[0]), ids(&by_text));
     assert_eq!(batch[1].len(), 5);
     assert_eq!(embedder.calls(), 3);

@@ -125,7 +125,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -144,7 +145,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -167,7 +169,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -187,7 +190,7 @@ async fn main() -> Result<()> {
         .parse("text:async text_vec:\"concurrent\"")
         .await?;
     request.limit = 3;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -213,7 +216,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\nHybrid search example completed successfully!");

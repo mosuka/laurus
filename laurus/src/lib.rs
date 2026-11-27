@@ -104,7 +104,7 @@ pub use engine::schema::{
 pub use engine::search::{
     FusionAlgorithm, GroupBy, HighlightOptions, HybridMode, LateInteractionQuery,
     LexicalSearchOptions, RescoreOptions, Rescorer, SearchQuery, SearchRequest,
-    SearchRequestBuilder, SearchResult, VectorSearchOptions, VectorSearchQuery,
+    SearchRequestBuilder, SearchResponse, SearchResult, VectorSearchOptions, VectorSearchQuery,
 };
 pub use engine::type_inference::{InferredValue, infer_from_json, infer_option_from_data_value};
 pub use engine::{UpdateFieldOptions, UpdateFieldOutcome};
@@ -115,7 +115,8 @@ pub use lexical::core::field::{
 };
 pub use lexical::search::features::highlight::HighlightConfig;
 pub use lexical::search::searcher::{
-    LexicalSearchParams, LexicalSearchQuery, LexicalSearchRequest, SortField, SortOrder,
+    LexicalSearchParams, LexicalSearchQuery, LexicalSearchRequest, SortField, SortOrder, TotalHits,
+    TotalHitsRelation, TrackTotalHits,
 };
 pub use maintenance::deletion::DeletionConfig;
 pub use storage::{Storage, StorageConfig, StorageFactory};

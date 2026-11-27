@@ -134,6 +134,7 @@ async fn scores(engine: &Engine, request: SearchRequestBuilder) -> BTreeMap<u64,
         .search(request.limit(1000).build())
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| (hit.id.parse().unwrap(), hit.score))
         .collect()

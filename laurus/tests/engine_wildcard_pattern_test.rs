@@ -89,7 +89,11 @@ async fn wrong_patterns(cases: &[(&str, Vec<&'static str>)]) -> Vec<String> {
             .highlight(vec!["title".to_string()])
             .limit(100)
             .build();
-        let hits = match engine.search(request).await {
+        let hits = match engine
+            .search(request)
+            .await
+            .map(|response| response.results)
+        {
             Ok(hits) => hits,
             Err(e) => {
                 wrong.push(format!("{pattern:?}: search failed: {e}"));
@@ -141,7 +145,11 @@ async fn wrong_dsl_cases(engine: &Engine, cases: &[(&str, Vec<&'static str>)]) -
             ),
         ];
         for (route, builder) in routes {
-            match engine.search(builder.limit(100).build()).await {
+            match engine
+                .search(builder.limit(100).build())
+                .await
+                .map(|response| response.results)
+            {
                 Ok(hits) => {
                     let found = sorted(
                         hits.iter()

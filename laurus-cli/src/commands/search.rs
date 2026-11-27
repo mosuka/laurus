@@ -59,6 +59,7 @@ pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<Vec
     engine
         .search(builder.build())
         .await
+        .map(|response| response.results)
         .context("Failed to execute search")
 }
 

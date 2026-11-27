@@ -4,6 +4,7 @@ use crate::error::{LaurusError, Result};
 use crate::lexical::query::Query;
 use crate::lexical::search::features::highlight::HighlightConfig;
 use crate::lexical::search::searcher::{LexicalSearchQuery, SortField};
+pub use crate::lexical::search::searcher::{TotalHits, TrackTotalHits};
 // Re-export VectorSearchQuery so engine.rs and query.rs can refer to it
 // via `self::search::VectorSearchQuery` without reaching into vector internals.
 use crate::vector::VectorScoreMode;
@@ -564,6 +565,12 @@ pub struct SearchRequest {
     /// [`GroupBy`]). When set, [`limit`](Self::limit) and
     /// [`offset`](Self::offset) count groups.
     pub group_by: Option<GroupBy>,
+
+    /// How many matches to count for [`SearchResponse::total_hits`]
+    /// (Issue #1472). Defaults to [`TrackTotalHits::Disabled`], which
+    /// counts nothing and reports no total. [`TrackTotalHits::UpTo`]`(0)`
+    /// fails the search with `InvalidArgument`.
+    pub track_total_hits: TrackTotalHits,
 }
 
 /// Algorithm used to combine lexical and vector scores in hybrid search.
@@ -671,6 +678,7 @@ impl Default for SearchRequest {
             vector_options: VectorSearchOptions::default(),
             rescore: None,
             group_by: None,
+            track_total_hits: TrackTotalHits::Disabled,
         }
     }
 }
@@ -704,6 +712,7 @@ pub struct SearchRequestBuilder {
     vector_options: VectorSearchOptions,
     rescore: Option<RescoreOptions>,
     group_by: Option<GroupBy>,
+    track_total_hits: TrackTotalHits,
 }
 
 impl Default for SearchRequestBuilder {
@@ -727,6 +736,7 @@ impl SearchRequestBuilder {
             vector_options: VectorSearchOptions::default(),
             rescore: None,
             group_by: None,
+            track_total_hits: TrackTotalHits::Disabled,
         }
     }
 
@@ -923,6 +933,15 @@ impl SearchRequestBuilder {
         self
     }
 
+    // ── Total hits ───────────────────────────────────────────────────────
+
+    /// Set how many matches to count for [`SearchResponse::total_hits`]
+    /// (see [`SearchRequest::track_total_hits`], Issue #1472).
+    pub fn track_total_hits(mut self, track_total_hits: TrackTotalHits) -> Self {
+        self.track_total_hits = track_total_hits;
+        self
+    }
+
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder and return the constructed [`SearchRequest`].
@@ -955,8 +974,37 @@ impl SearchRequestBuilder {
             vector_options: self.vector_options,
             rescore: self.rescore,
             group_by: self.group_by,
+            track_total_hits: self.track_total_hits,
         }
     }
+}
+
+// ── SearchResponse ───────────────────────────────────────────────────────────
+
+/// The response of an [`Engine`](super::Engine) search (Issue #1472).
+#[derive(Debug, Clone)]
+pub struct SearchResponse {
+    /// The page of results, best first. With
+    /// [`group_by`](SearchRequest::group_by), each is the best hit of a
+    /// group, with the group's other hits as its inner hits.
+    pub results: Vec<SearchResult>,
+    /// The total number of matches, when the request asked for one with
+    /// [`track_total_hits`](SearchRequest::track_total_hits); `None`
+    /// otherwise. What it counts depends on the search:
+    ///
+    /// - Lexical: the documents that match the query and the filter at or
+    ///   above the lexical `min_score`, exact below the threshold and
+    ///   [`TotalHits::at_least`] the threshold from it on.
+    /// - Vector: an approximate search has no set of matches, so the total
+    ///   is at least the number of hits it ranked.
+    /// - Hybrid, [`HybridMode::Union`]: at least the larger of the lexical
+    ///   total's value and the number of fused candidates.
+    /// - Hybrid, [`HybridMode::Intersection`]: at least the number of
+    ///   fused candidates; the lexical count is only an upper bound there.
+    /// - With [`group_by`](SearchRequest::group_by): the documents of the
+    ///   search the groups are formed from, not the groups.
+    /// - A filter that matches nothing: exactly 0.
+    pub total_hits: Option<TotalHits>,
 }
 
 // ── SearchResult ─────────────────────────────────────────────────────────────

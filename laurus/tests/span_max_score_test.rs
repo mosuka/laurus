@@ -56,7 +56,8 @@ async fn a_top_k_span_search_reaches_a_document_with_more_than_100_spans() {
                 .build(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     let top: Vec<(String, f32)> = hits.iter().map(|h| (h.id.clone(), h.score)).collect();
     assert_eq!(top, [("b".to_string(), 200.0)]);
 }

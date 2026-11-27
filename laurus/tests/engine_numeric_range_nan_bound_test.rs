@@ -118,7 +118,10 @@ async fn a_nan_bound_is_rejected_by_engine_search() {
     let mut wrong = Vec::new();
     for (name, range) in nan_ranges() {
         for (route, request) in requests(range) {
-            let result = engine.search(request.build()).await;
+            let result = engine
+                .search(request.build())
+                .await
+                .map(|response| response.results);
             if !matches!(
                 &result,
                 Err(LaurusError::InvalidArgument(m)) if m.contains("field 'price' has a NaN bound")
@@ -219,6 +222,7 @@ async fn an_infinite_bound_is_the_same_as_an_open_side() {
                     .build(),
             )
             .await
+            .map(|response| response.results)
             .map(|results| {
                 let mut ids: Vec<String> = results.into_iter().map(|r| r.id).collect();
                 ids.sort();

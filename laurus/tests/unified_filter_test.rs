@@ -83,7 +83,7 @@ async fn test_unified_filtering() -> laurus::Result<()> {
         .filter_query(filter_query)
         .build();
 
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
 
     // Should pass through Engine -> Lexical Filter -> Vector Store allowed_ids
     println!("Filtered Results (Vegetable): {:?}", results);
@@ -102,7 +102,7 @@ async fn test_unified_filtering() -> laurus::Result<()> {
         .filter_query(filter_query_fruit)
         .build();
 
-    let results_fruit = engine.search(req_fruit).await?;
+    let results_fruit = engine.search(req_fruit).await?.results;
     println!("Filtered Results (Fruit): {:?}", results_fruit);
     assert_eq!(
         results_fruit.len(),
@@ -183,7 +183,7 @@ async fn test_unified_filtering_hnsw() -> laurus::Result<()> {
         .filter_query(filter_query)
         .build();
 
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
     println!("Filtered Results HNSW (Vegetable): {:?}", results);
     assert_eq!(results.len(), 1, "Should filter down to 1 result");
     Ok(())
@@ -260,7 +260,7 @@ async fn test_unified_filtering_ivf() -> laurus::Result<()> {
         .filter_query(filter_query)
         .build();
 
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
     println!("Filtered Results IVF (Vegetable): {:?}", results);
     assert_eq!(results.len(), 1, "Should filter down to 1 result");
     Ok(())

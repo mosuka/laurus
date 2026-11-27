@@ -51,7 +51,7 @@ async fn test_unified_search_hybrid() -> laurus::Result<()> {
         .lexical_query(LexicalSearchQuery::Obj(lexical_query))
         .build();
 
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
     println!("Lexical Results: {:?}", results);
     assert!(
         results.iter().any(|r| r.score > 0.0),
@@ -72,7 +72,7 @@ async fn test_unified_search_hybrid() -> laurus::Result<()> {
         }]))
         .build();
 
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
     println!("Vector Results: {:?}", results);
     assert!(!results.is_empty(), "Should return vector results");
     // The closest vector to [0,1,0] should be doc2's embedding [0,1,0]
@@ -137,7 +137,7 @@ async fn test_unified_search_hybrid_fusion() -> laurus::Result<()> {
         .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
         .build();
 
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
 
     // In RRF, both Doc 1 and Doc 2 should be present because Doc 1 is top in Lexical, Doc 2 is top in Vector.
     assert_eq!(results.len(), 2);

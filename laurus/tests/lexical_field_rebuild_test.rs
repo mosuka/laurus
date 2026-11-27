@@ -79,7 +79,7 @@ async fn update_field_switches_to_japanese_analyzer_and_changes_search_behavior(
     // morphemes, so a partial-clause query matches nothing.
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("吾輩は猫").await?;
-    let before = engine.search(request).await?;
+    let before = engine.search(request).await?.results;
     assert!(
         before.is_empty(),
         "the default analyzer should not tokenize unspaced Japanese into \
@@ -109,7 +109,7 @@ async fn update_field_switches_to_japanese_analyzer_and_changes_search_behavior(
     // Lindera, so the bare query's morphemes OR-match both documents.
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("吾輩は猫").await?;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     let ids: Vec<&str> = results.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(
         ids.len(),
@@ -178,7 +178,7 @@ async fn update_field_enables_term_vectors_and_phrase_query_starts_matching() ->
     // positions, so the same phrase query now matches.
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("body:\"quick brown\"").await?;
-    let after = engine.search(request).await?;
+    let after = engine.search(request).await?.results;
     let ids: Vec<&str> = after.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -349,6 +349,7 @@ async fn update_field_succeeds_when_the_manifest_sync_fails_after_the_publish() 
         Ok(engine
             .search(request)
             .await?
+            .results
             .into_iter()
             .map(|hit| hit.id)
             .collect())
@@ -384,6 +385,7 @@ async fn delete_field_succeeds_when_the_manifest_sync_fails_after_the_publish() 
         Ok(engine
             .search(request)
             .await?
+            .results
             .into_iter()
             .map(|hit| hit.id)
             .collect())

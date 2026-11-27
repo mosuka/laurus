@@ -196,7 +196,7 @@ async fn assert_all_recovered(engine: &Engine) -> laurus::Result<()> {
         .lexical_query(LexicalSearchQuery::Obj(query))
         .limit(DOC_COUNT * 4)
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     assert_eq!(
         results.len(),
         DOC_COUNT,
@@ -402,13 +402,13 @@ async fn deferred_deletion_recovers_after_crash_without_manual_commit() -> lauru
                 ))))
                 .build()
         };
-        let updated = engine.search(request("updated")).await?;
+        let updated = engine.search(request("updated")).await?.results;
         assert_eq!(
             updated.len(),
             1,
             "the replayed new version must be searchable without a manual commit"
         );
-        let old = engine.search(request(SHARED_TERM)).await?;
+        let old = engine.search(request(SHARED_TERM)).await?.results;
         assert_eq!(
             old.len(),
             0,

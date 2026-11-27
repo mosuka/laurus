@@ -88,10 +88,15 @@ async fn test_search_batch_single_request_matches_search() -> laurus::Result<()>
     let engine = build_engine_with_corpus().await?;
 
     let req = term_request("rust");
-    let serial = engine.search(req).await?;
+    let serial = engine.search(req).await?.results;
 
     let req = term_request("rust");
-    let batch = engine.search_batch(vec![req]).await?;
+    let batch = engine
+        .search_batch(vec![req])
+        .await?
+        .into_iter()
+        .map(|response| response.results)
+        .collect::<Vec<_>>();
 
     assert_eq!(
         batch.len(),
@@ -116,12 +121,17 @@ async fn test_search_batch_multi_request_preserves_order() -> laurus::Result<()>
     let queries = ["rust", "vector", "distributed"];
     let requests: Vec<_> = queries.iter().map(|t| term_request(t)).collect();
 
-    let batch = engine.search_batch(requests).await?;
+    let batch = engine
+        .search_batch(requests)
+        .await?
+        .into_iter()
+        .map(|response| response.results)
+        .collect::<Vec<_>>();
     assert_eq!(batch.len(), queries.len());
 
     // Each query targets exactly one document; verify position-preserving result.
     for (i, term) in queries.iter().enumerate() {
-        let serial = engine.search(term_request(term)).await?;
+        let serial = engine.search(term_request(term)).await?.results;
         assert_eq!(
             batch[i].len(),
             serial.len(),
@@ -142,7 +152,7 @@ async fn test_search_batch_existing_search_unchanged() -> laurus::Result<()> {
     // returns the expected document for an ad-hoc query that the batch tests
     // also exercise.
     let req = term_request("rust");
-    let results = engine.search(req).await?;
+    let results = engine.search(req).await?.results;
     assert!(
         results.iter().any(|r| r.id == "doc1"),
         "Engine::search must still find doc1 for term 'rust' — batch refactor must not regress"

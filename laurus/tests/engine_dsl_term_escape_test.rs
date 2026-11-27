@@ -65,7 +65,11 @@ async fn wrong_cases(cases: &[(&str, Vec<&'static str>)]) -> Vec<String> {
             ),
         ];
         for (route, builder) in routes {
-            match engine.search(builder.limit(100).build()).await {
+            match engine
+                .search(builder.limit(100).build())
+                .await
+                .map(|response| response.results)
+            {
                 Ok(hits) => {
                     let found = sorted(
                         hits.iter()

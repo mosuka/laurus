@@ -104,6 +104,7 @@ async fn ids(engine: &Engine, request: laurus::SearchRequest) -> Result<Vec<Stri
     let mut ids: Vec<String> = engine
         .search(request)
         .await?
+        .results
         .into_iter()
         .map(|hit| hit.id)
         .collect();
@@ -230,7 +231,7 @@ async fn phrase_through_a_synonym_is_highlighted() -> Result<()> {
         .highlight(vec!["syn".to_string()])
         .limit(10)
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     let hit = results
         .iter()
         .find(|hit| hit.id == "large_dog")
@@ -255,7 +256,7 @@ async fn a_single_position_synonym_query_is_highlighted() -> Result<()> {
         .highlight(vec!["syn".to_string()])
         .limit(10)
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let hit = |id: &str| {
         results
@@ -308,7 +309,7 @@ async fn stacked_synonyms_do_not_change_the_score_of_an_unrelated_term() -> Resu
         .query_dsl("syn:dog")
         .limit(10)
         .build();
-    let hits = engine.search(request).await?;
+    let hits = engine.search(request).await?.results;
     let score_of = |id: &str| {
         hits.iter()
             .find(|h| h.id == id)
@@ -357,7 +358,7 @@ async fn a_stacked_synonym_or_scores_like_the_repeated_word() -> Result<()> {
         .lexical_query(LexicalSearchQuery::Obj(query))
         .limit(10)
         .build();
-    let hits = engine.search(request).await?;
+    let hits = engine.search(request).await?.results;
     let score_of = |id: &str| {
         hits.iter()
             .find(|h| h.id == id)
@@ -469,6 +470,7 @@ async fn request_highlights(
     let mut hits: Vec<(String, Vec<String>)> = engine
         .search(request)
         .await?
+        .results
         .into_iter()
         .map(|hit| {
             let marked = hit.highlights.get(field).cloned().unwrap_or_default();
@@ -524,7 +526,7 @@ async fn phrase_is_highlighted_where_the_index_matches_it() -> Result<()> {
         .highlight(vec!["body".to_string()])
         .limit(10)
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     let hit = results
         .iter()
         .find(|hit| hit.id == "statistical_machine_learning")

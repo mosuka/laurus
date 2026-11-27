@@ -48,6 +48,7 @@ async fn ids(engine: &Engine, builder: SearchRequestBuilder) -> Vec<String> {
         .search(builder.vector_query(query()).limit(5).build())
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|r| r.id)
         .collect()
