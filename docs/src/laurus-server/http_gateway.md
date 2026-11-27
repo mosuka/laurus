@@ -682,6 +682,54 @@ So are the values the engine rejects (see
 [gRPC `GroupByParams`](grpc_api.md#groupbyparams) and
 [Result Grouping](../concepts/search/result_grouping.md)).
 
+#### Search with a Total Hit Count
+
+`track_total_hits` counts the matching documents beyond the page
+(Issue #1472). As in Elasticsearch, it takes an integer `n`, which counts
+exactly up to `n` matches, `true`, which counts every match, or `false`,
+which counts nothing; omitting it and `null` mean `false`. The response then
+gains `"total_hits"`, whose `"relation"` is `"eq"` for an exact count and
+`"gte"` for a lower bound. With the four chunks of the
+[grouping example](#search-with-grouping), three of which contain "rust":
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "body:rust", "limit": 1, "track_total_hits": true}'
+```
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"eq","value":3}}
+```
+
+With `"track_total_hits": 2`, the count stops at the threshold, and the total
+is a lower bound:
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"gte","value":2}}
+```
+
+A search without `track_total_hits`, or with `false`, counts nothing and
+returns the body without `"total_hits"`. Counting has a cost, so ask for no
+more than you need: until the count reaches the threshold, the search cannot
+skip the documents that block-max pruning would skip. What the total counts
+for a vector, hybrid or grouped search is described in
+[Total hits](../laurus/engine.md#total-hits).
+
+Any value other than an integer, `true`, `false` or `null`, such as
+`"1000"`, `1.5` or `-1`, is rejected with `400 Bad Request` instead of
+searching without a total:
+
+```json
+{"error":{"code":400,"message":"track_total_hits must be true, false or an integer between 0 and 18446744073709551615"}}
+```
+
+`0` is rejected by the engine:
+
+```json
+{"error":{"code":400,"message":"Invalid argument: track_total_hits must count at least 1 match, got UpTo(0)"}}
+```
+
 ### Streaming Search (SSE)
 
 The `/v1/search/stream` endpoint returns results as Server-Sent Events (SSE). Each result is sent as a separate event:
@@ -710,6 +758,15 @@ data: {"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"m
 data: {"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}
 ```
 
+The stream has no event for a total, so a request whose `track_total_hits`
+asks for one (an integer or `true`) is rejected with `400 Bad Request`
+before any event (Issue #1472); use [`POST /v1/search`](#search) for a
+total:
+
+```json
+{"error":{"code":400,"message":"a streamed search returns no total hit count; send track_total_hits to a search that is not streamed"}}
+```
+
 ### Batch Search
 
 `POST /v1/search/batch` runs several independent searches in one request
@@ -729,6 +786,14 @@ response is:
 
 ```json
 {"results":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.7456220984458923}]},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}]}]}
+```
+
+Each query takes its own [`track_total_hits`](#search-with-a-total-hit-count),
+and its entry gains `"total_hits"` only when it asked for one (Issue #1472).
+For `{"queries": [{"query": "body:rust", "limit": 1, "track_total_hits": true}, {"query": "body:garbage", "limit": 1}]}`:
+
+```json
+{"results":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"eq","value":3}},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}]}]}
 ```
 
 An empty `queries` returns `{"results":[]}`. A body without `queries` is

@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use laurus::Engine;
+use laurus::{Engine, TrackTotalHits};
 
 use crate::convert::{error, search as search_convert};
 use crate::proto::laurus::v1::{
@@ -65,28 +65,33 @@ impl SearchServiceTrait for SearchService {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("No index is open"))?;
 
-        let results = engine
+        let response = engine
             .search(search_request)
             .await
-            .map_err(error::to_status)?
-            .results;
-        let results: Vec<SearchResult> = results
-            .iter()
-            .map(search_convert::result_to_proto)
-            .collect();
+            .map_err(error::to_status)?;
 
-        Ok(Response::new(SearchResponse { results }))
+        Ok(Response::new(search_convert::response_to_proto(&response)))
     }
 
     type SearchStreamStream = ReceiverStream<Result<SearchResult, Status>>;
 
     /// Executes a search query and streams results back one at a time.
+    ///
+    /// The stream carries only results, so a request that asks for a total
+    /// hit count is rejected with `INVALID_ARGUMENT` before the search runs
+    /// (Issue #1472), instead of counting and dropping the total.
     async fn search_stream(
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<Self::SearchStreamStream>, Status> {
         let req = request.into_inner();
         let search_request = self.convert(&req)?;
+        if !matches!(search_request.track_total_hits, TrackTotalHits::Disabled) {
+            return Err(Status::invalid_argument(
+                "a streamed search returns no total hit count; send track_total_hits to a \
+                 search that is not streamed",
+            ));
+        }
 
         let guard = self.engine.read().await;
         let engine = guard
@@ -157,15 +162,10 @@ impl SearchServiceTrait for SearchService {
             .await
             .map_err(error::batch_search_to_status)?;
 
+        // Each response carries its own request's total (Issue #1472).
         let results: Vec<SearchResponse> = batch_results
-            .into_iter()
-            .map(|per_query_results| SearchResponse {
-                results: per_query_results
-                    .results
-                    .iter()
-                    .map(search_convert::result_to_proto)
-                    .collect(),
-            })
+            .iter()
+            .map(search_convert::response_to_proto)
             .collect();
 
         Ok(Response::new(SearchBatchResponse { results }))
@@ -175,6 +175,7 @@ impl SearchServiceTrait for SearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::laurus::v1;
     use laurus::storage::memory::MemoryStorage;
     use laurus::{Schema, Storage, TextOption};
 
@@ -311,5 +312,133 @@ mod tests {
             "unexpected message: {}",
             status.message()
         );
+    }
+
+    /// A service over five committed documents whose `title` is "rust".
+    async fn service_with_five_matches() -> SearchService {
+        let service = service_with_title_field().await;
+        {
+            let guard = service.engine.read().await;
+            let engine = guard.as_ref().unwrap();
+            for i in 0..5 {
+                engine
+                    .put_document(
+                        &format!("doc{i}"),
+                        laurus::Document::builder()
+                            .add_text("title", "rust")
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            engine.commit().await.unwrap();
+        }
+        service
+    }
+
+    /// A page of two of the five matches, counted as `mode` asks.
+    fn counted(mode: Option<v1::track_total_hits::Mode>) -> SearchRequest {
+        SearchRequest {
+            track_total_hits: Some(v1::TrackTotalHits { mode }),
+            ..page(0, 2)
+        }
+    }
+
+    fn total(value: u64, relation: v1::TotalHitsRelation) -> Option<v1::TotalHits> {
+        Some(v1::TotalHits {
+            value,
+            relation: relation as i32,
+        })
+    }
+
+    /// Issue #1472: `Search` returns the total a request asks for, exact
+    /// below the threshold and a lower bound of it from it on, and none
+    /// for a request that asks for none. `up_to: 0` is INVALID_ARGUMENT.
+    #[tokio::test]
+    async fn search_returns_the_total_asked_for() {
+        use v1::TotalHitsRelation::{AtLeast, Exact};
+        use v1::track_total_hits::Mode;
+
+        let service = service_with_five_matches().await;
+        let search = |request: SearchRequest| {
+            let service = service.clone();
+            async move { service.search(Request::new(request)).await }
+        };
+
+        for (request, expected) in [
+            (counted(Some(Mode::UpTo(1000))), total(5, Exact)),
+            (counted(Some(Mode::UpTo(3))), total(3, AtLeast)),
+            (counted(Some(Mode::Exact(true))), total(5, Exact)),
+            (counted(Some(Mode::Exact(false))), None),
+            (counted(None), None),
+            (page(0, 2), None),
+        ] {
+            let label = format!("{:?}", request.track_total_hits);
+            let response = search(request).await.unwrap().into_inner();
+            assert_eq!(response.results.len(), 2, "{label}");
+            assert_eq!(response.total_hits, expected, "{label}");
+        }
+
+        let status = search(counted(Some(Mode::UpTo(0)))).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("track_total_hits"),
+            "unexpected message: {}",
+            status.message()
+        );
+    }
+
+    /// Issue #1472: each response of a batch carries its own request's
+    /// total.
+    #[tokio::test]
+    async fn search_batch_returns_each_requests_total() {
+        use v1::TotalHitsRelation::{AtLeast, Exact};
+        use v1::track_total_hits::Mode;
+
+        let service = service_with_five_matches().await;
+        let responses = service
+            .search_batch(Request::new(SearchBatchRequest {
+                queries: vec![
+                    counted(Some(Mode::UpTo(1000))),
+                    page(0, 2),
+                    counted(Some(Mode::UpTo(3))),
+                ],
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .results;
+        let totals: Vec<_> = responses.into_iter().map(|r| r.total_hits).collect();
+        assert_eq!(totals, [total(5, Exact), None, total(3, AtLeast)]);
+    }
+
+    /// Issue #1472: the stream has no message for a total, so a request
+    /// that asks for one is rejected before the search runs; one that asks
+    /// for none is streamed.
+    #[tokio::test]
+    async fn search_stream_rejects_a_request_for_a_total() {
+        use v1::track_total_hits::Mode;
+
+        let service = service_with_five_matches().await;
+        for mode in [Mode::UpTo(10), Mode::Exact(true)] {
+            let Err(status) = service
+                .search_stream(Request::new(counted(Some(mode))))
+                .await
+            else {
+                panic!("{mode:?} was streamed");
+            };
+            assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status:?}");
+            assert!(
+                status.message().contains("no total hit count"),
+                "unexpected message: {}",
+                status.message()
+            );
+        }
+        for request in [counted(Some(Mode::Exact(false))), counted(None), page(0, 2)] {
+            assert!(
+                service.search_stream(Request::new(request)).await.is_ok(),
+                "a request for no total was rejected"
+            );
+        }
     }
 }

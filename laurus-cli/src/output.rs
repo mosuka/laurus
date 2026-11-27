@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use base64::Engine as _;
 use clap::ValueEnum;
-use laurus::{DataValue, Document, EngineStats, SearchResult};
+use laurus::{
+    DataValue, Document, EngineStats, SearchResponse, SearchResult, TotalHits, TotalHitsRelation,
+};
 use serde_json::json;
 use tabled::settings::location::ByColumnName;
 use tabled::settings::{Remove, Style};
@@ -23,61 +25,105 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Print search results to stdout.
+/// Print a search's response to stdout: its results, and its total hit
+/// count when the search asked for one (Issue #1472).
+///
+/// JSON is the object [`search_response_to_json`] builds, and a table the
+/// text [`search_response_table`] builds.
 ///
 /// # Arguments
 ///
-/// * `results` - Slice of [`SearchResult`] entries returned by the engine.
+/// * `response` - The [`SearchResponse`] returned by the engine.
 /// * `format` - The desired output format (table or JSON).
-pub fn print_search_results(results: &[SearchResult], format: OutputFormat) {
+pub fn print_search_response(response: &SearchResponse, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
-            let json_results = search_results_to_json(results);
-            println!("{}", serde_json::to_string_pretty(&json_results).unwrap());
+            let json = search_response_to_json(response);
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
-        OutputFormat::Table => {
-            if results.is_empty() {
-                println!("No results found.");
-                return;
-            }
-
-            let has_highlights = results.iter().any(|r| {
-                std::iter::once(r)
-                    .chain(&r.inner_hits)
-                    .any(|hit| !hit.highlights.is_empty())
-            });
-            let grouped = results
-                .iter()
-                .any(|r| r.group_key.is_some() || !r.inner_hits.is_empty());
-            let mut rows = Vec::new();
-            for result in results {
-                rows.push(search_result_row(result, false));
-                // A group's inner hits follow it, indented (Issue #1297).
-                rows.extend(
-                    result
-                        .inner_hits
-                        .iter()
-                        .map(|hit| search_result_row(hit, true)),
-                );
-            }
-
-            let mut table = Table::new(&rows);
-            table.with(Style::rounded());
-            // Highlighting was not requested for this search (Issue #1134):
-            // drop the column instead of rendering it empty on every row.
-            if !has_highlights {
-                table.with(Remove::column(ByColumnName::new("Highlights")));
-            }
-            // Likewise for an ungrouped search (Issue #1297).
-            if !grouped {
-                table.with(Remove::column(ByColumnName::new("Group")));
-            }
-            println!("{table}");
-        }
+        OutputFormat::Table => println!("{}", search_response_table(response)),
     }
 }
 
-/// One table row of [`print_search_results`]: a result, or one of a group's
+/// The JSON [`print_search_response`] prints: `{"results": [...]}`, as the
+/// HTTP gateway and laurus-mcp return a search, with `"total_hits"`,
+/// `{"value": 12, "relation": "eq"}`, only when the search asked for a
+/// total (Issue #1472). The results used to be printed as a bare array.
+fn search_response_to_json(response: &SearchResponse) -> serde_json::Value {
+    let mut json = json!({ "results": search_results_to_json(&response.results) });
+    if let Some(total_hits) = &response.total_hits {
+        let relation = match total_hits.relation {
+            TotalHitsRelation::Exact => "eq",
+            TotalHitsRelation::AtLeast => "gte",
+        };
+        json["total_hits"] = json!({ "value": total_hits.value, "relation": relation });
+    }
+    json
+}
+
+/// The line under a table that shows a search's total hit count (Issue
+/// #1472): `Total hits: 12` when exact, `Total hits: at least 1000` when a
+/// lower bound.
+fn total_hits_line(total_hits: &TotalHits) -> String {
+    match total_hits.relation {
+        TotalHitsRelation::Exact => format!("Total hits: {}", total_hits.value),
+        TotalHitsRelation::AtLeast => format!("Total hits: at least {}", total_hits.value),
+    }
+}
+
+/// The table [`print_search_response`] prints: the results, or "No results
+/// found." when there are none, followed by [`total_hits_line`] when the
+/// search asked for a total (Issue #1472).
+fn search_response_table(response: &SearchResponse) -> String {
+    let mut text = search_results_table(&response.results);
+    if let Some(total_hits) = &response.total_hits {
+        text.push('\n');
+        text.push_str(&total_hits_line(total_hits));
+    }
+    text
+}
+
+/// Search results as a table, or "No results found." when there are none.
+fn search_results_table(results: &[SearchResult]) -> String {
+    if results.is_empty() {
+        return "No results found.".to_string();
+    }
+
+    let has_highlights = results.iter().any(|r| {
+        std::iter::once(r)
+            .chain(&r.inner_hits)
+            .any(|hit| !hit.highlights.is_empty())
+    });
+    let grouped = results
+        .iter()
+        .any(|r| r.group_key.is_some() || !r.inner_hits.is_empty());
+    let mut rows = Vec::new();
+    for result in results {
+        rows.push(search_result_row(result, false));
+        // A group's inner hits follow it, indented (Issue #1297).
+        rows.extend(
+            result
+                .inner_hits
+                .iter()
+                .map(|hit| search_result_row(hit, true)),
+        );
+    }
+
+    let mut table = Table::new(&rows);
+    table.with(Style::rounded());
+    // Highlighting was not requested for this search (Issue #1134):
+    // drop the column instead of rendering it empty on every row.
+    if !has_highlights {
+        table.with(Remove::column(ByColumnName::new("Highlights")));
+    }
+    // Likewise for an ungrouped search (Issue #1297).
+    if !grouped {
+        table.with(Remove::column(ByColumnName::new("Group")));
+    }
+    table.to_string()
+}
+
+/// One table row of [`search_results_table`]: a result, or one of a group's
 /// inner hits (`inner`), whose ID is indented under its group's result and
 /// whose `Group` cell stays empty (Issue #1297).
 fn search_result_row(result: &SearchResult, inner: bool) -> SearchResultRow {
@@ -103,9 +149,9 @@ fn search_result_row(result: &SearchResult, inner: bool) -> SearchResultRow {
     }
 }
 
-/// Convert search results to the JSON shape [`print_search_results`] prints:
-/// `{"id", "score", "fields"?, "highlights"?, "group_key"?, "inner_hits"?}`
-/// per result. `"highlights"` is present only when at least one field
+/// Convert search results to the JSON [`search_response_to_json`] puts
+/// under `"results"`: `{"id", "score", "fields"?, "highlights"?,
+/// "group_key"?, "inner_hits"?}` per result. `"highlights"` is present only when at least one field
 /// actually highlighted (Issue #1134); `"group_key"` only when set and
 /// `"inner_hits"` only when non-empty, each inner hit in the same shape
 /// (Issue #1297). This matches the HTTP gateway's and laurus-mcp's
@@ -579,16 +625,16 @@ mod tests {
     /// `Highlights` column must actually disappear when nothing in the
     /// result set has any (rather than rendering an all-empty column).
     #[test]
-    fn print_search_results_table_drops_the_highlights_column_when_empty() {
+    fn print_search_response_table_drops_the_highlights_column_when_empty() {
         let no_highlights = vec![result_with_highlights("doc1", HashMap::new())];
-        print_search_results(&no_highlights, OutputFormat::Table);
-        print_search_results(&no_highlights, OutputFormat::Json);
+        print_search_response(&response(no_highlights.clone()), OutputFormat::Table);
+        print_search_response(&response(no_highlights.clone()), OutputFormat::Json);
 
         let mut highlights = HashMap::new();
         highlights.insert("body".to_string(), vec!["<mark>Rust</mark>".to_string()]);
         let with_highlights = vec![result_with_highlights("doc1", highlights)];
-        print_search_results(&with_highlights, OutputFormat::Table);
-        print_search_results(&with_highlights, OutputFormat::Json);
+        print_search_response(&response(with_highlights.clone()), OutputFormat::Table);
+        print_search_response(&response(with_highlights.clone()), OutputFormat::Json);
     }
 
     /// A grouped result: `a` with group key `doc` and inner hit `b`.
@@ -630,7 +676,76 @@ mod tests {
         assert_eq!(search_result_row(&no_key, false).group, "-");
 
         // Smoke: both formats print a grouped search without panicking.
-        print_search_results(&[grouped_result()], OutputFormat::Table);
-        print_search_results(&[grouped_result()], OutputFormat::Json);
+        print_search_response(&response(vec![grouped_result()]), OutputFormat::Table);
+        print_search_response(&response(vec![grouped_result()]), OutputFormat::Json);
+    }
+
+    /// A response with `results` and no total.
+    fn response(results: Vec<SearchResult>) -> SearchResponse {
+        SearchResponse {
+            results,
+            total_hits: None,
+        }
+    }
+
+    /// Issue #1472: the JSON output is an object, as the HTTP gateway's
+    /// and laurus-mcp's are: `{"results": [...]}` without a total, and with
+    /// `"total_hits"` when the search asked for one.
+    #[test]
+    fn search_response_to_json_is_an_object_with_the_total_only_when_asked() {
+        let results = vec![result_with_highlights("doc1", HashMap::new())];
+        assert_eq!(
+            search_response_to_json(&response(results.clone())),
+            json!({ "results": search_results_to_json(&results) })
+        );
+
+        let with_total = |total_hits: TotalHits| {
+            search_response_to_json(&SearchResponse {
+                results: Vec::new(),
+                total_hits: Some(total_hits),
+            })
+        };
+        assert_eq!(
+            with_total(TotalHits::exact(12)),
+            json!({"results": [], "total_hits": {"value": 12, "relation": "eq"}})
+        );
+        assert_eq!(
+            with_total(TotalHits::at_least(1000)),
+            json!({"results": [], "total_hits": {"value": 1000, "relation": "gte"}})
+        );
+    }
+
+    /// Issue #1472: the line under a table says whether the total is exact.
+    #[test]
+    fn total_hits_line_says_whether_the_total_is_exact() {
+        assert_eq!(total_hits_line(&TotalHits::exact(12)), "Total hits: 12");
+        assert_eq!(
+            total_hits_line(&TotalHits::at_least(1000)),
+            "Total hits: at least 1000"
+        );
+    }
+
+    /// Issue #1472: the table is followed by the total line when the search
+    /// asked for a total, after "No results found." too, and by nothing
+    /// otherwise.
+    #[test]
+    fn search_response_table_ends_with_the_total_asked_for() {
+        let table = |results: Vec<SearchResult>, total_hits: Option<TotalHits>| {
+            search_response_table(&SearchResponse {
+                results,
+                total_hits,
+            })
+        };
+        assert_eq!(
+            table(Vec::new(), Some(TotalHits::exact(0))),
+            "No results found.\nTotal hits: 0"
+        );
+        assert_eq!(table(Vec::new(), None), "No results found.");
+
+        let counted = table(vec![grouped_result()], Some(TotalHits::at_least(10)));
+        assert!(counted.ends_with("╯\nTotal hits: at least 10"), "{counted}");
+        let uncounted = table(vec![grouped_result()], None);
+        assert!(uncounted.ends_with('╯'), "{uncounted}");
+        assert!(!uncounted.contains("Total hits"), "{uncounted}");
     }
 }

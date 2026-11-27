@@ -463,8 +463,9 @@ rpc Search(SearchRequest) returns (SearchResponse);
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `results` | `repeated SearchResult` | 関連度順の検索結果 |
+| `total_hits` | `TotalHits` | 一致する文書の数。リクエストの `track_total_hits` が求めたときだけ入る（Issue #1472） |
 
-レスポンスはヒットの総数を持ちません。フィールド番号 `2`（`total_hits`）は、説明にあった一致件数ではなく返した結果の件数を入れていたため、削除しました（Issue #1455）。
+フィールド番号 `2` は `uint64 total_hits` で、説明にあった一致件数ではなく返した結果の件数を入れていたため、削除しました（Issue #1455）。番号は予約したままで、件数はフィールド番号 `3` が持ちます。
 
 ### `SearchStream`
 
@@ -476,6 +477,8 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 `group_by` を指定すると、各メッセージは 1 つのグループになります。グループの
 最上位の結果で、グループの 2 番目以降の結果は `inner_hits` に入ります。
+
+ストリームには総数を入れるメッセージがないため、`track_total_hits` で総数を求めるリクエスト（`up_to`、または `exact: true`）は、検索を実行する前に `INVALID_ARGUMENT` で断ります（Issue #1472）。総数は `Search` で求めてください。
 
 ### `SearchBatch`
 
@@ -504,6 +507,8 @@ message SearchBatchResponse {
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `results` | `repeated SearchResponse` | クエリごとのレスポンス。`queries` の順 |
+
+各レスポンスは、そのクエリの `track_total_hits` が求めた `total_hits` を持ちます。総数を求めなかったクエリのレスポンスは持ちません（Issue #1472）。
 
 `queries` が空なら、空の `results` を返します。サーバーはどのクエリを実行するよりも先に全クエリを読み、読む段階で拒むクエリ（`offset + limit` が `max_result_window` を超えるクエリなど）があれば、その位置で始まるメッセージ（`queries[1]: ...`）で呼び出し全体を失敗させます。クエリの実行中のエンジンのエラー（クエリの未知のフィールド、範囲外の `group_by` など）も、同じように呼び出し全体を失敗させます。メッセージは位置の後にエンジンのメッセージが続き、ステータスコードはそのエラーのものです（Issue #1553）。たとえば `queries[1]: Invalid argument: query references unknown field(s) ["nosuch"]; ...` です。複数のクエリが失敗したときは、最初に失敗したものを示します。位置が最も小さいものとは限りません。どちらの場合も、結果は返りません。
 
@@ -575,6 +580,7 @@ ERROR:
 | `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
 | `rescore` | `RescoreParams` | いいえ | 1 段目の上位の結果を late interaction で再採点する（Issue #1351） |
 | `group_by` | `GroupByParams` | いいえ | 結果をフィールド値でグループ化する。指定すると `limit` と `offset` はグループの数を数える（Issue #1297） |
+| `track_total_hits` | `TrackTotalHits` | いいえ | 一致する文書を数え、その数を `SearchResponse.total_hits` で返す（Issue #1472）。未指定なら数えない（[TrackTotalHits](#tracktotalhits) を参照） |
 
 `query` または `query_vectors` のいずれか 1 つ以上を指定する必要があります。
 
@@ -697,6 +703,24 @@ Issue #1551 より前は、この 3 つのフィールドが proto3 の素のス
 値はエンジンが検査します。グループ化に使えないフィールド、1〜100 の範囲外の
 `group_size`、10,000 を超える `offset + limit` は、`INVALID_ARGUMENT` で拒否
 されます。
+
+### TrackTotalHits
+
+検索が一致をいくつまで数えるかを決めます（Issue #1472）。`oneof mode` のフィールドのどれか 1 つを指定します。`track_total_hits` を指定しないとき、`exact: false` のとき、`mode` のないメッセージのときは数えず、コストもかかりません。
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `up_to` | `uint64` | この数まで一致を正確に数える。この数以上なら総数は下限になり、`value` は `up_to`、`relation` は `TOTAL_HITS_RELATION_AT_LEAST`。`0` は `INVALID_ARGUMENT` で拒否される |
+| `exact` | `bool` | `true` はすべての一致を正確に数える。`false` は数えない |
+
+数えることにはコストがあります。数えた件数が上限に届くまで、検索は block-max の打ち切りが読み飛ばす文書を読み飛ばせません。そのため、一致の多いクエリでは、上限が大きいほど、また `exact` では遅くなります。検索の種類ごとに何を数えるか（lexical 検索は正確に、または下限として、ベクトル検索とハイブリッド検索は下限として、`group_by` ではグループではなく文書を数える）は、[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。
+
+### TotalHits
+
+| フィールド | 型 | 説明 |
+| :--- | :--- | :--- |
+| `value` | `uint64` | 一致する文書の数、またはその下限 |
+| `relation` | `TotalHitsRelation` | `TOTAL_HITS_RELATION_EXACT` は `value` が一致する文書の数であることを、`TOTAL_HITS_RELATION_AT_LEAST` は少なくとも `value` 件の文書が一致することを表す |
 
 ### SearchResult
 

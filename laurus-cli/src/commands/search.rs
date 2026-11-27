@@ -14,16 +14,18 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use laurus::vector::Vector;
-use laurus::{GroupBy, RescoreOptions, SearchRequestBuilder, SearchResult};
+use laurus::{GroupBy, RescoreOptions, SearchRequestBuilder, SearchResponse};
 
 use crate::cli::SearchCommand;
 use crate::context;
 use crate::output::{self, OutputFormat};
 
-/// Open the index and execute the query, returning the engine's raw hits.
+/// Open the index and execute the query, returning the engine's response:
+/// its raw hits, and the total hit count when `--track-total-hits` asked
+/// for one (Issue #1472).
 ///
-/// Split out of [`run`] so tests can assert on hits without capturing
-/// stdout.
+/// Split out of [`run`] so tests can assert on the response without
+/// capturing stdout.
 ///
 /// # Arguments
 ///
@@ -35,7 +37,7 @@ use crate::output::{self, OutputFormat};
 ///
 /// Returns an error if the index cannot be opened, the query string is not
 /// valid DSL, it references a field outside the schema, or execution fails.
-pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<Vec<SearchResult>> {
+pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<SearchResponse> {
     let engine = context::open_index(index_dir).await?;
 
     let mut builder = SearchRequestBuilder::new()
@@ -55,11 +57,13 @@ pub(crate) async fn execute(cmd: &SearchCommand, index_dir: &Path) -> Result<Vec
             None => group_by,
         });
     }
+    if let Some(track_total_hits) = cmd.track_total_hits {
+        builder = builder.track_total_hits(track_total_hits);
+    }
 
     engine
         .search(builder.build())
         .await
-        .map(|response| response.results)
         .context("Failed to execute search")
 }
 
@@ -115,8 +119,8 @@ fn rescore_options(cmd: &SearchCommand) -> Result<Option<RescoreOptions>> {
 ///
 /// See [`execute`].
 pub async fn run(cmd: SearchCommand, index_dir: &Path, format: OutputFormat) -> Result<()> {
-    let results = execute(&cmd, index_dir).await?;
-    output::print_search_results(&results, format);
+    let response = execute(&cmd, index_dir).await?;
+    output::print_search_response(&response, format);
     Ok(())
 }
 
@@ -153,6 +157,7 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             rescore_window: None,
             group_by: None,
             group_size: None,
+            track_total_hits: None,
         }
     }
 
@@ -185,7 +190,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
 
         let results = execute(&search_command("吾輩は猫"), dir.path())
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert!(
             !results.is_empty(),
             "query must match via the field's own analyzer"
@@ -230,7 +236,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
 
         let results = execute(&search_command("吾輩は猫"), dir.path())
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(
             results.len(),
             2,
@@ -265,7 +272,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
 
         let results = execute(&search_command("_id:doc1"), dir.path())
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert_eq!(results.len(), 1);
     }
 
@@ -325,8 +333,67 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             dir.path(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
         assert_eq!(limited.len(), 2);
+    }
+
+    /// Issue #1472: `--track-total-hits` counts the matches beyond the
+    /// page: exactly below the threshold and with `true`, as a lower bound
+    /// of the threshold from it on, and not at all without the flag or
+    /// with `false`.
+    #[tokio::test]
+    async fn search_counts_the_matches_when_asked() {
+        use laurus::{TotalHits, TrackTotalHits};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("schema.toml"), BIGRAM_SCHEMA).unwrap();
+        let engine = context::open_index(dir.path()).await.unwrap();
+        for i in 0..5 {
+            engine
+                .put_document(
+                    &format!("doc{i}"),
+                    laurus::Document::builder()
+                        .add_field("body", "吾輩は猫である")
+                        .build(),
+                )
+                .await
+                .unwrap();
+        }
+        engine.commit().await.unwrap();
+        drop(engine);
+
+        let mut totals = Vec::new();
+        for track_total_hits in [
+            None,
+            Some(TrackTotalHits::Disabled),
+            Some(TrackTotalHits::UpTo(1000)),
+            Some(TrackTotalHits::UpTo(3)),
+            Some(TrackTotalHits::Exact),
+        ] {
+            let response = execute(
+                &SearchCommand {
+                    limit: 2,
+                    track_total_hits,
+                    ..search_command("猫で")
+                },
+                dir.path(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.results.len(), 2, "{track_total_hits:?}");
+            totals.push(response.total_hits);
+        }
+        assert_eq!(
+            totals,
+            [
+                None,
+                None,
+                Some(TotalHits::exact(5)),
+                Some(TotalHits::at_least(3)),
+                Some(TotalHits::exact(5)),
+            ]
+        );
     }
 
     /// Table-formatting a Japanese result must not panic — this is the
@@ -357,9 +424,9 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
         drop(engine);
 
         // 2+ characters: the bigram analyzer needs at least min_gram (2).
-        let results = execute(&search_command("猫で"), dir.path()).await.unwrap();
-        output::print_search_results(&results, OutputFormat::Table);
-        output::print_search_results(&results, OutputFormat::Json);
+        let response = execute(&search_command("猫で"), dir.path()).await.unwrap();
+        output::print_search_response(&response, OutputFormat::Table);
+        output::print_search_response(&response, OutputFormat::Json);
     }
 
     /// `--highlight body` (Issue #1134) must reach the engine and come back
@@ -395,7 +462,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
             dir.path(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
 
         assert_eq!(results.len(), 1);
         let fragments = results[0]
@@ -430,7 +498,8 @@ tokenizer = { type = "ngram", min_gram = 2, max_gram = 2 }
 
         let results = execute(&search_command("吾輩は猫"), dir.path())
             .await
-            .unwrap();
+            .unwrap()
+            .results;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.highlights.is_empty()));
     }
@@ -498,7 +567,8 @@ distance = "DotProduct"
             dir.path(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["c", "b", "d", "a", "e"]);
 
@@ -591,6 +661,7 @@ distance = "DotProduct"
         )
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|result| {
             assert_eq!(

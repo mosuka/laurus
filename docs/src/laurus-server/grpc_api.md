@@ -467,10 +467,11 @@ rpc Search(SearchRequest) returns (SearchResponse);
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `results` | `repeated SearchResult` | Search results ordered by relevance |
+| `total_hits` | `TotalHits` | The number of matching documents, set only when the request's `track_total_hits` asked for it (Issue #1472) |
 
-The response carries no total hit count. Field `2` (`total_hits`) held the
-number of returned results rather than the number of matches its description
-promised, and was removed (Issue #1455).
+Field `2` was a `uint64 total_hits` that held the number of returned results
+rather than the number of matches its description promised; it was removed
+(Issue #1455) and its number stays reserved. Field `3` holds the count.
 
 ### `SearchStream`
 
@@ -482,6 +483,10 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 With `group_by`, each message is one group: its best hit, with the group's
 next best hits in `inner_hits`.
+
+The stream has no message for a total, so a request whose `track_total_hits`
+asks for one (`up_to`, or `exact: true`) is rejected with `INVALID_ARGUMENT`
+before the search runs (Issue #1472). Use `Search` for a total.
 
 ### `SearchBatch`
 
@@ -512,6 +517,9 @@ message SearchBatchResponse {
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `results` | `repeated SearchResponse` | One response per query, in the order of `queries` |
+
+Each response has the `total_hits` its own query's `track_total_hits` asked
+for, and none for a query that asked for none (Issue #1472).
 
 An empty `queries` returns an empty `results`. Every query is read before
 any runs, and one the server rejects while reading it, such as a query
@@ -597,6 +605,7 @@ ERROR:
 | `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
 | `rescore` | `RescoreParams` | No | Rescore the top first-stage results with late interaction (Issue #1351) |
 | `group_by` | `GroupByParams` | No | Group the results by a field's value; `limit` and `offset` then count groups (Issue #1297) |
+| `track_total_hits` | `TrackTotalHits` | No | Count the matching documents and return the count in `SearchResponse.total_hits` (Issue #1472). Unset counts nothing (see [TrackTotalHits](#tracktotalhits)) |
 
 At least one of `query` or `query_vectors` must be provided.
 
@@ -732,6 +741,32 @@ value into groups, ordered by each group's best result (Issue #1297). See
 The engine validates the values: a field that cannot group, a `group_size`
 outside 1 to 100, or an `offset + limit` above 10,000 is rejected with
 `INVALID_ARGUMENT`.
+
+### TrackTotalHits
+
+How far a search counts its matches (Issue #1472). One of the fields of
+`oneof mode` is set. An unset `track_total_hits`, `exact: false` and a
+message without `mode` count nothing, which costs nothing.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `up_to` | `uint64` | Count exactly up to this many matches. From it on, the total is a lower bound: `value` is `up_to` and `relation` is `TOTAL_HITS_RELATION_AT_LEAST`. `0` is rejected with `INVALID_ARGUMENT` |
+| `exact` | `bool` | `true` counts every match, exactly; `false` counts nothing |
+
+Counting has a cost: until the count reaches the threshold, the search
+cannot skip the documents that block-max pruning would skip, so a higher
+threshold, or `exact`, is slower for a query with many matches. What the
+total counts for each kind of search (exactly or as a lower bound for a
+lexical search, as a lower bound for a vector or hybrid search, documents
+rather than groups with `group_by`) is described in
+[Total hits](../laurus/engine.md#total-hits).
+
+### TotalHits
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `value` | `uint64` | The number of matching documents, or a lower bound of it |
+| `relation` | `TotalHitsRelation` | `TOTAL_HITS_RELATION_EXACT`: `value` is the number of matching documents. `TOTAL_HITS_RELATION_AT_LEAST`: at least `value` documents match |
 
 ### SearchResult
 
