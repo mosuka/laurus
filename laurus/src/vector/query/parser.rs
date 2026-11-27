@@ -13,6 +13,7 @@ use pest_derive::Parser;
 use crate::data::DataValue;
 use crate::embedding::embedder::{EmbedInput, Embedder};
 use crate::error::{LaurusError, Result};
+use crate::lexical::query::parser::discard_escapes;
 use crate::vector::store::request::{
     QueryPayload, QueryVector, VectorSearchQuery, VectorSearchRequest, check_query_vector_weight,
 };
@@ -37,6 +38,9 @@ struct VectorQueryStringParser;
 /// - `content:python^0.8` — unquoted with weight (boost)
 /// - `"cute kitten"` — uses default field (quoted)
 /// - `content:"cats" image:"dogs"^0.5` — multiple queries
+/// - `content:"say \"hi\""` — in quoted text a backslash takes the next
+///   character literally, and the text is embedded without it, as in a
+///   lexical phrase (Issue #1758)
 ///
 /// # Example
 ///
@@ -196,10 +200,12 @@ impl VectorQueryParser {
                     }
                 }
                 Rule::quoted_text => {
-                    // Extract text from quoted_text → inner_text
+                    // Extract text from quoted_text → inner_text, without the
+                    // backslashes of its escapes, as a lexical phrase
+                    // (Issue #1758).
                     for qt_inner in inner.into_inner() {
                         if qt_inner.as_rule() == Rule::inner_text {
-                            text = Some(qt_inner.as_str().to_string());
+                            text = Some(discard_escapes(qt_inner.as_str()));
                         }
                     }
                 }
@@ -560,5 +566,58 @@ mod tests {
         let vecs = get_vectors(&request);
         assert_eq!(vecs.len(), 1);
         assert_eq!(qv_field(&vecs[0]), "content");
+    }
+
+    /// Mock embedder that records the texts it embeds.
+    #[derive(Debug, Default)]
+    struct RecordingEmbedder {
+        texts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Embedder for RecordingEmbedder {
+        async fn embed(&self, input: &EmbedInput<'_>) -> Result<Vector> {
+            if let EmbedInput::Text(text) = input {
+                self.texts.lock().unwrap().push(text.to_string());
+            }
+            Ok(Vector::new(vec![0.0; 4]))
+        }
+        fn supported_input_types(&self) -> Vec<EmbedInputType> {
+            vec![EmbedInputType::Text]
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Issue #1758: a quoted value reads its escapes as a lexical phrase
+    /// does: a backslash takes the next character literally, so `\"` does
+    /// not end the value, and the text is embedded without the backslashes.
+    #[tokio::test]
+    async fn test_quoted_text_reads_its_escapes() {
+        let mut wrong = Vec::new();
+        for (dsl, expected) in [
+            (r#"content:"say \"hi\"""#, r#"say "hi""#),
+            (r#"content:"a\:b""#, "a:b"),
+            (r#"content:"a\\b""#, r"a\b"),
+            (r#"content:"C:\temp"^0.5"#, "C:temp"),
+            (r#"content:"cute kitten""#, "cute kitten"),
+        ] {
+            let embedder = Arc::new(RecordingEmbedder::default());
+            let parser = VectorQueryParser::new(embedder.clone());
+            match parser.parse(dsl).await {
+                Ok(_) => {
+                    let texts = embedder.texts.lock().unwrap().clone();
+                    if texts != [expected] {
+                        wrong.push(format!("{dsl}: embedded {texts:?}"));
+                    }
+                }
+                Err(e) => wrong.push(format!("{dsl}: {e}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
