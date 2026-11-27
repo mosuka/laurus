@@ -1,4 +1,8 @@
 //! PHP wrapper for the Laurus [`Schema`] type.
+//!
+//! Multi-word parameters are camelCase (`$efConstruction`, `$multiValued`),
+//! as everywhere in this binding; see "Parameter names" in the crate docs.
+#![allow(non_snake_case)]
 
 use std::cell::RefCell;
 use std::str::FromStr;
@@ -57,7 +61,7 @@ fn parse_quantizer(
     subvector_count: Option<usize>,
 ) -> PhpResult<QuantizationMethod> {
     const REJECT_SUBVECTOR_COUNT: &str =
-        "subvector_count is only valid with quantizer 'product_quantization'";
+        "subvectorCount is only valid with quantizer 'product_quantization'";
     match name.map(|s| s.to_lowercase()).as_deref() {
         None | Some("scalar_8bit") | Some("scalar") => {
             if subvector_count.is_some() {
@@ -75,7 +79,7 @@ fn parse_quantizer(
             Some(subvector_count) => {
                 Ok(QuantizationMethod::ProductQuantization { subvector_count })
             }
-            None => Err("quantizer 'product_quantization' requires subvector_count \
+            None => Err("quantizer 'product_quantization' requires subvectorCount \
                          (must divide the field dimension)"
                 .into()),
         },
@@ -110,7 +114,7 @@ fn parse_rerank_storage(name: Option<&str>) -> PhpResult<Option<RerankStorageKin
     match name.map(|s| s.to_lowercase()).as_deref() {
         None => Ok(None),
         Some("f32") => Ok(Some(RerankStorageKind::F32)),
-        Some(other) => Err(format!("Unknown rerank_storage: '{other}'. Valid: f32").into()),
+        Some(other) => Err(format!("Unknown rerankStorage: '{other}'. Valid: f32").into()),
     }
 }
 
@@ -203,9 +207,9 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the original value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `term_vectors` - Whether term positions are stored, required by
+    /// * `termVectors` - Whether term positions are stored, required by
     ///   phrase and span queries over this field (default: true).
-    /// * `doc_values` - Whether the value is also copied into DocValues,
+    /// * `docValues` - Whether the value is also copied into DocValues,
     ///   the column-oriented store sort/facet/aggregation read from
     ///   (default: true). Takes effect only when `stored` is also true.
     /// * `analyzer` - Optional analyzer name. For parameter-less built-in
@@ -214,29 +218,29 @@ impl PhpSchema {
     ///   as the Japanese analyzer (which needs a Lindera dictionary path),
     ///   register a custom analyzer via `addAnalyzer` and reference it by
     ///   name.
-    /// * `multi_valued` - When true, the field accepts a sequential array of
+    /// * `multiValued` - When true, the field accepts a sequential array of
     ///   strings; a term query matches if any element contains the term,
     ///   and a phrase query never spans two elements (Lucene-style).
     ///   Default: false. Appended after `analyzer` so existing positional
     ///   callers keep working.
-    /// * `position_increment_gap` - Positions skipped between the elements
+    /// * `positionIncrementGap` - Positions skipped between the elements
     ///   of a multi-valued field, so a phrase needs a slop of at least this
     ///   value to cross an element boundary (default 100; `0` numbers the
-    ///   elements as if concatenated). Ignored unless `multi_valued` is
+    ///   elements as if concatenated). Ignored unless `multiValued` is
     ///   true.
     ///
     /// # Errors
     ///
-    /// Throws `\Exception` if `position_increment_gap` is outside
+    /// Throws `\Exception` if `positionIncrementGap` is outside
     /// `0..=4294967295`, or `\ValueError` if `name` starts with `_` (other
     /// than `_id`), which is reserved for system fields.
     #[php(defaults(
         stored = true,
         indexed = true,
-        term_vectors = true,
-        doc_values = true,
-        multi_valued = false,
-        position_increment_gap = 100
+        termVectors = true,
+        docValues = true,
+        multiValued = false,
+        positionIncrementGap = 100
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_text_field(
@@ -244,23 +248,23 @@ impl PhpSchema {
         name: String,
         stored: bool,
         indexed: bool,
-        term_vectors: bool,
-        doc_values: bool,
+        termVectors: bool,
+        docValues: bool,
         analyzer: Option<String>,
-        multi_valued: bool,
-        position_increment_gap: i64,
+        multiValued: bool,
+        positionIncrementGap: i64,
     ) -> PhpResult<()> {
-        let position_increment_gap = u32::try_from(position_increment_gap)
-            .map_err(|_| "position_increment_gap must be between 0 and 4294967295")?;
+        let positionIncrementGap = u32::try_from(positionIncrementGap)
+            .map_err(|_| "positionIncrementGap must be between 0 and 4294967295")?;
         self.insert_field(
             name,
             FieldOption::Text(TextOption {
                 indexed,
                 stored,
-                multi_valued,
-                position_increment_gap,
-                term_vectors,
-                doc_values,
+                multi_valued: multiValued,
+                position_increment_gap: positionIncrementGap,
+                term_vectors: termVectors,
+                doc_values: docValues,
                 analyzer: analyzer.map(laurus::AnalyzerSpec::Named),
             }),
         )
@@ -273,32 +277,32 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `multi_valued` - When true, the field accepts arrays of integers
+    /// * `multiValued` - When true, the field accepts arrays of integers
     ///   and range queries match if any value satisfies the predicate
     ///   (Lucene-style "any match"). Default: false.
-    /// * `doc_values` - Whether the value is also copied into DocValues
+    /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    #[php(defaults(stored = true, indexed = true, multiValued = false, docValues = true))]
     pub fn add_integer_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
-        multi_valued: bool,
-        doc_values: bool,
+        multiValued: bool,
+        docValues: bool,
     ) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::Integer(IntegerOption {
                 indexed,
                 stored,
-                multi_valued,
-                doc_values,
+                multi_valued: multiValued,
+                doc_values: docValues,
             }),
         )
     }
@@ -310,32 +314,32 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `multi_valued` - When true, the field accepts arrays of floats
+    /// * `multiValued` - When true, the field accepts arrays of floats
     ///   and range queries match if any value satisfies the predicate
     ///   (Lucene-style "any match"). Default: false.
-    /// * `doc_values` - Whether the value is also copied into DocValues
+    /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    #[php(defaults(stored = true, indexed = true, multiValued = false, docValues = true))]
     pub fn add_float_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
-        multi_valued: bool,
-        doc_values: bool,
+        multiValued: bool,
+        docValues: bool,
     ) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::Float(FloatOption {
                 indexed,
                 stored,
-                multi_valued,
-                doc_values,
+                multi_valued: multiValued,
+                doc_values: docValues,
             }),
         )
     }
@@ -347,32 +351,32 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `multi_valued` - When true, the field accepts an array of bools and
+    /// * `multiValued` - When true, the field accepts an array of bools and
     ///   a term query / DSL `flags:true` matches if any element is `true`
     ///   (Lucene-style "any match"). Default: false.
-    /// * `doc_values` - Whether the value is also copied into DocValues
+    /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    #[php(defaults(stored = true, indexed = true, multiValued = false, docValues = true))]
     pub fn add_boolean_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
-        multi_valued: bool,
-        doc_values: bool,
+        multiValued: bool,
+        docValues: bool,
     ) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::Boolean(BooleanOption {
                 indexed,
                 stored,
-                multi_valued,
-                doc_values,
+                multi_valued: multiValued,
+                doc_values: docValues,
             }),
         )
     }
@@ -384,32 +388,32 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `multi_valued` - When true, the field accepts an array of RFC 3339
+    /// * `multiValued` - When true, the field accepts an array of RFC 3339
     ///   strings and range queries match if any instant satisfies the
     ///   predicate (Lucene-style "any match"). Default: false.
-    /// * `doc_values` - Whether the value is also copied into DocValues
+    /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    #[php(defaults(stored = true, indexed = true, multiValued = false, docValues = true))]
     pub fn add_datetime_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
-        multi_valued: bool,
-        doc_values: bool,
+        multiValued: bool,
+        docValues: bool,
     ) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::DateTime(DateTimeOption {
                 indexed,
                 stored,
-                multi_valued,
-                doc_values,
+                multi_valued: multiValued,
+                doc_values: docValues,
             }),
         )
     }
@@ -421,34 +425,34 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `multi_valued` - When true, the field accepts an array of
+    /// * `multiValued` - When true, the field accepts an array of
     ///   `["lat" => .., "lon" => ..]` arrays and distance / bounding-box
     ///   queries match if any point satisfies the predicate (Lucene-style
     ///   "any match"), scoring the document by its closest point. Default:
     ///   false.
-    /// * `doc_values` - Whether the value is also copied into DocValues
+    /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    #[php(defaults(stored = true, indexed = true, multiValued = false, docValues = true))]
     pub fn add_geo_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
-        multi_valued: bool,
-        doc_values: bool,
+        multiValued: bool,
+        docValues: bool,
     ) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::Geo(GeoOption {
                 indexed,
                 stored,
-                multi_valued,
-                doc_values,
+                multi_valued: multiValued,
+                doc_values: docValues,
             }),
         )
     }
@@ -465,33 +469,33 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
     /// * `indexed` - Whether the field is searchable (default: true).
-    /// * `multi_valued` - When true, the field accepts an array of
+    /// * `multiValued` - When true, the field accepts an array of
     ///   `["x" => .., "y" => .., "z" => ..]` arrays and the geo3d queries
     ///   match if any point satisfies the predicate (Lucene-style "any
     ///   match"), scoring the document by its closest point. Default: false.
-    /// * `doc_values` - Whether the value is also copied into DocValues
+    /// * `docValues` - Whether the value is also copied into DocValues
     ///   (default: true). Takes effect only when `stored` is also true.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, indexed = true, multi_valued = false, doc_values = true))]
+    #[php(defaults(stored = true, indexed = true, multiValued = false, docValues = true))]
     pub fn add_geo3d_field(
         &self,
         name: String,
         stored: bool,
         indexed: bool,
-        multi_valued: bool,
-        doc_values: bool,
+        multiValued: bool,
+        docValues: bool,
     ) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::Geo3d(Geo3dOption {
                 indexed,
                 stored,
-                multi_valued,
-                doc_values,
+                multi_valued: multiValued,
+                doc_values: docValues,
             }),
         )
     }
@@ -502,20 +506,20 @@ impl PhpSchema {
     ///
     /// * `name` - Field name.
     /// * `stored` - Whether the value is retrievable (default: true).
-    /// * `multi_valued` - When true, the field accepts an array of binary
+    /// * `multiValued` - When true, the field accepts an array of binary
     ///   values (each with its own optional MIME type). Default: false.
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`),
     /// which is reserved for system fields.
-    #[php(defaults(stored = true, multi_valued = false))]
-    pub fn add_bytes_field(&self, name: String, stored: bool, multi_valued: bool) -> PhpResult<()> {
+    #[php(defaults(stored = true, multiValued = false))]
+    pub fn add_bytes_field(&self, name: String, stored: bool, multiValued: bool) -> PhpResult<()> {
         self.insert_field(
             name,
             FieldOption::Bytes(BytesOption {
                 stored,
-                multi_valued,
+                multi_valued: multiValued,
             }),
         )
     }
@@ -528,29 +532,29 @@ impl PhpSchema {
     /// * `dimension` - Vector dimensionality.
     /// * `distance` - Distance metric (default: "cosine").
     /// * `m` - HNSW branching factor (default: 16).
-    /// * `ef_construction` - Build-time expansion factor (default: 200).
-    /// * `default_ef_search` - Schema-level default for the search-time
+    /// * `efConstruction` - Build-time expansion factor (default: 200).
+    /// * `defaultEfSearch` - Schema-level default for the search-time
     ///   `ef_search` candidate-list size (Issue #644). When `null`, the
-    ///   searcher uses twice the larger of `ef_construction` and 50 (400
+    ///   searcher uses twice the larger of `efConstruction` and 50 (400
     ///   with the default of 200). Per-query overrides via the search
     ///   request still take precedence.
     /// * `embedder` - Embedder name registered via `addEmbedder` (default: "" for none).
     /// * `quantizer` - Vector quantizer — "scalar_8bit" (default),
     ///   "float16" (IEEE half precision, 2 bytes per dimension) or
-    ///   "product_quantization" (requires `subvector_count`).
-    /// * `subvector_count` - Number of PQ sub-vectors. Required when
+    ///   "product_quantization" (requires `subvectorCount`).
+    /// * `subvectorCount` - Number of PQ sub-vectors. Required when
     ///   `quantizer` is "product_quantization" and must divide `dimension`;
     ///   rejected for other quantizers.
-    /// * `rerank_storage` - Stage-2 rerank sidecar — omitted (default) keeps
+    /// * `rerankStorage` - Stage-2 rerank sidecar — omitted (default) keeps
     ///   the int8-only segment, "f32" stores full-precision vectors in a
     ///   `*.hnsw.f32` sidecar for exact rerank distances.
-    /// * `pq_codebook_path` - Storage-relative file name of a shared PQ
+    /// * `pqCodebookPath` - Storage-relative file name of a shared PQ
     ///   codebook (Issue #631), trained once via the
     ///   `laurus train pq-codebook` CLI command. Only meaningful when
     ///   `quantizer` is "product_quantization"; commits then encode against
     ///   the pre-trained codebook instead of re-training k-means per
     ///   segment. Omitted (default) keeps per-segment training.
-    /// * `base_weight` - This field's relative scoring priority when
+    /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. Only matters when a query targets two or more specific
     ///   vector fields at once; has no effect on the lexical-vs-vector
@@ -558,16 +562,16 @@ impl PhpSchema {
     ///
     /// # Errors
     ///
-    /// Throws `\Exception` if `distance`, `quantizer` or `rerank_storage`
-    /// is not a known name, or if `subvector_count` is missing for, or
+    /// Throws `\Exception` if `distance`, `quantizer` or `rerankStorage`
+    /// is not a known name, or if `subvectorCount` is missing for, or
     /// supplied without, `"product_quantization"`. Throws `\ValueError` if
-    /// `dimension`, `m`, `ef_construction`, `default_ef_search` or
-    /// `subvector_count` is negative (Issue #1493), or if `name` starts with
+    /// `dimension`, `m`, `efConstruction`, `defaultEfSearch` or
+    /// `subvectorCount` is negative (Issue #1493), or if `name` starts with
     /// `_` (other than `_id`), which is reserved for system fields.
     #[php(defaults(
         m = DEFAULT_HNSW_M as i64,
-        ef_construction = DEFAULT_HNSW_EF_CONSTRUCTION as i64,
-        base_weight = 1.0
+        efConstruction = DEFAULT_HNSW_EF_CONSTRUCTION as i64,
+        baseWeight = 1.0
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_field(
@@ -576,14 +580,14 @@ impl PhpSchema {
         dimension: i64,
         distance: Option<String>,
         m: i64,
-        ef_construction: i64,
-        default_ef_search: Option<i64>,
+        efConstruction: i64,
+        defaultEfSearch: Option<i64>,
         embedder: Option<String>,
         quantizer: Option<String>,
-        subvector_count: Option<i64>,
-        rerank_storage: Option<String>,
-        pq_codebook_path: Option<String>,
-        base_weight: f64,
+        subvectorCount: Option<i64>,
+        rerankStorage: Option<String>,
+        pqCodebookPath: Option<String>,
+        baseWeight: f64,
     ) -> PhpResult<()> {
         const CONTEXT: &str = "Schema::addHnswField";
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
@@ -591,20 +595,20 @@ impl PhpSchema {
             dimension: unsigned_param(CONTEXT, "dimension", dimension)?,
             distance: parse_distance(&dist_str)?,
             m: unsigned_param(CONTEXT, "m", m)?,
-            ef_construction: unsigned_param(CONTEXT, "ef_construction", ef_construction)?,
-            default_ef_search: default_ef_search
-                .map(|v| unsigned_param(CONTEXT, "default_ef_search", v))
+            ef_construction: unsigned_param(CONTEXT, "efConstruction", efConstruction)?,
+            default_ef_search: defaultEfSearch
+                .map(|v| unsigned_param(CONTEXT, "defaultEfSearch", v))
                 .transpose()?,
             quantizer: parse_quantizer(
                 quantizer.as_deref(),
-                subvector_count
-                    .map(|v| unsigned_param(CONTEXT, "subvector_count", v))
+                subvectorCount
+                    .map(|v| unsigned_param(CONTEXT, "subvectorCount", v))
                     .transpose()?,
             )?,
-            rerank_storage: parse_rerank_storage(rerank_storage.as_deref())?,
+            rerank_storage: parse_rerank_storage(rerankStorage.as_deref())?,
             embedder,
-            pq_codebook_path,
-            base_weight: base_weight as f32,
+            pq_codebook_path: pqCodebookPath,
+            base_weight: baseWeight as f32,
         };
         self.insert_field(name, FieldOption::Hnsw(opt))
     }
@@ -617,7 +621,7 @@ impl PhpSchema {
     /// * `dimension` - Vector dimensionality.
     /// * `distance` - Distance metric (default: "cosine").
     /// * `embedder` - Embedder name registered via `addEmbedder` (default: "" for none).
-    /// * `base_weight` - This field's relative scoring priority when
+    /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `add_hnsw_field` for the full contract.
     /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
@@ -630,14 +634,14 @@ impl PhpSchema {
     /// name or `quantizer` is `"product_quantization"`, or `\ValueError`
     /// if `dimension` is negative (Issue #1493) or `name` starts with `_`
     /// (other than `_id`), which is reserved for system fields.
-    #[php(defaults(base_weight = 1.0))]
+    #[php(defaults(baseWeight = 1.0))]
     pub fn add_flat_field(
         &self,
         name: String,
         dimension: i64,
         distance: Option<String>,
         embedder: Option<String>,
-        base_weight: f64,
+        baseWeight: f64,
         quantizer: Option<String>,
     ) -> PhpResult<()> {
         let dist_str = distance.unwrap_or_else(|| "cosine".to_string());
@@ -646,7 +650,7 @@ impl PhpSchema {
             distance: parse_distance(&dist_str)?,
             quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
-            base_weight: base_weight as f32,
+            base_weight: baseWeight as f32,
             ..Default::default()
         };
         self.insert_field(name, FieldOption::Flat(opt))
@@ -659,10 +663,10 @@ impl PhpSchema {
     /// * `name` - Field name.
     /// * `dimension` - Vector dimensionality.
     /// * `distance` - Distance metric (default: "cosine").
-    /// * `n_clusters` - Number of Voronoi clusters (default: 100).
-    /// * `n_probe` - Number of clusters to probe at search time (default: 1).
+    /// * `nClusters` - Number of Voronoi clusters (default: 100).
+    /// * `nProbe` - Number of clusters to probe at search time (default: 1).
     /// * `embedder` - Embedder name registered via `addEmbedder` (default: "" for none).
-    /// * `base_weight` - This field's relative scoring priority when
+    /// * `baseWeight` - This field's relative scoring priority when
     ///   searched alongside other vector fields (Issue #1084). Defaults to
     ///   1.0. See `add_hnsw_field` for the full contract.
     /// * `quantizer` - Vector quantizer — "scalar_8bit" (default) or
@@ -673,13 +677,13 @@ impl PhpSchema {
     ///
     /// Throws `\Exception` if `distance` or `quantizer` is not a known
     /// name or `quantizer` is `"product_quantization"`, or `\ValueError`
-    /// if `dimension`, `n_clusters` or `n_probe` is negative (Issue #1493)
+    /// if `dimension`, `nClusters` or `nProbe` is negative (Issue #1493)
     /// or `name` starts with `_` (other than `_id`), which is reserved for
     /// system fields.
     #[php(defaults(
-        n_clusters = DEFAULT_IVF_N_CLUSTERS as i64,
-        n_probe = DEFAULT_IVF_N_PROBE as i64,
-        base_weight = 1.0
+        nClusters = DEFAULT_IVF_N_CLUSTERS as i64,
+        nProbe = DEFAULT_IVF_N_PROBE as i64,
+        baseWeight = 1.0
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn add_ivf_field(
@@ -687,10 +691,10 @@ impl PhpSchema {
         name: String,
         dimension: i64,
         distance: Option<String>,
-        n_clusters: i64,
-        n_probe: i64,
+        nClusters: i64,
+        nProbe: i64,
         embedder: Option<String>,
-        base_weight: f64,
+        baseWeight: f64,
         quantizer: Option<String>,
     ) -> PhpResult<()> {
         const CONTEXT: &str = "Schema::addIvfField";
@@ -698,11 +702,11 @@ impl PhpSchema {
         let opt = IvfOption {
             dimension: unsigned_param(CONTEXT, "dimension", dimension)?,
             distance: parse_distance(&dist_str)?,
-            n_clusters: unsigned_param(CONTEXT, "n_clusters", n_clusters)?,
-            n_probe: unsigned_param(CONTEXT, "n_probe", n_probe)?,
+            n_clusters: unsigned_param(CONTEXT, "nClusters", nClusters)?,
+            n_probe: unsigned_param(CONTEXT, "nProbe", nProbe)?,
             quantizer: parse_flat_ivf_quantizer(quantizer.as_deref())?,
             embedder,
-            base_weight: base_weight as f32,
+            base_weight: baseWeight as f32,
             ..Default::default()
         };
         self.insert_field(name, FieldOption::Ivf(opt))
@@ -723,14 +727,14 @@ impl PhpSchema {
     ///   #1346): `"f32"` (default, exact), `"f16"` (2x smaller), `"int8"`
     ///   (~4x smaller), `"binary"` (~32x smaller, 1 bit per element;
     ///   requires `"cosine"`).
-    /// * `pool_factor` - Token pooling (Issue #1346): each document keeps
-    ///   about `1 / pool_factor` of its token vectors (default 1, all).
+    /// * `poolFactor` - Token pooling (Issue #1346): each document keeps
+    ///   about `1 / poolFactor` of its token vectors (default 1, all).
     ///
     /// # Errors
     ///
     /// Throws `\ValueError` if `name` starts with `_` (other than `_id`), if
     /// `dimension` is not positive, if `distance` is neither cosine nor
-    /// dot_product, if `storage` is not a known kind, or if `pool_factor`
+    /// dot_product, if `storage` is not a known kind, or if `poolFactor`
     /// is not positive.
     pub fn add_multi_vector_field(
         &self,
@@ -739,18 +743,18 @@ impl PhpSchema {
         distance: Option<String>,
         embedder: Option<String>,
         storage: Option<String>,
-        pool_factor: Option<i64>,
+        poolFactor: Option<i64>,
     ) -> PhpResult<()> {
         // A negative dimension (or pool factor) is rejected by `validate`
         // like 0.
         let dimension = usize::try_from(dimension).unwrap_or(0);
-        let pool_factor = u32::try_from(pool_factor.unwrap_or(1)).unwrap_or(0);
+        let poolFactor = u32::try_from(poolFactor.unwrap_or(1)).unwrap_or(0);
         let mut opt = MultiVectorOption::new(dimension)
             .distance(parse_distance(distance.as_deref().unwrap_or("cosine"))?)
             .storage(parse_multi_vector_storage(
                 storage.as_deref().unwrap_or("f32"),
             )?)
-            .pool_factor(pool_factor);
+            .pool_factor(poolFactor);
         opt.embedder = embedder;
         opt.validate(&name).map_err(laurus_err)?;
         self.insert_field(name, FieldOption::MultiVector(opt))
@@ -807,9 +811,9 @@ impl PhpSchema {
     /// * `name` - Unique analyzer name, referenced from `addTextField`'s
     ///   `analyzer` parameter.
     /// * `tokenizer` - Associative array describing the tokenizer.
-    /// * `char_filters` - Optional sequential array of char-filter
+    /// * `charFilters` - Optional sequential array of char-filter
     ///   definitions, applied to raw text before tokenization.
-    /// * `token_filters` - Optional sequential array of token-filter
+    /// * `tokenFilters` - Optional sequential array of token-filter
     ///   definitions, applied to the token stream after tokenization.
     ///
     /// # Errors
@@ -821,18 +825,14 @@ impl PhpSchema {
         &self,
         name: String,
         tokenizer: &ZendHashTable,
-        char_filters: Option<&ZendHashTable>,
-        token_filters: Option<&ZendHashTable>,
+        charFilters: Option<&ZendHashTable>,
+        tokenFilters: Option<&ZendHashTable>,
     ) -> PhpResult<()> {
         laurus::analysis::analyzer::registry::validate_analyzer_name(&name).map_err(laurus_err)?;
         let definition = AnalyzerDefinition {
             tokenizer: tokenizer_from_ht(tokenizer)?,
-            char_filters: filter_list_from_ht(char_filters, "charFilters", char_filter_from_ht)?,
-            token_filters: filter_list_from_ht(
-                token_filters,
-                "tokenFilters",
-                token_filter_from_ht,
-            )?,
+            char_filters: filter_list_from_ht(charFilters, "charFilters", char_filter_from_ht)?,
+            token_filters: filter_list_from_ht(tokenFilters, "tokenFilters", token_filter_from_ht)?,
         };
         self.inner.borrow_mut().analyzers.insert(name, definition);
         Ok(())
@@ -849,13 +849,13 @@ impl PhpSchema {
     ///
     /// # Arguments
     ///
-    /// * `toml_str` - Schema definition in TOML.
+    /// * `tomlStr` - Schema definition in TOML.
     ///
     /// # Errors
     ///
-    /// Throws a PHP `ValueError` if `toml_str` is not a valid schema.
-    pub fn from_toml(toml_str: String) -> PhpResult<Self> {
-        let inner = Schema::from_toml(&toml_str).map_err(laurus_err)?;
+    /// Throws a PHP `ValueError` if `tomlStr` is not a valid schema.
+    pub fn from_toml(tomlStr: String) -> PhpResult<Self> {
+        let inner = Schema::from_toml(&tomlStr).map_err(laurus_err)?;
         Ok(Self {
             inner: RefCell::new(inner),
         })

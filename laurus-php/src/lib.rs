@@ -9,6 +9,19 @@
 //!
 //! Then copy the resulting `liblaurus_php.so` to the PHP extensions directory
 //! and add `extension=laurus_php.so` to `php.ini`.
+//!
+//! # Parameter names
+//!
+//! Every parameter PHP sees is named in camelCase (`$efConstruction`,
+//! `$groupBy`), as the methods of PHP's own classes name theirs, since a PHP
+//! caller can pass it as a named argument (Issue #1694). `#[php_impl]` and
+//! `#[php_function]` expose a parameter's Rust identifier as its PHP name and
+//! cannot rename it, so the Rust identifiers are camelCase too. The
+//! `non_snake_case` lint is allowed per module, in each module that has a
+//! multi-word parameter, because the macros bind each argument by that
+//! identifier in code they generate outside the `impl` block, where a
+//! function-level `#[allow]` does not reach. A test checks every parameter
+//! name through PHP reflection (`testEveryParameterNameIsCamelCase`).
 
 #![deny(clippy::all)]
 

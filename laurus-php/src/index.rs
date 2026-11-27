@@ -1,9 +1,7 @@
 //! PHP-facing `Index` class — the primary entry point for the laurus binding.
 //!
-//! The multi-word `groupBy` parameter of `search` and `searchBatch` (Issue
-//! #1297) is camelCase, as in `search.rs`: `#[php_impl]` exposes a
-//! parameter's Rust identifier as its PHP named-argument name. The lint is
-//! allowed for the whole module for the reason given there.
+//! Multi-word parameters are camelCase (`$groupBy`, `$walSyncPolicy`), as
+//! everywhere in this binding; see "Parameter names" in the crate docs.
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;
@@ -70,7 +68,7 @@ impl PhpWalSyncPolicy {
     ///
     /// Every `addDocument` / `putDocument` is fsynced before it returns, so a
     /// successful write can never be lost to a crash. This is the safest policy
-    /// and the engine default when no `wal_sync_policy` is supplied to
+    /// and the engine default when no `walSyncPolicy` is supplied to
     /// [`PhpIndex::__construct`], at the cost of the lowest ingest throughput.
     ///
     /// # Returns
@@ -85,7 +83,7 @@ impl PhpWalSyncPolicy {
     /// Create a group-commit durability policy.
     ///
     /// The engine defers the fsync and amortizes it over a batch: it flushes
-    /// when **either** `max_records` records **or** `max_bytes` bytes have
+    /// when **either** `maxRecords` records **or** `maxBytes` bytes have
     /// accumulated since the last sync (whichever comes first), and
     /// unconditionally at `commit()`. This trades per-record durability for
     /// ingest throughput — a crash can lose the most recent unsynced batch of
@@ -94,13 +92,13 @@ impl PhpWalSyncPolicy {
     ///
     /// # Arguments
     ///
-    /// * `max_records` - Flush after this many records accumulate since the
+    /// * `maxRecords` - Flush after this many records accumulate since the
     ///   last sync. Defaults to laurus' built-in
     ///   [`DEFAULT_GROUP_MAX_RECORDS`] (1024) when null.
-    /// * `max_bytes` - Flush after this many appended bytes accumulate since
+    /// * `maxBytes` - Flush after this many appended bytes accumulate since
     ///   the last sync. Defaults to laurus' built-in
     ///   [`DEFAULT_GROUP_MAX_BYTES`] (1 MiB) when null.
-    /// * `max_interval_ms` - Optional periodic flush interval in milliseconds.
+    /// * `maxIntervalMs` - Optional periodic flush interval in milliseconds.
     ///   When provided, the engine runs a background timer that forces the WAL
     ///   durable at least this often so a trailing partial batch under a low
     ///   ingest rate is not left unsynced indefinitely. Null disables the
@@ -114,23 +112,23 @@ impl PhpWalSyncPolicy {
     ///
     /// Throws `\ValueError` if an argument is negative (Issue #1609).
     pub fn group(
-        max_records: Option<i64>,
-        max_bytes: Option<i64>,
-        max_interval_ms: Option<i64>,
+        maxRecords: Option<i64>,
+        maxBytes: Option<i64>,
+        maxIntervalMs: Option<i64>,
     ) -> PhpResult<Self> {
         const CONTEXT: &str = "WalSyncPolicy::group";
         Ok(Self {
             inner: WalSyncPolicy::Group {
-                max_records: max_records
-                    .map(|v| unsigned_param(CONTEXT, "max_records", v))
+                max_records: maxRecords
+                    .map(|v| unsigned_param(CONTEXT, "maxRecords", v))
                     .transpose()?
                     .unwrap_or(DEFAULT_GROUP_MAX_RECORDS),
-                max_bytes: max_bytes
-                    .map(|v| unsigned_param(CONTEXT, "max_bytes", v))
+                max_bytes: maxBytes
+                    .map(|v| unsigned_param(CONTEXT, "maxBytes", v))
                     .transpose()?
                     .unwrap_or(DEFAULT_GROUP_MAX_BYTES),
-                max_interval: max_interval_ms
-                    .map(|v| unsigned_param(CONTEXT, "max_interval_ms", v))
+                max_interval: maxIntervalMs
+                    .map(|v| unsigned_param(CONTEXT, "maxIntervalMs", v))
                     .transpose()?
                     .map(std::time::Duration::from_millis),
             },
@@ -146,7 +144,7 @@ impl PhpWalSyncPolicy {
                 max_bytes,
                 max_interval,
             } => format!(
-                "WalSyncPolicy.group(max_records={}, max_bytes={}, max_interval_ms={})",
+                "WalSyncPolicy.group(maxRecords={}, maxBytes={}, maxIntervalMs={})",
                 max_records,
                 max_bytes,
                 match max_interval {
@@ -194,7 +192,7 @@ impl PhpCommitPolicy {
     /// Create a manual (no auto-commit) policy.
     ///
     /// The engine commits only when `commit()` is called explicitly. This is
-    /// the engine default when no `commit_policy` is supplied to
+    /// the engine default when no `commitPolicy` is supplied to
     /// [`PhpIndex::__construct`].
     ///
     /// # Returns
@@ -328,11 +326,11 @@ impl PhpIndex {
     ///   *creating* a new index; must be omitted when reopening an existing
     ///   one. If omitted for both an in-memory index and a brand-new
     ///   file-backed one, an empty schema is used.
-    /// * `wal_sync_policy` - Optional [`PhpWalSyncPolicy`] controlling when the
+    /// * `walSyncPolicy` - Optional [`PhpWalSyncPolicy`] controlling when the
     ///   write-ahead log is forced durable. Defaults to per-record durability
     ///   ([`WalSyncPolicy::PerRecord`]) when null. Use
     ///   [`PhpWalSyncPolicy::group`] for higher-throughput group commit.
-    /// * `commit_policy` - Optional [`PhpCommitPolicy`] controlling automatic
+    /// * `commitPolicy` - Optional [`PhpCommitPolicy`] controlling automatic
     ///   commits during ingestion. Defaults to manual (caller-driven commits)
     ///   when null. Use [`PhpCommitPolicy::every_docs`] to auto-commit every
     ///   `n` documents.
@@ -354,8 +352,8 @@ impl PhpIndex {
     pub fn __construct(
         path: Option<String>,
         schema: Option<&PhpSchema>,
-        wal_sync_policy: Option<&PhpWalSyncPolicy>,
-        commit_policy: Option<&PhpCommitPolicy>,
+        walSyncPolicy: Option<&PhpWalSyncPolicy>,
+        commitPolicy: Option<&PhpCommitPolicy>,
     ) -> PhpResult<Self> {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| ext_php_rs::exception::PhpException::from_message(e.to_string()))?;
@@ -366,10 +364,10 @@ impl PhpIndex {
         let (schema_val, storage, claim) = resolve_storage_and_schema(path.as_deref(), schema_val)?;
 
         let mut builder = Engine::builder(storage, schema_val);
-        if let Some(policy) = wal_sync_policy {
+        if let Some(policy) = walSyncPolicy {
             builder = builder.wal_sync_policy(policy.inner);
         }
-        if let Some(policy) = commit_policy {
+        if let Some(policy) = commitPolicy {
             builder = builder.commit_policy(policy.inner);
         }
 

@@ -3,13 +3,8 @@
 //! Each PHP query class stores the data needed to construct the Rust query.
 //! Vector query classes produce [`VectorSearchQuery`] instead.
 //!
-//! `FuzzyQuery::__construct`'s `maxEdits` parameter is camelCase (not
-//! Rust-idiomatic snake_case) because `#[php_impl]` exposes a parameter's
-//! literal Rust identifier as its PHP named-argument name, and the rest of
-//! this binding's public surface is camelCase (Issue #1384). The lint is
-//! allowed for the whole module because the macro binds each argument by
-//! that identifier in code it generates outside the `impl` block, where a
-//! function-level `#[allow]` does not reach.
+//! Multi-word parameters are camelCase (`$maxEdits`, `$distanceM`), as
+//! everywhere in this binding; see "Parameter names" in the crate docs.
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;
@@ -441,7 +436,7 @@ fn integer_bound_repr(bound: Option<f64>) -> String {
 
 /// Numeric range filter query (`Laurus\NumericRangeQuery`).
 ///
-/// Use `numeric_type` parameter to specify "integer" or "float".
+/// Use `numericType` parameter to specify "integer" or "float".
 #[php_class]
 #[php(name = "Laurus\\NumericRangeQuery")]
 pub struct PhpNumericRangeQuery {
@@ -459,7 +454,7 @@ impl PhpNumericRangeQuery {
     /// * `min` - Lower bound, an `int` or a `float` for either numeric type
     ///   (pass null for unbounded). An integer range truncates a `float`.
     /// * `max` - Upper bound, as `min`.
-    /// * `numeric_type` - "integer" or "float" (default: "integer").
+    /// * `numericType` - "integer" or "float" (default: "integer").
     ///
     /// A `NAN` bound is rejected with `ValueError` when the query is
     /// searched (Issue #1601).
@@ -472,9 +467,9 @@ impl PhpNumericRangeQuery {
         field: String,
         min: &Zval,
         max: &Zval,
-        numeric_type: Option<String>,
+        numericType: Option<String>,
     ) -> PhpResult<Self> {
-        let nt = numeric_type.unwrap_or_else(|| "integer".to_string());
+        let nt = numericType.unwrap_or_else(|| "integer".to_string());
         let (min, max) = (numeric_bound("min", min)?, numeric_bound("max", max)?);
         let kind = if nt == "float" {
             NumericKind::Float(min, max)
@@ -617,20 +612,20 @@ impl PhpGeoDistanceQuery {
     /// * `field` - Geo field name.
     /// * `lat` - Center latitude.
     /// * `lon` - Center longitude.
-    /// * `distance_m` - Maximum distance from the centre in meters.
-    pub fn within_radius(field: String, lat: f64, lon: f64, distance_m: f64) -> Self {
+    /// * `distanceM` - Maximum distance from the centre in meters.
+    pub fn within_radius(field: String, lat: f64, lon: f64, distanceM: f64) -> Self {
         Self {
             field,
             lat,
             lon,
-            distance_m,
+            distance_m: distanceM,
         }
     }
 
     /// Return a string representation.
     pub fn __to_string(&self) -> String {
         format!(
-            "GeoDistanceQuery.within_radius(field='{}', lat={}, lon={}, distance_m={})",
+            "GeoDistanceQuery.withinRadius(field='{}', lat={}, lon={}, distanceM={})",
             self.field, self.lat, self.lon, self.distance_m
         )
     }
@@ -670,30 +665,30 @@ impl PhpGeoBoundingBoxQuery {
     /// # Arguments
     ///
     /// * `field` - Geo field name.
-    /// * `min_lat` - Southern boundary.
-    /// * `min_lon` - Western boundary.
-    /// * `max_lat` - Northern boundary.
-    /// * `max_lon` - Eastern boundary.
+    /// * `minLat` - Southern boundary.
+    /// * `minLon` - Western boundary.
+    /// * `maxLat` - Northern boundary.
+    /// * `maxLon` - Eastern boundary.
     pub fn within_bounding_box(
         field: String,
-        min_lat: f64,
-        min_lon: f64,
-        max_lat: f64,
-        max_lon: f64,
+        minLat: f64,
+        minLon: f64,
+        maxLat: f64,
+        maxLon: f64,
     ) -> Self {
         Self {
             field,
-            min_lat,
-            min_lon,
-            max_lat,
-            max_lon,
+            min_lat: minLat,
+            min_lon: minLon,
+            max_lat: maxLat,
+            max_lon: maxLon,
         }
     }
 
     /// Return a string representation.
     pub fn __to_string(&self) -> String {
         format!(
-            "GeoBoundingBoxQuery.within_bounding_box(field='{}', min_lat={}, min_lon={}, max_lat={}, max_lon={})",
+            "GeoBoundingBoxQuery.withinBoundingBox(field='{}', minLat={}, minLon={}, maxLat={}, maxLon={})",
             self.field, self.min_lat, self.min_lon, self.max_lat, self.max_lon
         )
     }
@@ -718,7 +713,7 @@ impl PhpGeoBoundingBoxQuery {
 
 /// 3D ECEF sphere query (`Laurus\Geo3dDistanceQuery`).
 ///
-/// Returns documents whose 3D ECEF point lies within `distance_m` meters of the
+/// Returns documents whose 3D ECEF point lies within `distanceM` meters of the
 /// query centre. Construct via the `withinSphere` static factory.
 #[php_class]
 #[php(name = "Laurus\\Geo3dDistanceQuery")]
@@ -740,22 +735,22 @@ impl PhpGeo3dDistanceQuery {
     /// * `x` - Centre ECEF X coordinate (meters).
     /// * `y` - Centre ECEF Y coordinate (meters).
     /// * `z` - Centre ECEF Z coordinate (meters).
-    /// * `distance_m` - Maximum distance from the centre in meters
+    /// * `distanceM` - Maximum distance from the centre in meters
     ///   (i.e. the search sphere's radius).
-    pub fn within_sphere(field: String, x: f64, y: f64, z: f64, distance_m: f64) -> Self {
+    pub fn within_sphere(field: String, x: f64, y: f64, z: f64, distanceM: f64) -> Self {
         Self {
             field,
             x,
             y,
             z,
-            distance_m,
+            distance_m: distanceM,
         }
     }
 
     /// Return a string representation.
     pub fn __to_string(&self) -> String {
         format!(
-            "Geo3dDistanceQuery(field='{}', x={}, y={}, z={}, distance_m={})",
+            "Geo3dDistanceQuery(field='{}', x={}, y={}, z={}, distanceM={})",
             self.field, self.x, self.y, self.z, self.distance_m
         )
     }
@@ -779,7 +774,7 @@ impl PhpGeo3dDistanceQuery {
 /// 3D ECEF axis-aligned bounding box query (`Laurus\Geo3dBoundingBoxQuery`).
 ///
 /// Returns documents whose 3D ECEF point lies inside the AABB defined by
-/// `[min_x, max_x] x [min_y, max_y] x [min_z, max_z]`. Construct via the
+/// `[minX, maxX] x [minY, maxY] x [minZ, maxZ]`. Construct via the
 /// `withinBox` static factory.
 #[php_class]
 #[php(name = "Laurus\\Geo3dBoundingBoxQuery")]
@@ -800,30 +795,30 @@ impl PhpGeo3dBoundingBoxQuery {
     /// # Arguments
     ///
     /// * `field` - Geo3d field name.
-    /// * `min_x` - Minimum ECEF X (meters).
-    /// * `min_y` - Minimum ECEF Y (meters).
-    /// * `min_z` - Minimum ECEF Z (meters).
-    /// * `max_x` - Maximum ECEF X (meters).
-    /// * `max_y` - Maximum ECEF Y (meters).
-    /// * `max_z` - Maximum ECEF Z (meters).
+    /// * `minX` - Minimum ECEF X (meters).
+    /// * `minY` - Minimum ECEF Y (meters).
+    /// * `minZ` - Minimum ECEF Z (meters).
+    /// * `maxX` - Maximum ECEF X (meters).
+    /// * `maxY` - Maximum ECEF Y (meters).
+    /// * `maxZ` - Maximum ECEF Z (meters).
     #[allow(clippy::too_many_arguments)]
     pub fn within_box(
         field: String,
-        min_x: f64,
-        min_y: f64,
-        min_z: f64,
-        max_x: f64,
-        max_y: f64,
-        max_z: f64,
+        minX: f64,
+        minY: f64,
+        minZ: f64,
+        maxX: f64,
+        maxY: f64,
+        maxZ: f64,
     ) -> Self {
         Self {
             field,
-            min_x,
-            min_y,
-            min_z,
-            max_x,
-            max_y,
-            max_z,
+            min_x: minX,
+            min_y: minY,
+            min_z: minZ,
+            max_x: maxX,
+            max_y: maxY,
+            max_z: maxZ,
         }
     }
 
@@ -878,9 +873,9 @@ impl PhpGeo3dNearestQuery {
     /// * `y` - Centre ECEF Y coordinate (meters).
     /// * `z` - Centre ECEF Z coordinate (meters).
     /// * `k` - Number of nearest neighbours to return.
-    /// * `initial_radius_m` - Starting radius for the expanding-radius search
+    /// * `initialRadiusM` - Starting radius for the expanding-radius search
     ///   in meters (optional, default 1000.0).
-    /// * `max_radius_m` - Hard cap on the search radius in meters (optional,
+    /// * `maxRadiusM` - Hard cap on the search radius in meters (optional,
     ///   default 1e10).
     ///
     /// # Errors
@@ -893,8 +888,8 @@ impl PhpGeo3dNearestQuery {
         y: f64,
         z: f64,
         k: i64,
-        initial_radius_m: Option<f64>,
-        max_radius_m: Option<f64>,
+        initialRadiusM: Option<f64>,
+        maxRadiusM: Option<f64>,
     ) -> PhpResult<Self> {
         Ok(Self {
             field,
@@ -902,8 +897,8 @@ impl PhpGeo3dNearestQuery {
             y,
             z,
             k: u32_param("Geo3dNearestQuery::kNearest", "k", k)?,
-            initial_radius_m,
-            max_radius_m,
+            initial_radius_m: initialRadiusM,
+            max_radius_m: maxRadiusM,
         })
     }
 

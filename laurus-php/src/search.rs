@@ -1,13 +1,7 @@
 //! PHP wrappers for search request/result and fusion algorithm types.
 //!
-//! The multi-word parameters of `SearchRequest::__construct` (Issue #1379),
-//! `WeightedSum::__construct` and `LateInteractionRescore::__construct`
-//! (Issue #1384) are camelCase (not Rust-idiomatic snake_case) because
-//! `#[php_impl]` exposes a parameter's literal Rust identifier as its PHP
-//! named-argument name, and the rest of this binding's public surface is
-//! camelCase. The lint is allowed for the whole module because the macro
-//! binds each argument by that identifier in code it generates outside the
-//! `impl` block, where a function-level `#[allow]` does not reach.
+//! Multi-word parameters are camelCase (`$lexicalQuery`, `$windowSize`), as
+//! everywhere in this binding; see "Parameter names" in the crate docs.
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
