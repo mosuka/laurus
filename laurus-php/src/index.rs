@@ -22,8 +22,8 @@ use crate::convert::{document_to_hashtable, hashtable_to_document, unsigned_para
 use crate::errors::{closed_err, index_dir_err, laurus_err, with_context};
 use crate::schema::PhpSchema;
 use crate::search::{
-    PhpSearchResult, build_request_from_php, parse_group_by_option, parse_highlight_option,
-    parse_rescore_option, to_php_search_result,
+    PhpSearchResponse, build_request_from_php, parse_group_by_option, parse_highlight_option,
+    parse_rescore_option, parse_track_total_hits_option, to_php_search_response,
 };
 
 // ---------------------------------------------------------------------------
@@ -291,8 +291,8 @@ impl PhpCommitPolicy {
 /// # Searching
 ///
 /// ```php
-/// $results = $index->search("title:hello", 10);
-/// $results = $index->search(new \Laurus\TermQuery("body", "rust"), 5);
+/// $results = $index->search("title:hello", 10)->getResults();
+/// $results = $index->search(new \Laurus\TermQuery("body", "rust"), 5)->getResults();
 /// ```
 #[php_class]
 #[php(name = "Laurus\\Index")]
@@ -560,7 +560,8 @@ impl PhpIndex {
 
     // ── Search ────────────────────────────────────────────────────────────
 
-    /// Search the index and return an array of `SearchResult` objects.
+    /// Search the index and return a `SearchResponse` with the page of
+    /// `SearchResult` objects and, when asked for, the total hit count.
     ///
     /// `$query` may be:
     ///   - A **DSL string** (e.g. `"title:hello"`)
@@ -581,19 +582,30 @@ impl PhpIndex {
     ///   MaxSim against a multi-vector field (Issue #1351).
     /// * `groupBy` - `GroupBy` grouping the results by a field's value
     ///   (Issue #1297); `$limit` and `$offset` then count groups.
+    /// * `trackTotalHits` - How many matches to count for the response's
+    ///   `getTotalHits()` (Issue #1472): an int from 0 up counts exactly up
+    ///   to it, `true` counts every match, and `false` or `null` (the
+    ///   default) counts nothing. Counting has a cost, and what a total
+    ///   means for vector, hybrid and grouped searches is the engine's
+    ///   (`laurus/engine.md`, "Total hits").
     ///
     /// When `$query` is a `SearchRequest`, the other arguments are ignored
     /// in favor of the request's own values, though they are still checked.
     ///
     /// # Returns
     ///
-    /// An array of `SearchResult` objects.
+    /// A `SearchResponse`: `getResults()` is an array of `SearchResult`
+    /// objects, and `getTotalHits()` is a `TotalHits` when `$trackTotalHits`
+    /// asked for one, null otherwise.
     ///
     /// # Errors
     ///
-    /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
-    /// #1609).
+    /// Throws `\ValueError` if `limit`, `offset` or `trackTotalHits` is
+    /// negative (Issue #1609), `\TypeError` if `trackTotalHits` is not
+    /// `null`, a bool or an int, and `\ValueError` from the engine for a
+    /// `trackTotalHits` of 0 (Issue #1472).
     #[php(defaults(limit = 10, offset = 0))]
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
         query: &Zval,
@@ -602,12 +614,14 @@ impl PhpIndex {
         highlight: Option<&ZendHashTable>,
         rescore: Option<&Zval>,
         groupBy: Option<&Zval>,
-    ) -> PhpResult<Vec<PhpSearchResult>> {
+        trackTotalHits: Option<&Zval>,
+    ) -> PhpResult<PhpSearchResponse> {
         let limit = unsigned_param("Index::search", "limit", limit)?;
         let offset = unsigned_param("Index::search", "offset", offset)?;
         let highlight = parse_highlight_option(highlight)?;
         let rescore = parse_rescore_option(rescore)?;
         let group_by = parse_group_by_option(groupBy)?;
+        let track_total_hits = parse_track_total_hits_option("Index::search", trackTotalHits)?;
         let request = build_request_from_php(
             query,
             limit,
@@ -615,16 +629,16 @@ impl PhpIndex {
             highlight.as_ref(),
             rescore.as_ref(),
             group_by.as_ref(),
+            track_total_hits,
         )?;
 
         let engine = self.engine()?;
-        let results = self
+        let response = self
             .rt
             .block_on(engine.search(request))
-            .map_err(laurus_err)?
-            .results;
+            .map_err(laurus_err)?;
 
-        Ok(results.into_iter().map(to_php_search_result).collect())
+        Ok(to_php_search_response(response))
     }
 
     /// Execute multiple independent searches in one call.
@@ -646,17 +660,22 @@ impl PhpIndex {
     ///   `search`'s `$highlight` (Issue #1134).
     /// * `groupBy` - `GroupBy` applied identically to every query in the
     ///   batch (Issue #1297). A `SearchRequest` element uses its own.
+    /// * `trackTotalHits` - How many matches to count for each query's
+    ///   `getTotalHits()`, applied identically to every query in the batch
+    ///   and read as `search`'s (Issue #1472). A `SearchRequest` element
+    ///   uses its own.
     ///
     /// # Returns
     ///
-    /// An array of arrays: `results[i]` is the result array for
-    /// `queries[i]`. Empty input returns an empty array without
-    /// invoking the engine.
+    /// An array of `SearchResponse` objects: `responses[i]` is the response
+    /// for `queries[i]`, with its own `getTotalHits()`. Empty input returns
+    /// an empty array without invoking the engine.
     ///
     /// # Errors
     ///
-    /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
-    /// #1609), even when `queries` is empty.
+    /// Throws `\ValueError` if `limit`, `offset` or `trackTotalHits` is
+    /// negative (Issue #1609), and `\TypeError` if `trackTotalHits` is not
+    /// `null`, a bool or an int (Issue #1472), even when `queries` is empty.
     ///
     /// Throws the exception `search` throws for a query that cannot be
     /// converted or that the engine rejects, its message starting with
@@ -673,11 +692,13 @@ impl PhpIndex {
         offset: i64,
         highlight: Option<&ZendHashTable>,
         groupBy: Option<&Zval>,
-    ) -> PhpResult<Vec<Vec<PhpSearchResult>>> {
+        trackTotalHits: Option<&Zval>,
+    ) -> PhpResult<Vec<PhpSearchResponse>> {
         let limit = unsigned_param("Index::searchBatch", "limit", limit)?;
         let offset = unsigned_param("Index::searchBatch", "offset", offset)?;
         let highlight = parse_highlight_option(highlight)?;
         let group_by = parse_group_by_option(groupBy)?;
+        let track_total_hits = parse_track_total_hits_option("Index::searchBatch", trackTotalHits)?;
         let arr = queries.array().ok_or_else(|| {
             PhpException::from(
                 "search_batch: expected an array of queries (DSL string, Query object, or SearchRequest)".to_string(),
@@ -700,6 +721,7 @@ impl PhpIndex {
                 highlight.as_ref(),
                 None,
                 group_by.as_ref(),
+                track_total_hits,
             )
             .map_err(|e| with_context(e, &format!("queries[{index}]")))?;
             requests.push(request);
@@ -713,13 +735,7 @@ impl PhpIndex {
 
         Ok(batch_results
             .into_iter()
-            .map(|per_query_results| {
-                per_query_results
-                    .results
-                    .into_iter()
-                    .map(to_php_search_result)
-                    .collect()
-            })
+            .map(to_php_search_response)
             .collect())
     }
 

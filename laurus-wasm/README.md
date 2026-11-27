@@ -50,7 +50,7 @@ await index.putDocument("doc2", {
 await index.commit();
 
 // Search with DSL string
-const results = await index.search("programming", 5);
+const { results } = await index.search("programming", 5);
 for (const r of results) {
   console.log(r.id, r.score, r.document.title);
 }
@@ -74,13 +74,13 @@ await index.deleteDocuments("id");
 await index.commit();                                  // flush + persist to OPFS
 
 // Search
-const results = await index.search("query DSL", limit, offset);
-const results = await index.searchTerm("field", "term", limit);
-const results = await index.searchVector("field", [0.1, ...], limit);
-const results = await index.searchVectorText("field", "text", limit);
+const { results } = await index.search("query DSL", limit, offset);
+const { results } = await index.searchTerm("field", "term", limit);
+const { results } = await index.searchVector("field", [0.1, ...], limit);
+const { results } = await index.searchVectorText("field", "text", limit);
 
 // Late-interaction rescore of the top results (also on searchVector / searchVectorText)
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",            // a multi-vector field
   vectors: [[0.1, ...], ...], // or text: "query" with a token_callback embedder
   windowSize: 100,            // optional (default 100)

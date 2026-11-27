@@ -96,7 +96,7 @@ await index.commit();
 
 // 事前計算済みクエリ埋め込みで検索
 const queryVec = await embed("安全なシステムプログラミング");
-const results = await index.searchVector("embedding", queryVec);
+const { results } = await index.searchVector("embedding", queryVec);
 ```
 
 このアプローチにより、ネイティブ環境と同じ Sentence Transformer モデルを使った
@@ -127,7 +127,7 @@ const index = await Index.create(schema);
 await index.putDocument("doc1", { title: "Rust 入門" });
 await index.commit();
 
-const results = await index.searchVectorText("embedding", "安全なシステムプログラミング");
+const { results } = await index.searchVectorText("embedding", "安全なシステムプログラミング");
 ```
 
 Option A と比べると、Callback アプローチではエンジンがインジェスト時に埋め込みを
@@ -166,7 +166,7 @@ await index.putDocument("doc1", { body, body_colbert: body });
 await index.commit();
 
 // lexical 検索の上位を再採点する。クエリのテキストはコールバックが role "query" で埋め込む。
-const results = await index.search("body:rust", 10, 0, undefined, {
+const { results } = await index.search("body:rust", 10, 0, undefined, {
   field: "body_colbert",
   text: "how do lifetimes work",
 });

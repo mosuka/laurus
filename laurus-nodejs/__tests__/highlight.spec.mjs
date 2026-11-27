@@ -33,7 +33,7 @@ async function createTextIndex() {
 describe("highlighting", () => {
   it("returns fragments for the requested field", async () => {
     const index = await createTextIndex();
-    const results = await index.search("body:rust", 10, 0, {
+    const { results } = await index.search("body:rust", 10, 0, {
       fields: ["body"],
     });
 
@@ -45,7 +45,7 @@ describe("highlighting", () => {
 
   it("leaves highlights empty when not requested", async () => {
     const index = await createTextIndex();
-    const results = await index.search("body:rust", 10, 0);
+    const { results } = await index.search("body:rust", 10, 0);
 
     expect(results.length).toBe(1);
     expect(results[0].highlights).toEqual({});
@@ -53,7 +53,7 @@ describe("highlighting", () => {
 
   it("omits an unrequested field from highlights", async () => {
     const index = await createTextIndex();
-    const results = await index.search("body:rust", 10, 0, {
+    const { results } = await index.search("body:rust", 10, 0, {
       fields: ["body"],
     });
 
@@ -62,7 +62,7 @@ describe("highlighting", () => {
 
   it("applies a custom tag via HighlightOptions", async () => {
     const index = await createTextIndex();
-    const results = await index.searchTerm("body", "rust", 10, 0, {
+    const { results } = await index.searchTerm("body", "rust", 10, 0, {
       fields: ["body"],
       tag: "em",
     });
@@ -82,7 +82,7 @@ describe("highlighting", () => {
     );
 
     expect(batch.length).toBe(2);
-    for (const results of batch) {
+    for (const { results } of batch) {
       expect(results.length).toBe(1);
       expect(results[0].highlights.body[0]).toContain("<mark>");
     }
@@ -99,6 +99,6 @@ describe("highlighting", () => {
     });
     const viaRequest = await index.searchWithRequest(request);
 
-    expect(viaKwarg[0].highlights).toEqual(viaRequest[0].highlights);
+    expect(viaKwarg.results[0].highlights).toEqual(viaRequest.results[0].highlights);
   });
 });

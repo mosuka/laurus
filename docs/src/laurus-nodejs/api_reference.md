@@ -49,16 +49,19 @@ class Index {
 | `deleteDocuments(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush writes and make pending changes searchable. |
 | `flushWal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, limit?, offset?, highlight?, rescore?, groupBy?)` | Search with a DSL string. `rescore` reorders the top results by late interaction; see [Late-interaction rescore](#late-interaction-rescore). `groupBy` groups the results by a field's value; see [Result grouping](#result-grouping). |
+| `search(query, limit?, offset?, highlight?, rescore?, groupBy?, trackTotalHits?)` | Search with a DSL string. `trackTotalHits` asks for the total hit count; see [Total hits](#total-hits). `rescore` reorders the top results by late interaction; see [Late-interaction rescore](#late-interaction-rescore). `groupBy` groups the results by a field's value; see [Result grouping](#result-grouping). |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | Search with an exact term match. |
 | `searchVector(field, vector, limit?, offset?)` | Search with a pre-computed vector, whose components must be finite (see [VectorQuery](#vectorquery)). |
 | `searchVectorText(field, text, limit?, offset?)` | Search with text (auto-embedded). |
-| `searchWithRequest(request)` | Search with a `SearchRequest`. |
-| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | Execute multiple DSL string queries in parallel. `results[i]` corresponds to `queries[i]`. Returns `Promise<Array<Array<JsSearchResult>>>`. Empty input returns `[]`. `highlight` and `groupBy` apply identically to every query. For an element that is not a string, the promise rejects with code `StringExpected` and a message naming its position (`queries[1]: expected a DSL string, got a number`); for a query the engine rejects, with the error `search` gives that query, its message starting with the query's position (`queries[1]: ...`) (Issue #1627). |
+| `searchWithRequest(request)` | Search with a `SearchRequest`, whose `trackTotalHits` asks for the total hit count. |
+| `searchBatch(queries, limit?, offset?, highlight?, groupBy?, trackTotalHits?)` | Execute multiple DSL string queries in parallel. Returns `Promise<SearchResponse[]>`: `responses[i]` is the response of `queries[i]`, with its own `totalHits`. Empty input returns `[]`. `highlight`, `groupBy` and `trackTotalHits` apply identically to every query. For an element that is not a string, the promise rejects with code `StringExpected` and a message naming its position (`queries[1]: expected a DSL string, got a number`); for a query the engine rejects, with the error `search` gives that query, its message starting with the query's position (`queries[1]: ...`) (Issue #1627). |
 | `stats()` | Return index statistics (`documentCount`, `vectorFields`). |
 
 All document methods and search methods are async
-and return Promises. `stats()` is synchronous.
+and return Promises. `stats()` is synchronous. Every search method resolves
+to a [`SearchResponse`](#searchresponse), whose `results` holds the page of
+results (Issue #1472); only `search`, `searchWithRequest` and `searchBatch`
+can ask for its `totalHits`.
 
 `stats()` returns an object shaped like:
 
@@ -598,6 +601,7 @@ interface SearchRequestOptions {
   highlight?: HighlightOptions;
   rescore?: RescoreOptions;
   groupBy?: GroupByOptions;
+  trackTotalHits?: number | boolean | null; // see Total hits
 }
 
 class SearchRequest {
@@ -608,9 +612,10 @@ class SearchRequest {
 Construct with primitive options first; attach polymorphic clauses with
 the per-type setters below. As with `BooleanQuery`, the binding exposes
 per-type setters because of `napi-derive`'s limitation on `Either<&T, ...>`
-arguments. `highlight`, `rescore` and `groupBy` are plain data (not
-class-instance unions), so they live directly on `SearchRequestOptions` rather
-than behind a setter.
+arguments. `highlight`, `rescore`, `groupBy` and `trackTotalHits` are plain
+data (not class-instance unions), so they live directly on
+`SearchRequestOptions` rather than behind a setter. The constructor checks
+`trackTotalHits` as it checks `limit`.
 
 ### DSL and fusion setters
 
@@ -648,7 +653,7 @@ const req = new SearchRequest({ limit: 5 });
 req.setLexicalTerm(new TermQuery("title", "rust"));
 req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
 req.setRrfFusion(new RRF(60.0));
-const results = await index.searchWithRequest(req);
+const { results } = await index.searchWithRequest(req);
 ```
 
 ### Highlighting
@@ -669,7 +674,7 @@ interface HighlightOptions {
 Only `fields` is required. Highlighting follows the query passed to the same call, and only `stored: true` text fields can be highlighted — a field that isn't stored, isn't a text field, or had no match is simply absent from the result's `highlights` object.
 
 ```javascript
-const results = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
+const { results } = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language."] }
 ```
 
@@ -723,7 +728,7 @@ stage, including a hybrid one.
 
 ```javascript
 // A DSL search, rescored with the query's token vectors.
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",
   vectors: [[1, 0], [0, 1]],
 });
@@ -737,7 +742,7 @@ const req = new SearchRequest({
 req.setLexicalTerm(new TermQuery("body", "lifetimes"));
 req.setVectorQuery(new VectorQuery("body_vec", queryEmbedding));
 req.setRrfFusion(new RRF(60.0));
-const reranked = await index.searchWithRequest(req);
+const reranked = (await index.searchWithRequest(req)).results;
 ```
 
 ### Result grouping
@@ -787,7 +792,7 @@ await index.addDocument("manual", { body: "Elided lifetimes follow three rules."
 await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
 await index.commit();
 
-const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+const { results } = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
   field: "_id",
   groupSize: 2,
 });
@@ -800,14 +805,59 @@ for (const r of results) {
 // The same grouping through a SearchRequest.
 const req = new SearchRequest({ limit: 10, groupBy: { field: "_id", groupSize: 2 } });
 req.setLexicalTerm(new TermQuery("body", "lifetimes"));
-const grouped = await index.searchWithRequest(req);
+const grouped = (await index.searchWithRequest(req)).results;
 ```
+
+### Total hits
+
+`search`'s `trackTotalHits`, `searchBatch`'s and `SearchRequestOptions.trackTotalHits` (Issue #1472) ask for the number of matching documents in the response's `totalHits`, as the HTTP gateway's `"track_total_hits"` does:
+
+| Value | Counts |
+| :--- | :--- |
+| `false`, `null` or `undefined` (the default) | Nothing: the response has no `totalHits`. |
+| An integer from 1 to 4294967295 | Exactly while fewer match. Once the count reaches it, `totalHits.value` is that number with the relation `"gte"`. |
+| `true` | Every match. |
+
+Counting has a cost: until the count reaches the threshold, a search cannot skip the documents block-max pruning would skip. What a total counts for vector, hybrid and grouped searches is the engine's; see [Total hits](../laurus/engine.md#total-hits). `0` rejects with the engine's error (`track_total_hits must count at least 1 match, got UpTo(0)`), and any other value with an `InvalidArg` error naming the parameter (`Index.search: trackTotalHits must be true, false or an integer from 0 to 4294967295, got "1000"`), as for the [integer arguments](#integer-arguments). `NaN` and the infinities, which napi-rs cannot convert, throw `Failed to convert js number to serde_json::Number` as the call is made.
+
+Over five documents that match `body:rust`:
+
+```javascript
+let response = await index.search("body:rust", 2, 0, null, null, null, 3);
+console.log(response.results.length); // 2
+console.log(response.totalHits);      // { value: 3, relation: 'gte' }
+
+response = await index.search("body:rust", 2, 0, null, null, null, true);
+console.log(response.totalHits);      // { value: 5, relation: 'eq' }
+
+console.log((await index.search("body:rust", 2)).totalHits); // undefined
+```
+
+---
+
+## SearchResponse
+
+What every search method resolves to, and each element of `searchBatch`'s array (Issue #1472). The TypeScript declarations name it `JsSearchResponse`, and `TotalHits` `JsTotalHits`, as they name `SearchResult` `JsSearchResult`.
+
+```typescript
+interface SearchResponse {
+  results: SearchResult[]; // The page of results
+  totalHits?: TotalHits;   // With trackTotalHits, the total hit count
+}
+
+interface TotalHits {
+  value: number;              // The number of matching documents counted
+  relation: "eq" | "gte";     // "eq" when value is exact, "gte" when it is a lower bound
+}
+```
+
+`totalHits` is absent unless asked for, as `groupKey` is for an ungrouped search. The relation is written as the HTTP gateway, MCP and the CLI write it. See [Total hits](#total-hits).
 
 ---
 
 ## SearchResult
 
-Returned by search methods as an array.
+One result of a search, an element of `SearchResponse.results`.
 
 ```typescript
 interface SearchResult {

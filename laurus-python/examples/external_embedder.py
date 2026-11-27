@@ -116,7 +116,7 @@ def main() -> None:
     print("[A] Vector-only: 'database ORM queries'")
     print("=" * 60)
     _print_results(
-        index.search(laurus.VectorQuery("text_vec", embed("database ORM queries")), limit=3)
+        index.search(laurus.VectorQuery("text_vec", embed("database ORM queries")), limit=3).results
     )
 
     # =====================================================================
@@ -130,7 +130,7 @@ def main() -> None:
         filter_query=laurus.TermQuery("category", "testing"),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [C] Hybrid search — RRF Fusion
@@ -144,7 +144,7 @@ def main() -> None:
         fusion=laurus.RRF(k=60.0),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [D] Hybrid search — WeightedSum Fusion
@@ -158,7 +158,7 @@ def main() -> None:
         fusion=laurus.WeightedSum(lexical_weight=0.3, vector_weight=0.7),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [E] Hybrid search with filter
@@ -173,7 +173,7 @@ def main() -> None:
         fusion=laurus.RRF(k=60.0),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     print("\nExternal embedder example completed!")
 

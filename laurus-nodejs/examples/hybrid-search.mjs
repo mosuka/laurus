@@ -47,7 +47,7 @@ const rrfReq = new SearchRequest({ limit: 5 });
 rrfReq.setLexicalTerm(new TermQuery("description", "fast"));
 rrfReq.setVectorQuery(new VectorQuery("embedding", [0.85, 0.15, 0.2, 0.3]));
 rrfReq.setRrfFusion(new RRF(60.0));
-for (const r of await index.searchWithRequest(rrfReq)) {
+for (const r of (await index.searchWithRequest(rrfReq)).results) {
   console.log(`  ${r.id}  score=${r.score.toFixed(4)}  name="${r.document.name}"`);
 }
 
@@ -59,7 +59,7 @@ const wsReq = new SearchRequest({ limit: 5 });
 wsReq.setLexicalTerm(new TermQuery("description", "fast"));
 wsReq.setVectorQuery(new VectorQuery("embedding", [0.85, 0.15, 0.2, 0.3]));
 wsReq.setWeightedSumFusion(new WeightedSum(0.3, 0.7));
-for (const r of await index.searchWithRequest(wsReq)) {
+for (const r of (await index.searchWithRequest(wsReq)).results) {
   console.log(`  ${r.id}  score=${r.score.toFixed(4)}  name="${r.document.name}"`);
 }
 

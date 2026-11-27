@@ -9,7 +9,8 @@ use crate::errors::{
 };
 use crate::schema::PySchema;
 use crate::search::{
-    PyGroupBy, PyLateInteractionRescore, PySearchResult, build_request_from_py, to_py_search_result,
+    PyGroupBy, PyLateInteractionRescore, PySearchResponse, build_request_from_py,
+    to_py_search_response, track_total_hits_from_py,
 };
 use laurus::index_dir::IndexDirClaim;
 use laurus::{
@@ -278,13 +279,13 @@ impl PyCommitPolicy {
 ///
 /// ```python
 /// # DSL string
-/// results = index.search("title:hello", limit=10)
+/// results = index.search("title:hello", limit=10).results
 ///
 /// # Query object
-/// results = index.search(laurus.TermQuery("body", "rust"), limit=5)
+/// results = index.search(laurus.TermQuery("body", "rust"), limit=5).results
 ///
 /// # Pre-computed vector
-/// results = index.search(laurus.VectorQuery("embedding", vec), limit=5)
+/// results = index.search(laurus.VectorQuery("embedding", vec), limit=5).results
 ///
 /// # Hybrid via SearchRequest
 /// request = laurus.SearchRequest(
@@ -293,7 +294,7 @@ impl PyCommitPolicy {
 ///     fusion=laurus.RRF(k=60.0),
 ///     limit=3,
 /// )
-/// results = index.search(request)
+/// results = index.search(request).results
 /// ```
 #[pyclass(name = "Index")]
 pub struct PyIndex {
@@ -736,7 +737,8 @@ impl PyIndex {
 
     // ── Search ────────────────────────────────────────────────────────────
 
-    /// Search the index and return a list of [`SearchResult`] objects.
+    /// Search the index and return a [`SearchResponse`] with the page of
+    /// [`SearchResult`] objects and, when asked for, the total hit count.
     ///
     /// `query` may be:
     ///   - A **DSL string** (e.g. `"title:hello"`, `"text_vec:\"memory safety\""`)
@@ -763,11 +765,26 @@ impl PyIndex {
     ///         (Issue #1297); `limit` and `offset` then count groups.
     ///         Ignored when `query` is a `SearchRequest`, which carries its
     ///         own.
+    ///     track_total_hits: How many matches to count for the response's
+    ///         `total_hits` (Issue #1472): an `int` from 0 up counts exactly
+    ///         up to it, `True` counts every match, and `False` or `None`
+    ///         (the default) counts nothing. Counting has a cost, and what
+    ///         a total means for vector, hybrid and grouped searches is the
+    ///         engine's (`laurus/engine.md`, "Total hits"). Ignored when
+    ///         `query` is a `SearchRequest`, which carries its own.
     ///
     /// Returns:
-    ///     A list of [`SearchResult`] objects with `.id`, `.score`,
-    ///     `.document`, `.highlights`, `.group_key`, `.inner_hits`.
-    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None))]
+    ///     A [`SearchResponse`]: `.results` is a list of [`SearchResult`]
+    ///     objects with `.id`, `.score`, `.document`, `.highlights`,
+    ///     `.group_key`, `.inner_hits`, and `.total_hits` is a
+    ///     [`TotalHits`] when `track_total_hits` asked for one, `None`
+    ///     otherwise.
+    ///
+    /// Raises:
+    ///     `TypeError` or `ValueError` if `track_total_hits` is not `True`,
+    ///     `False`, `None` or an integer from 0 to `u64::MAX`, and
+    ///     `ValueError` from the engine for `track_total_hits=0`.
+    #[pyo3(signature = (query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None, track_total_hits=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
@@ -778,7 +795,8 @@ impl PyIndex {
         highlight: Option<&Bound<PyAny>>,
         rescore: Option<PyLateInteractionRescore>,
         group_by: Option<PyGroupBy>,
-    ) -> PyResult<Vec<PySearchResult>> {
+        track_total_hits: Option<&Bound<PyAny>>,
+    ) -> PyResult<PySearchResponse> {
         let request = build_request_from_py(
             py,
             query,
@@ -787,18 +805,15 @@ impl PyIndex {
             highlight,
             rescore.as_ref(),
             group_by.as_ref(),
+            track_total_hits_from_py(track_total_hits)?,
         )?;
 
         let engine = self.engine()?;
-        let results = py
+        let response = py
             .detach(|| self.rt.block_on(engine.search(request)))
-            .map_err(laurus_err)?
-            .results;
+            .map_err(laurus_err)?;
 
-        results
-            .into_iter()
-            .map(|r| to_py_search_result(py, r))
-            .collect()
+        to_py_search_response(py, response)
     }
 
     /// Execute multiple independent searches in one call.
@@ -821,20 +836,26 @@ impl PyIndex {
     ///         `search`'s `highlight` parameter (Issue #1134).
     ///     group_by: A `GroupBy` applied identically to every query in the
     ///         batch (Issue #1297). A `SearchRequest` entry uses its own.
+    ///     track_total_hits: How many matches to count for each query's
+    ///         `total_hits`, applied identically to every query in the batch
+    ///         and read as `search`'s (Issue #1472). A `SearchRequest` entry
+    ///         uses its own.
     ///
     /// Returns:
-    ///     A list of lists: `results[i]` is the result list for
-    ///     `queries[i]`. Empty input returns an empty list without
-    ///     invoking the engine.
+    ///     A list of [`SearchResponse`] objects: `responses[i]` is the
+    ///     response for `queries[i]`, with its own `total_hits`. Empty input
+    ///     returns an empty list without invoking the engine.
     ///
     /// Raises:
     ///     The exception `search()` raises for a query that cannot be
     ///     converted or that the engine rejects, its message starting with
-    ///     `queries[i]: ` for the query's position `i` (Issue #1627).
+    ///     `queries[i]: ` for the query's position `i` (Issue #1627), and
+    ///     the exception `search()` raises for `track_total_hits`.
     ///
     /// Issue [#717](https://github.com/mosuka/laurus/issues/717)
     /// Phase 3b of [#648](https://github.com/mosuka/laurus/issues/648).
-    #[pyo3(signature = (queries, *, limit=10, offset=0, highlight=None, group_by=None))]
+    #[pyo3(signature = (queries, *, limit=10, offset=0, highlight=None, group_by=None, track_total_hits=None))]
+    #[allow(clippy::too_many_arguments)]
     pub fn search_batch(
         &self,
         py: Python,
@@ -843,7 +864,9 @@ impl PyIndex {
         offset: usize,
         highlight: Option<&Bound<PyAny>>,
         group_by: Option<PyGroupBy>,
-    ) -> PyResult<Vec<Vec<PySearchResult>>> {
+        track_total_hits: Option<&Bound<PyAny>>,
+    ) -> PyResult<Vec<PySearchResponse>> {
+        let track_total_hits = track_total_hits_from_py(track_total_hits)?;
         let queries_seq = queries.try_iter().map_err(|_| {
             PyRuntimeError::new_err(
                 "search_batch: expected an iterable of queries (DSL string, Query object, or SearchRequest)",
@@ -855,9 +878,17 @@ impl PyIndex {
             let item = item?;
             // Name the query a conversion error came from, as the engine's
             // errors are (Issue #1627).
-            let request =
-                build_request_from_py(py, &item, limit, offset, highlight, None, group_by.as_ref())
-                    .map_err(|e| with_context(py, e, &format!("queries[{index}]")))?;
+            let request = build_request_from_py(
+                py,
+                &item,
+                limit,
+                offset,
+                highlight,
+                None,
+                group_by.as_ref(),
+                track_total_hits,
+            )
+            .map_err(|e| with_context(py, e, &format!("queries[{index}]")))?;
             requests.push(request);
         }
 
@@ -872,13 +903,7 @@ impl PyIndex {
 
         batch_results
             .into_iter()
-            .map(|per_query_results| {
-                per_query_results
-                    .results
-                    .into_iter()
-                    .map(|r| to_py_search_result(py, r))
-                    .collect::<PyResult<Vec<_>>>()
-            })
+            .map(|response| to_py_search_response(py, response))
             .collect()
     }
 

@@ -179,7 +179,7 @@ describe("multi-valued datetime arrays from JS (#1184)", () => {
     const docs = await index.getDocuments("doc1");
     expect(docs[0].seenAt).toEqual(["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"]);
     // Any instant matches a range query.
-    const hits = await index.search("seenAt:[2024-06-01 TO 2024-12-31]", 5);
+    const hits = (await index.search("seenAt:[2024-06-01 TO 2024-12-31]", 5)).results;
     expect(hits.map((h) => h.id)).toEqual(["doc1"]);
   });
 
@@ -236,9 +236,9 @@ describe("multi-valued boolean arrays from JS (#1180)", () => {
     const docs = await index.getDocuments("doc1");
     expect(docs[0].flags).toEqual([true, false]);
     // Any element matches a term query.
-    const trues = await index.search("flags:true", 5);
+    const trues = (await index.search("flags:true", 5)).results;
     expect(trues.map((h) => h.id)).toEqual(["doc1"]);
-    const falses = await index.search("flags:false", 5);
+    const falses = (await index.search("flags:false", 5)).results;
     expect(falses.map((h) => h.id).sort()).toEqual(["doc1", "doc2"]);
   });
 
@@ -293,9 +293,9 @@ describe("multi-valued text arrays from JS (#1175)", () => {
     const docs = await index.getDocuments("doc1");
     expect(docs[0].notes).toEqual(["hello world", "foo bar"]);
     // Any element matches a term query.
-    const hello = await index.search("notes:hello", 5);
+    const hello = (await index.search("notes:hello", 5)).results;
     expect(hello.map((h) => h.id)).toEqual(["doc1"]);
-    const bar = await index.search("notes:bar", 5);
+    const bar = (await index.search("notes:bar", 5)).results;
     expect(bar.map((h) => h.id).sort()).toEqual(["doc1", "doc2"]);
   });
 
@@ -337,13 +337,13 @@ describe("multi-valued text arrays from JS (#1175)", () => {
     const index = await indexWithTextField(true);
     await index.putDocument("doc1", { title: "t", notes: ["hello world", "foo bar"] });
     await index.commit();
-    expect((await index.search('notes:"hello world"', 5)).map((h) => h.id)).toEqual(["doc1"]);
-    expect(await index.search('notes:"world foo"', 5)).toEqual([]);
+    expect((await index.search('notes:"hello world"', 5)).results.map((h) => h.id)).toEqual(["doc1"]);
+    expect((await index.search('notes:"world foo"', 5)).results).toEqual([]);
 
     const contiguous = await indexWithTextField(true, 0);
     await contiguous.putDocument("doc1", { title: "t", notes: ["hello world", "foo bar"] });
     await contiguous.commit();
-    expect((await contiguous.search('notes:"world foo"', 5)).map((h) => h.id)).toEqual(["doc1"]);
+    expect((await contiguous.search('notes:"world foo"', 5)).results.map((h) => h.id)).toEqual(["doc1"]);
   });
 });
 

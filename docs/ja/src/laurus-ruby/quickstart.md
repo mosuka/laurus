@@ -40,10 +40,10 @@ index.commit
 
 ```ruby
 # DSL 文字列
-results = index.search("title:rust", limit: 5)
+results = index.search("title:rust", limit: 5).results
 
 # クエリオブジェクト
-results = index.search(Laurus::TermQuery.new("body", "ruby"), limit: 5)
+results = index.search(Laurus::TermQuery.new("body", "ruby"), limit: 5).results
 
 # 結果を表示
 results.each do |r|
@@ -68,7 +68,7 @@ index.put_document("doc2", { "title" => "Ruby", "embedding" => [0.9, 0.8, 0.7, 0
 index.commit
 
 query_vec = [0.1, 0.2, 0.3, 0.4]
-results = index.search(Laurus::VectorQuery.new("embedding", query_vec), limit: 3)
+results = index.search(Laurus::VectorQuery.new("embedding", query_vec), limit: 3).results
 ```
 
 ## 5. ハイブリッド検索
@@ -80,7 +80,7 @@ request = Laurus::SearchRequest.new(
   fusion: Laurus::RRF.new(k: 60.0),
   limit: 5,
 )
-results = index.search(request)
+results = index.search(request).results
 ```
 
 ## 6. Late interaction による再採点
@@ -99,7 +99,7 @@ index.put_document("doc1", { "title" => "rust", "tokens" => [[0.1, 0.0]] })
 index.put_document("doc2", { "title" => "rust language", "tokens" => [[0.9, 0.2], [0.1, 0.8]] })
 index.commit
 
-results = index.search("title:rust", rescore: Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]]))
+results = index.search("title:rust", rescore: Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]])).results
 # doc2（MaxSim 1.7）が doc1（MaxSim 0.1）より上位になる
 ```
 

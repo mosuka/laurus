@@ -132,7 +132,7 @@ $stats = $index->stats();
 
 if ($query !== "") {
     $start = microtime(true);
-    $results = $index->search($query, 10);
+    $results = $index->search($query, 10)->getResults();
     $elapsed = (microtime(true) - $start) * 1000;
 }
 

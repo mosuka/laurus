@@ -44,11 +44,11 @@ def ids(results):
 
 
 def test_dsl_search_is_reordered_by_late_interaction(index):
-    baseline = index.search("title:rust")
+    baseline = index.search("title:rust").results
     assert ids(baseline) != EXPECTED
 
     rescore = laurus.LateInteractionRescore("tokens", QUERY)
-    results = index.search("title:rust", rescore=rescore)
+    results = index.search("title:rust", rescore=rescore).results
 
     assert ids(results) == EXPECTED
     tokens = {doc_id: t for doc_id, _, _, t in CORPUS}
@@ -59,7 +59,7 @@ def test_dsl_search_is_reordered_by_late_interaction(index):
 def test_search_request_is_reordered_by_late_interaction(index):
     rescore = laurus.LateInteractionRescore("tokens", QUERY)
     request = laurus.SearchRequest(query="title:rust", rescore=rescore)
-    assert ids(index.search(request)) == EXPECTED
+    assert ids(index.search(request).results) == EXPECTED
 
     hybrid = laurus.SearchRequest(
         lexical_query=laurus.TermQuery("title", "rust"),
@@ -67,15 +67,15 @@ def test_search_request_is_reordered_by_late_interaction(index):
         fusion=laurus.RRF(),
         rescore=rescore,
     )
-    assert ids(index.search(hybrid)) == EXPECTED
+    assert ids(index.search(hybrid).results) == EXPECTED
 
 
 def test_only_the_window_is_reordered(index):
-    baseline = index.search("title:rust")
+    baseline = index.search("title:rust").results
     rescore = laurus.LateInteractionRescore("tokens", QUERY, window_size=1)
     assert rescore.window_size == 1
 
-    results = index.search("title:rust", rescore=rescore)
+    results = index.search("title:rust", rescore=rescore).results
 
     assert ids(results) == ids(baseline)
     tokens = {doc_id: t for doc_id, _, _, t in CORPUS}
@@ -136,7 +136,9 @@ def test_invalid_token_vectors_are_rejected(index, tokens, error):
 def test_integer_token_vectors_are_accepted(index):
     index.put_document("x", {"title": "rust", "tokens": [[2, 0]]})
     index.commit()
-    results = index.search("title:rust", rescore=laurus.LateInteractionRescore("tokens", QUERY))
+    results = index.search(
+        "title:rust", rescore=laurus.LateInteractionRescore("tokens", QUERY)
+    ).results
     assert results[0].id == "x"
     assert results[0].score == pytest.approx(2.0)
 

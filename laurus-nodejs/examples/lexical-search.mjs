@@ -40,13 +40,13 @@ await index.commit();
 
 // DSL search
 console.log("=== DSL: 'name:express' ===");
-for (const r of await index.search("name:express", 5)) {
+for (const r of (await index.search("name:express", 5)).results) {
   console.log(`  ${r.id}  ${r.document.name}`);
 }
 
 // Term query
 console.log("\n=== Term: description='framework' ===");
-for (const r of await index.searchTerm("description", "framework", 5)) {
+for (const r of (await index.searchTerm("description", "framework", 5)).results) {
   console.log(`  ${r.id}  ${r.document.name}`);
 }
 
@@ -54,19 +54,19 @@ for (const r of await index.searchTerm("description", "framework", 5)) {
 console.log("\n=== Phrase: description='web framework' ===");
 const phraseReq = new SearchRequest({ limit: 5 });
 phraseReq.setLexicalPhrase(new PhraseQuery("description", ["web", "framework"]));
-for (const r of await index.searchWithRequest(phraseReq)) {
+for (const r of (await index.searchWithRequest(phraseReq)).results) {
   console.log(`  ${r.id}  ${r.document.name}`);
 }
 
 // DSL wildcard
 console.log("\n=== DSL: 'name:fast*' ===");
-for (const r of await index.search("name:fast*", 5)) {
+for (const r of (await index.search("name:fast*", 5)).results) {
   console.log(`  ${r.id}  ${r.document.name}`);
 }
 
 // DSL fuzzy (tilde after the term)
 console.log("\n=== DSL: 'name:exprss~' (fuzzy) ===");
-for (const r of await index.search("name:exprss~", 5)) {
+for (const r of (await index.search("name:exprss~", 5)).results) {
   console.log(`  ${r.id}  ${r.document.name}`);
 }
 

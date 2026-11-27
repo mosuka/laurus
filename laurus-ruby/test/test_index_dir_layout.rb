@@ -37,7 +37,7 @@ class TestIndexDirLayout < Minitest::Test
       idx.close
 
       reopened = Laurus::Index.new(path: dir)
-      results = reopened.search("title:hello", limit: 5)
+      results = reopened.search("title:hello", limit: 5).results
       assert_equal 1, results.length
     end
   end
@@ -142,7 +142,7 @@ class TestIndexDirLayout < Minitest::Test
       idx = Laurus::Index.new(path: index_dir, schema: schema)
       idx.put_document("doc1", { "body" => "hello world" })
       idx.commit
-      assert_equal 1, idx.search("body:hello", limit: 5).length
+      assert_equal 1, idx.search("body:hello", limit: 5).results.length
     end
   end
 
@@ -167,7 +167,7 @@ class TestIndexDirLayout < Minitest::Test
       idx = Laurus::Index.new(path: dir, schema: schema)
       idx.put_document("doc1", { "body" => "hello world" })
       idx.commit
-      assert_equal 1, idx.search("body:hello", limit: 5).length
+      assert_equal 1, idx.search("body:hello", limit: 5).results.length
       assert File.file?(File.join(dir, "README.txt")), "unrelated file must still survive"
     end
   end

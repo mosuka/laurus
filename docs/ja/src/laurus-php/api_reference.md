@@ -33,8 +33,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | 指定 ID の全バージョンを削除します。 |
 | `commit(): void` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flushWal(): void` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | 検索クエリを実行します。`SearchResult` の配列を返します。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$groupBy` は結果をフィールドの値でグループ化し（Issue #1297）、このとき `$limit`/`$offset` はグループの数を数えます。[GroupBy](#groupby) を参照。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` を使い、他の引数は無視されます（ただし検査はされます）。`$limit` か `$offset` が負なら `\ValueError` を投げます（Issue #1609）。 |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、`SearchResult` の配列の配列を返します。入力が空の配列の場合は `[]` を返します。`$highlight` と `$groupBy` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。`$limit` か `$offset` が負なら、`$queries` が空でも `\ValueError` を投げます（Issue #1609）。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリに投げるのと同じクラスと code の例外を投げ、メッセージの先頭に、要素の並びでのクエリの位置（配列のキーによらない）が付きます: `queries[1]: ...`（Issue #1627）。 |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null, int\|bool\|null $trackTotalHits = null): SearchResponse` | 検索クエリを実行します。`getResults()` が `SearchResult` のページの [`SearchResponse`](#searchresponse) を返します。`$trackTotalHits` で総ヒット数を求められます（Issue #1472、[総ヒット数](#総ヒット数)を参照）。`$rescore` は上位の結果を MultiVector フィールドに対する late interaction の MaxSim で並べ替えます（Issue #1351）。[LateInteractionRescore](#lateinteractionrescore) を参照。`$rescore` にそれ以外のオブジェクトを渡すと `\TypeError` になります。`$groupBy` は結果をフィールドの値でグループ化し（Issue #1297）、このとき `$limit`/`$offset` はグループの数を数えます。[GroupBy](#groupby) を参照。`$query` が `SearchRequest` の場合は、リクエスト自身の `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy`/`$trackTotalHits` を使い、他の引数は無視されます（ただし検査はされます）。`$limit` か `$offset` が負なら `\ValueError` を投げます（Issue #1609）。 |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null, int\|bool\|null $trackTotalHits = null): array` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。[`SearchResponse`](#searchresponse) の配列を返し、`responses[i]` は `queries[i]` のレスポンスで、自分の `getTotalHits()` を持ちます。入力が空の配列の場合は `[]` を返します。`$highlight`・`$groupBy`・`$trackTotalHits` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`$rescore` パラメータはありません。`SearchRequest` の要素は、その要素自身の `$rescore` で再採点されます。`$limit` か `$offset` が負なら、`$queries` が空でも `\ValueError` を投げます（Issue #1609）。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリに投げるのと同じクラスと code の例外を投げ、メッセージの先頭に、要素の並びでのクエリの位置（配列のキーによらない）が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats(): array` | インデックス統計（`"documentCount"`、`"vectorFields"`）を返します。 |
 
 ### `search` の query 引数
@@ -48,6 +48,31 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 
 `searchBatch` の `$queries` 配列の各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
 
+### 総ヒット数
+
+`search`・`searchBatch`・`new \Laurus\SearchRequest(...)` は `$trackTotalHits` を受けます（Issue #1472）。一致する文書の数を、レスポンスの `getTotalHits()` に入れるよう求める引数で、HTTP gateway の `"track_total_hits"` と同じ値を受けます。
+
+| 値 | 数えるもの |
+| :--- | :--- |
+| `null` または `false`（既定） | 何も数えません。`getTotalHits()` は `null` です。 |
+| 1 以上の int | 一致がその数より少なければ正確に数えます。数がその数に届くと、総数はその数で、relation は `"gte"` です。 |
+| `true` | すべての一致を数えます。 |
+
+数えるにはコストがかかります。数が上限に届くまで、block-max pruning が飛ばすはずの文書を飛ばせないためです。ベクトル・ハイブリッド・グループ化の検索で総数が何を数えるかは、エンジンが決めます。[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。`0` はエンジンが `\ValueError`（`track_total_hits must count at least 1 match, got UpTo(0)`）で断ります。負の int は `\ValueError`（`Index::search: trackTotalHits must be at least 0, got -1`）、ほかの型の値は `\TypeError`（`Index::search: trackTotalHits must be true, false, null or an int from 0 up, got a value of type String`）を投げます。値は PHP の型変換をせずに読むので、`"1000"` と `1.5` は int ではありません。前の引数を省くときは、`trackTotalHits: 3` のように名前を付けて渡します。
+
+`body:rust` に一致する 5 つの文書に対して実行すると、次のようになります。
+
+```php
+$response = $index->search("body:rust", 2, trackTotalHits: 3);
+echo count($response->getResults()), "\n"; // 2
+echo $response->getTotalHits(), "\n";      // TotalHits(value=3, relation='gte')
+
+$response = $index->search("body:rust", 2, trackTotalHits: true);
+echo $response->getTotalHits(), "\n";      // TotalHits(value=5, relation='eq')
+
+var_dump($index->search("body:rust", 2)->getTotalHits()); // NULL
+```
+
 ### ハイライト
 
 `search`/`searchBatch` の `$highlight` パラメータ（Issue #1134）は、各ヒットの `SearchResult::getHighlights()` にフィールドごとのハイライト済みフラグメントを要求します。以下のいずれかを受け付けます。
@@ -58,7 +83,7 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 `max_fragments`、`fragment_size`、`max_analyzed_chars` が負なら `\ValueError` を投げます（Issue #1609）。
 
 ```php
-$results = $index->search("body:rust", 10, 0, ["body"]);
+$results = $index->search("body:rust", 10, 0, ["body"])->getResults();
 $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems programming language."]]
 ```
 
@@ -510,6 +535,7 @@ new \Laurus\SearchRequest(
     ?array $highlight = null,
     ?LateInteractionRescore $rescore = null,
     ?GroupBy $groupBy = null,
+    int|bool|null $trackTotalHits = null,
 )
 ```
 
@@ -525,8 +551,9 @@ new \Laurus\SearchRequest(
 | `$highlight` | `Index->search()` の `$highlight` と同じリストまたは連想配列の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。`$limit`/`$offset` 以外は PHP レベルのデフォルトを持たないため、`$highlight` を名前付き引数で渡す場合もそれ以前の引数はすべて位置または名前で渡す必要があります。 |
 | `$rescore` | 上位の結果を並べ替える `LateInteractionRescore`（Issue #1351）。それ以外のオブジェクトは `\TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
 | `$groupBy` | 結果をグループ化する `GroupBy`（Issue #1297）。それ以外の値は `\TypeError` になります。[GroupBy](#groupby) を参照。`$highlight` と同じく、それ以前の引数もすべて渡す必要があります。 |
+| `$trackTotalHits` | レスポンスの `getTotalHits()` のために数える一致の数（Issue #1472）。`Index->search()` と同じように読みます（[総ヒット数](#総ヒット数)を参照）。ほかの値は、リクエストを作るときに `\TypeError` か `\ValueError` になります。 |
 
-`SearchRequest` を `Index->search()` に渡すと、リクエスト自身の `$limit`・`$offset`・`$highlight`・`$rescore`・`$groupBy` が使われ、`search` の他の引数は無視されます。
+`SearchRequest` を `Index->search()` に渡すと、リクエスト自身の `$limit`・`$offset`・`$highlight`・`$rescore`・`$groupBy`・`$trackTotalHits` が使われ、`search` の他の引数は無視されます。
 
 ---
 
@@ -574,12 +601,12 @@ $index->putDocument("b", ["title" => "rust language", "tokens" => [[0.9, 0.2]]])
 $index->commit();
 
 $rescore = new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], 50);
-$results = $index->search("title:rust", 10, 0, null, $rescore);
+$results = $index->search("title:rust", 10, 0, null, $rescore)->getResults();
 $results[0]->getId();    // "b"
 $results[0]->getScore(); // ≈ 1.1 = 0.9 + 0.2（MaxSim）
 
 // SearchRequest で同じ再採点を行う（9 番目の引数）
-$results = $index->search(new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $rescore));
+$results = $index->search(new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $rescore))->getResults();
 
 // テキストのクエリには、フィールドにトークン単位のエンベダーが必要（「エンベダータイプ」を参照）
 $rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes work");
@@ -627,21 +654,43 @@ $index->addDocument("manual", ["body" => "Elided lifetimes follow three rules."]
 $index->addDocument("faq", ["body" => "Why do lifetimes appear in signatures?"]);
 $index->commit();
 
-$results = $index->search("body:lifetimes", groupBy: new Laurus\GroupBy("_id", groupSize: 2));
+$results = $index->search("body:lifetimes", groupBy: new Laurus\GroupBy("_id", groupSize: 2))->getResults();
 $results[0]->getGroupKey();                            // "faq"
 $results[1]->getGroupKey();                            // "manual"
 $results[1]->getInnerHits()[0]->getDocument()["body"]; // "Elided lifetimes follow three rules."
 
 // SearchRequest で同じグループ化を行う（10 番目の引数）
 $request = new Laurus\SearchRequest("body:lifetimes", null, null, null, null, 10, 0, null, null, new Laurus\GroupBy("_id", groupSize: 2));
-$results = $index->search($request);
+$results = $index->search($request)->getResults();
 ```
+
+---
+
+## SearchResponse
+
+`Index->search()` が返すクラスです。`Index->searchBatch()` は、クエリごとにこれを返します（Issue #1472）。
+
+| メソッド | 説明 |
+| :--- | :--- |
+| `getResults(): array` | 結果のページで、`SearchResult` の配列です。 |
+| `getTotalHits(): ?TotalHits` | `$trackTotalHits` を指定したときの総ヒット数。指定しなければ `null` です。 |
+
+文字列にすると `SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))` になります。
+
+### TotalHits
+
+| メソッド | 説明 |
+| :--- | :--- |
+| `getValue(): int` | 数えた一致する文書の数。 |
+| `getRelation(): string` | 値が正確な数なら `"eq"`、下限なら `"gte"`。 |
+
+relation は、HTTP gateway・MCP・CLI と同じ値です。[総ヒット数](#総ヒット数)を参照してください。
 
 ---
 
 ## SearchResult
 
-`Index->search()` が返すクラスです。
+検索の 1 件の結果で、`SearchResponse->getResults()` の要素です。
 
 ```php
 $result->getId()          // string   -- 外部ドキュメント識別子

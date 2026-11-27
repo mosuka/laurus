@@ -152,7 +152,7 @@ def main
   puts "[A] Text-to-Image: query='a screenshot of Rails console'"
   puts "=" * 60
   query_vec = embed_text("a screenshot of Rails console")
-  print_results(index.search(Laurus::VectorQuery.new("content_vec", query_vec), limit: 3))
+  print_results(index.search(Laurus::VectorQuery.new("content_vec", query_vec), limit: 3).results)
 
   # =====================================================================
   # [B] Text-to-Text: find text descriptions
@@ -165,7 +165,7 @@ def main
     filter_query: Laurus::TermQuery.new("type", "text"),
     limit: 3
   )
-  print_results(index.search(request))
+  print_results(index.search(request).results)
 
   # =====================================================================
   # [C] Image-to-Anything: find documents similar to a given image
@@ -175,7 +175,7 @@ def main
   puts "=" * 60
   query_img_bytes = fake_image("rails_console.png")
   query_vec = embed_image(query_img_bytes)
-  print_results(index.search(Laurus::VectorQuery.new("content_vec", query_vec), limit: 3))
+  print_results(index.search(Laurus::VectorQuery.new("content_vec", query_vec), limit: 3).results)
 
   puts "\nMultimodal search example completed!"
 end

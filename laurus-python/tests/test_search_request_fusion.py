@@ -50,7 +50,9 @@ def test_search_request_rejects_a_fusion_of_another_type(fusion):
 
 def test_search_request_applies_none_rrf_and_weighted_sum(hybrid_index):
     def scores(fusion):
-        return {r.id: round(r.score, 6) for r in hybrid_index.search(hybrid_request(fusion))}
+        return {
+            r.id: round(r.score, 6) for r in hybrid_index.search(hybrid_request(fusion)).results
+        }
 
     default = scores(None)
     assert scores(laurus.RRF(k=60.0)) == default

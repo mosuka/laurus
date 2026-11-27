@@ -36,7 +36,7 @@ class TestSearchRequestFusion < Minitest::Test
   end
 
   def scores(fusion)
-    @index.search(hybrid_request(fusion)).to_h { |r| [r.id, r.score.round(6)] }
+    @index.search(hybrid_request(fusion)).results.to_h { |r| [r.id, r.score.round(6)] }
   end
 
   def test_rejects_a_fusion_of_another_type

@@ -147,7 +147,7 @@ echo PHP_EOL . "Indexed " . count($chunks) . " chunks." . PHP_EOL . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 echo "[A] Vector Search: 'database ORM queries'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
-print_results($index->search(new VectorQuery("text_vec", embed($apiKey, "database ORM queries")), 3));
+print_results($index->search(new VectorQuery("text_vec", embed($apiKey, "database ORM queries")), 3)->getResults());
 
 // =====================================================================
 // [B] Filtered Vector Search -- category filter
@@ -163,7 +163,7 @@ $request = new SearchRequest(
     null,
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [C] Filtered Vector Search -- numeric range filter
@@ -179,7 +179,7 @@ $request = new SearchRequest(
     null,
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [D] Lexical Search
@@ -187,7 +187,7 @@ print_results($index->search($request));
 echo PHP_EOL . str_repeat("=", 60) . PHP_EOL;
 echo "[D] Lexical Search: 'hooks'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
-print_results($index->search(new TermQuery("text", "hooks"), 3));
+print_results($index->search(new TermQuery("text", "hooks"), 3)->getResults());
 
 // =====================================================================
 // [E] Hybrid Search (RRF)
@@ -203,6 +203,6 @@ $request = new SearchRequest(
     new RRF(60.0),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 echo PHP_EOL . "Search with OpenAI example completed!" . PHP_EOL;

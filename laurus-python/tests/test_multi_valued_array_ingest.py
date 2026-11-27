@@ -168,7 +168,7 @@ def test_datetime_list_round_trips_through_multi_valued_datetime_field():
 
     docs = idx.get_documents("doc1")
     assert docs[0]["seen_at"] == ["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"]
-    hits = idx.search("seen_at:[2024-06-01 TO 2024-12-31]", limit=5)
+    hits = idx.search("seen_at:[2024-06-01 TO 2024-12-31]", limit=5).results
     assert [h.id for h in hits] == ["doc1"]
 
 
@@ -219,8 +219,8 @@ def test_bool_list_round_trips_through_multi_valued_boolean_field():
     idx.commit()
 
     assert idx.get_documents("doc1")[0]["flags"] == [True, False]
-    assert [h.id for h in idx.search("flags:true", limit=5)] == ["doc1"]
-    assert sorted(h.id for h in idx.search("flags:false", limit=5)) == ["doc1", "doc2"]
+    assert [h.id for h in idx.search("flags:true", limit=5).results] == ["doc1"]
+    assert sorted(h.id for h in idx.search("flags:false", limit=5).results) == ["doc1", "doc2"]
 
 
 def test_single_bool_is_wrapped_on_multi_valued_boolean_field():
@@ -269,8 +269,8 @@ def test_str_list_round_trips_through_multi_valued_text_field():
     idx.commit()
 
     assert idx.get_documents("doc1")[0]["notes"] == ["hello world", "foo bar"]
-    assert [h.id for h in idx.search("notes:hello", limit=5)] == ["doc1"]
-    assert sorted(h.id for h in idx.search("notes:bar", limit=5)) == ["doc1", "doc2"]
+    assert [h.id for h in idx.search("notes:hello", limit=5).results] == ["doc1"]
+    assert sorted(h.id for h in idx.search("notes:bar", limit=5).results) == ["doc1", "doc2"]
 
 
 def test_single_str_is_wrapped_on_multi_valued_text_field():
@@ -314,15 +314,15 @@ def test_position_increment_gap_keeps_phrases_inside_one_element():
     idx = _index_with(laurus.Schema.add_text_field, "notes", multi_valued=True)
     idx.put_document("doc1", {"title": "t", "notes": ["hello world", "foo bar"]})
     idx.commit()
-    assert [h.id for h in idx.search('notes:"hello world"', limit=5)] == ["doc1"]
-    assert idx.search('notes:"world foo"', limit=5) == []
+    assert [h.id for h in idx.search('notes:"hello world"', limit=5).results] == ["doc1"]
+    assert idx.search('notes:"world foo"', limit=5).results == []
 
     contiguous = _index_with(
         laurus.Schema.add_text_field, "notes", multi_valued=True, position_increment_gap=0
     )
     contiguous.put_document("doc1", {"title": "t", "notes": ["hello world", "foo bar"]})
     contiguous.commit()
-    assert [h.id for h in contiguous.search('notes:"world foo"', limit=5)] == ["doc1"]
+    assert [h.id for h in contiguous.search('notes:"world foo"', limit=5).results] == ["doc1"]
 
 
 # ---- Multi-valued bytes (Issue #1176) ----

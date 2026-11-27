@@ -124,7 +124,7 @@ class TestGvlRelease < Minitest::Test
     threads = (0...8).map do |i|
       Thread.new do
         10.times do
-          results = idx.search("title:unique", limit: 5)
+          results = idx.search("title:unique", limit: 5).results
           ids_per_thread[i] << results.map(&:id)
         end
       end

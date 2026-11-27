@@ -13,7 +13,8 @@ use ext_php_rs::zend::ce;
 use laurus::vector::Vector;
 use laurus::{
     DataValue, Document, FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions,
-    LexicalSearchQuery, RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
+    LexicalSearchQuery, RescoreOptions, SearchRequestBuilder, SearchResult, TotalHits,
+    TotalHitsRelation, TrackTotalHits, VectorSearchQuery,
 };
 
 use crate::convert::{
@@ -355,7 +356,7 @@ fn parse_fusion_option(fusion: &Zval) -> PhpResult<Option<FusionAlgorithm>> {
 /// ## Example
 ///
 /// ```php
-/// $results = $index->search("body:rust", groupBy: new Laurus\GroupBy("_id", groupSize: 3));
+/// $results = $index->search("body:rust", groupBy: new Laurus\GroupBy("_id", groupSize: 3))->getResults();
 /// ```
 #[php_class]
 #[php(name = "Laurus\\GroupBy")]
@@ -428,7 +429,8 @@ pub fn parse_group_by_option(group_by: Option<&Zval>) -> PhpResult<Option<GroupB
 // SearchResult
 // ---------------------------------------------------------------------------
 
-/// A single search result returned by `Index->search()` (`Laurus\SearchResult`).
+/// A single search result (`Laurus\SearchResult`), an element of a
+/// `SearchResponse`'s `getResults()` (Issue #1472).
 ///
 /// Properties:
 ///   - `id` (string): External document identifier.
@@ -540,6 +542,164 @@ pub fn to_php_search_result(r: SearchResult) -> PhpSearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// SearchResponse and TotalHits (Issue #1472)
+// ---------------------------------------------------------------------------
+
+/// The total hit count of a search (`Laurus\TotalHits`), returned when
+/// `$trackTotalHits` asks for one (Issue #1472).
+///
+/// Methods:
+///   - `getValue()` (int): The number of matching documents counted.
+///   - `getRelation()` (string): `"eq"` when the value is the number of
+///     matching documents, `"gte"` when counting stopped at the threshold
+///     and the value is a lower bound. What a total counts for vector,
+///     hybrid and grouped searches is the engine's (`laurus/engine.md`,
+///     "Total hits").
+#[php_class]
+#[php(name = "Laurus\\TotalHits")]
+pub struct PhpTotalHits {
+    value: u64,
+    relation: &'static str,
+}
+
+#[php_impl]
+impl PhpTotalHits {
+    /// Return the number of matching documents counted. A PHP int is an
+    /// `i64`, so the value stops at `PHP_INT_MAX`, which no index reaches.
+    pub fn get_value(&self) -> i64 {
+        i64::try_from(self.value).unwrap_or(i64::MAX)
+    }
+
+    /// Return `"eq"` or `"gte"`.
+    pub fn get_relation(&self) -> String {
+        self.relation.to_string()
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        format!(
+            "TotalHits(value={}, relation='{}')",
+            self.value, self.relation
+        )
+    }
+}
+
+impl From<TotalHits> for PhpTotalHits {
+    /// Write the relation as the HTTP gateway, MCP and the CLI write it:
+    /// `"eq"` for an exact total, `"gte"` for a lower bound.
+    fn from(total: TotalHits) -> Self {
+        Self {
+            value: total.value,
+            relation: match total.relation {
+                TotalHitsRelation::Exact => "eq",
+                TotalHitsRelation::AtLeast => "gte",
+            },
+        }
+    }
+}
+
+/// The response of `Index::search`, and of each query of
+/// `Index::searchBatch` (`Laurus\SearchResponse`, Issue #1472).
+///
+/// Methods:
+///   - `getResults()` (array of SearchResult): The page of results.
+///   - `getTotalHits()` (TotalHits | null): The total hit count, when
+///     `$trackTotalHits` asked for one; null otherwise.
+#[php_class]
+#[php(name = "Laurus\\SearchResponse")]
+pub struct PhpSearchResponse {
+    /// The engine's results, converted when `getResults` is called, as
+    /// `SearchResult::getInnerHits` converts its hits.
+    results: Vec<SearchResult>,
+    total_hits: Option<TotalHits>,
+}
+
+#[php_impl]
+impl PhpSearchResponse {
+    /// Return the page of results as an array of `SearchResult`.
+    pub fn get_results(&self) -> Vec<PhpSearchResult> {
+        self.results
+            .iter()
+            .cloned()
+            .map(to_php_search_result)
+            .collect()
+    }
+
+    /// Return the total hit count as a `TotalHits`, or null.
+    pub fn get_total_hits(&self) -> Option<PhpTotalHits> {
+        self.total_hits.map(PhpTotalHits::from)
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        let total_hits = self.total_hits.map_or_else(
+            || "null".to_string(),
+            |total| PhpTotalHits::from(total).__to_string(),
+        );
+        format!(
+            "SearchResponse(results={}, total_hits={total_hits})",
+            self.results.len()
+        )
+    }
+}
+
+/// Convert the engine's [`laurus::SearchResponse`] into a
+/// [`PhpSearchResponse`].
+pub fn to_php_search_response(response: laurus::SearchResponse) -> PhpSearchResponse {
+    PhpSearchResponse {
+        results: response.results,
+        total_hits: response.total_hits,
+    }
+}
+
+/// Read a `$trackTotalHits` argument as the HTTP gateway reads
+/// `"track_total_hits"` (Issue #1472): an int from 0 up counts exactly up
+/// to it, `true` counts every match, and `false` or `null` (the default)
+/// counts nothing.
+///
+/// The value is read as it is, without PHP's type juggling: `"1000"` and
+/// `1.5` are not ints. A 0 is passed on: the engine rejects it, which
+/// throws `\ValueError`.
+///
+/// # Arguments
+///
+/// * `context` - The method, such as `Index::search`, which starts the
+///   error message.
+/// * `value` - The value passed.
+///
+/// # Errors
+///
+/// Throws `\ValueError` for a negative int, as `$limit` does (Issue #1609),
+/// and `\TypeError` for a value of another type.
+pub fn parse_track_total_hits_option(
+    context: &str,
+    value: Option<&Zval>,
+) -> PhpResult<TrackTotalHits> {
+    let Some(zv) = value.filter(|zv| !zv.is_null()) else {
+        return Ok(TrackTotalHits::Disabled);
+    };
+    if let Some(flag) = zv.bool() {
+        return Ok(if flag {
+            TrackTotalHits::Exact
+        } else {
+            TrackTotalHits::Disabled
+        });
+    }
+    match zv.long() {
+        Some(n) => unsigned_param(context, "trackTotalHits", n).map(TrackTotalHits::UpTo),
+        None => Err(PhpException::new(
+            format!(
+                "{context}: trackTotalHits must be true, false, null or an int from 0 up, \
+                 got a value of type {:?}",
+                zv.get_type()
+            ),
+            0,
+            ce::type_error(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchRequest
 // ---------------------------------------------------------------------------
 
@@ -578,6 +738,9 @@ pub struct PhpSearchRequest {
     rescore: Option<RescoreOptions>,
     /// Grouping of the results by a field's value (Issue #1297).
     group_by: Option<GroupBy>,
+    /// How many matches to count for the response's `getTotalHits()`
+    /// (Issue #1472).
+    track_total_hits: TrackTotalHits,
 }
 
 #[php_impl]
@@ -608,12 +771,16 @@ impl PhpSearchRequest {
     ///   (Issue #1351).
     /// * `groupBy` - `GroupBy` grouping the results by a field's value
     ///   (Issue #1297).
+    /// * `trackTotalHits` - How many matches to count for the response's
+    ///   `getTotalHits()` (Issue #1472): an int from 0 up, `true`, or
+    ///   `false`/`null` (the default), read as `Index::search`'s.
     ///
     /// # Errors
     ///
-    /// Throws `\ValueError` if `limit` or `offset` is negative (Issue
-    /// #1609), and `\TypeError` if `fusion` is neither `null`, an `RRF` nor
-    /// a `WeightedSum` (Issue #1555).
+    /// Throws `\ValueError` if `limit`, `offset` or `trackTotalHits` is
+    /// negative (Issue #1609), and `\TypeError` if `fusion` is neither
+    /// `null`, an `RRF` nor a `WeightedSum` (Issue #1555), or if
+    /// `trackTotalHits` is not `null`, a bool or an int (Issue #1472).
     #[php(defaults(limit = 10, offset = 0))]
     #[allow(clippy::too_many_arguments)]
     pub fn __construct(
@@ -627,6 +794,7 @@ impl PhpSearchRequest {
         highlight: Option<&ZendHashTable>,
         rescore: Option<&Zval>,
         groupBy: Option<&Zval>,
+        trackTotalHits: Option<&Zval>,
     ) -> PhpResult<Self> {
         // A query or fusion left out is the same as `null` (Issue #1613).
         fn present(zv: Option<&Zval>) -> Option<&Zval> {
@@ -673,6 +841,7 @@ impl PhpSearchRequest {
         let highlight = parse_highlight_option(highlight)?;
         let rescore = parse_rescore_option(rescore)?;
         let group_by = parse_group_by_option(groupBy)?;
+        let track_total_hits = parse_track_total_hits_option("SearchRequest", trackTotalHits)?;
 
         Ok(Self {
             query: q,
@@ -685,6 +854,7 @@ impl PhpSearchRequest {
             highlight,
             rescore,
             group_by,
+            track_total_hits,
         })
     }
 
@@ -702,7 +872,8 @@ impl PhpSearchRequest {
     pub fn build(&self) -> PhpResult<laurus::SearchRequest> {
         let mut builder = SearchRequestBuilder::new()
             .limit(self.limit)
-            .offset(self.offset);
+            .offset(self.offset)
+            .track_total_hits(self.track_total_hits);
 
         // Fusion algorithm
         if let Some(ref fusion) = self.fusion {
@@ -816,9 +987,9 @@ impl PhpSearchRequest {
 /// - `VectorQuery` or `VectorTextQuery`
 ///
 /// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`/
-/// `groupBy` are used as-is from the request without overriding — same
-/// precedent as `limit`/`offset` already had here before highlighting
-/// existed.
+/// `groupBy`/`trackTotalHits` are used as-is from the request without
+/// overriding — same precedent as `limit`/`offset` already had here before
+/// highlighting existed.
 ///
 /// # Arguments
 ///
@@ -828,6 +999,7 @@ impl PhpSearchRequest {
 /// * `highlight` - Already-parsed highlight options, if `$highlight` was given.
 /// * `rescore` - Already-parsed rescore, if `$rescore` was given.
 /// * `group_by` - Already-parsed grouping, if `$groupBy` was given.
+/// * `track_total_hits` - Already-parsed `$trackTotalHits` (Issue #1472).
 ///
 /// # Returns
 ///
@@ -839,6 +1011,7 @@ pub fn build_request_from_php(
     highlight: Option<&HighlightOptions>,
     rescore: Option<&RescoreOptions>,
     group_by: Option<&GroupBy>,
+    track_total_hits: TrackTotalHits,
 ) -> PhpResult<laurus::SearchRequest> {
     // Full SearchRequest object
     if let Some(req_obj) = <&ZendClassObject<PhpSearchRequest>>::from_zval(query) {
@@ -846,7 +1019,10 @@ pub fn build_request_from_php(
         return req.build();
     }
 
-    let mut builder = SearchRequestBuilder::new().limit(limit).offset(offset);
+    let mut builder = SearchRequestBuilder::new()
+        .limit(limit)
+        .offset(offset)
+        .track_total_hits(track_total_hits);
 
     if let Some(options) = highlight {
         builder = builder

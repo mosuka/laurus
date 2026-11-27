@@ -54,16 +54,16 @@ def groups(results):
 
 
 def test_search_groups_chunks_by_id(index):
-    results = index.search(vector_query(), group_by=laurus.GroupBy("_id", group_size=2))
+    results = index.search(vector_query(), group_by=laurus.GroupBy("_id", group_size=2)).results
     assert groups(results) == EXPECTED
 
-    one_each = index.search(vector_query(), group_by=laurus.GroupBy("_id"))
+    one_each = index.search(vector_query(), group_by=laurus.GroupBy("_id")).results
     assert [r.id for r in one_each] == ["a", "b", "c"]
     assert all(r.inner_hits == [] for r in one_each)
 
 
 def test_ungrouped_results_have_no_group(index):
-    results = index.search(vector_query())
+    results = index.search(vector_query()).results
     assert len(results) == len(CHUNKS)
     assert all(r.group_key is None and r.inner_hits == [] for r in results)
 
@@ -72,14 +72,14 @@ def test_search_request_carries_its_own_group_by(index):
     request = laurus.SearchRequest(
         vector_query=vector_query(), group_by=laurus.GroupBy("_id", group_size=2)
     )
-    assert groups(index.search(request)) == EXPECTED
+    assert groups(index.search(request).results) == EXPECTED
 
 
 def test_search_batch_groups_every_query(index):
     batch = index.search_batch(
         [vector_query(), vector_query()], group_by=laurus.GroupBy("_id", group_size=2)
     )
-    assert [groups(results) for results in batch] == [EXPECTED, EXPECTED]
+    assert [groups(response.results) for response in batch] == [EXPECTED, EXPECTED]
 
 
 def test_group_by_repr_and_attributes():

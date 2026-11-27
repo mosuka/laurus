@@ -37,7 +37,7 @@ def test_doc_values_false_field_is_still_searchable():
     idx.put_document("doc1", {"title": "Rust programming"})
     idx.commit()
 
-    results = idx.search(laurus.TermQuery("title", "rust"), limit=5)
+    results = idx.search(laurus.TermQuery("title", "rust"), limit=5).results
     ids = [hit.id for hit in results]
     assert "doc1" in ids
 

@@ -171,7 +171,7 @@ impl SpanKind {
 /// ```javascript
 /// const { TermQuery } = require("laurus-nodejs");
 /// const q = new TermQuery("body", "rust");
-/// const results = await index.search(q, { limit: 5 });
+/// const { results } = await index.search(q, { limit: 5 });
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "TermQuery")]
@@ -801,7 +801,7 @@ impl JsGeo3dNearestQuery {
 /// bq.must(new TermQuery("body", "programming"));
 /// bq.mustNot(new TermQuery("body", "python"));
 /// bq.should(new TermQuery("category", "data-science"));
-/// const results = await index.search(bq, { limit: 5 });
+/// const { results } = await index.search(bq, { limit: 5 });
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "BooleanQuery")]
@@ -1251,7 +1251,7 @@ impl JsSpanQuery {
 ///
 /// ```javascript
 /// const { VectorQuery } = require("laurus-nodejs");
-/// const results = await index.search(new VectorQuery("text_vec", [0.1, 0.2, ...]));
+/// const { results } = await index.search(new VectorQuery("text_vec", [0.1, 0.2, ...]));
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "VectorQuery")]
@@ -1287,7 +1287,7 @@ impl JsVectorQueryInner {
 ///
 /// ```javascript
 /// const { VectorTextQuery } = require("laurus-nodejs");
-/// const results = await index.search(new VectorTextQuery("text_vec", "memory safety"));
+/// const { results } = await index.search(new VectorTextQuery("text_vec", "memory safety"));
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "VectorTextQuery")]

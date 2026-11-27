@@ -35,5 +35,5 @@ def test_non_finite_component_raises_value_error(with_documents, component):
 
 def test_finite_components_search():
     index = make_index(with_documents=True)
-    results = index.search(laurus.VectorQuery("vec", [1.0, 0.0]))
+    results = index.search(laurus.VectorQuery("vec", [1.0, 0.0])).results
     assert [r.id for r in results] == ["doc1", "doc2"]

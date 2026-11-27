@@ -216,11 +216,11 @@ describe("integer parameters accept an integer from 0 to 4294967295 as before", 
   });
 
   it("searches with the limit and offset given", async () => {
-    expect((await index.search("title:rust", 4294967295)).length).toBe(3);
-    expect((await index.search("title:rust", 2, 0)).length).toBe(2);
-    expect((await index.search("title:rust", 10, 2)).length).toBe(1);
-    expect((await index.search("title:rust", 0)).length).toBe(0);
-    expect((await index.search("title:rust")).length).toBe(3);
+    expect((await index.search("title:rust", 4294967295)).results.length).toBe(3);
+    expect((await index.search("title:rust", 2, 0)).results.length).toBe(2);
+    expect((await index.search("title:rust", 10, 2)).results.length).toBe(1);
+    expect((await index.search("title:rust", 0)).results.length).toBe(0);
+    expect((await index.search("title:rust")).results.length).toBe(3);
   });
 
   it("keeps the positions of the tokens passed to SynonymGraphFilter.apply", () => {

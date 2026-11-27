@@ -42,7 +42,7 @@ describe("Index(path) directory layout (#1059)", () => {
     index.close();
 
     const reopened = await Index.create(dir);
-    const results = await reopened.search("title:hello", 5);
+    const { results } = await reopened.search("title:hello", 5);
     expect(results.length).toBe(1);
   });
 

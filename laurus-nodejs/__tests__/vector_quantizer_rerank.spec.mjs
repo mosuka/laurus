@@ -88,7 +88,7 @@ describe("HNSW quantizer / rerankStorage options (#797)", () => {
     }
     await index.commit();
 
-    const results = await index.searchVector("embedding", nearBase, 3);
+    const { results } = await index.searchVector("embedding", nearBase, 3);
     expect(results.length).toBe(3);
     expect(results.every((r) => r.id.startsWith("near"))).toBe(true);
   });
@@ -161,7 +161,7 @@ async function expectFloat16RanksExactMatchFirst(schema) {
   await index.putDocument("b", { embedding: [0.25, 0.0] });
   await index.commit();
 
-  const results = await index.searchVector("embedding", [0.25, 0.0], 2);
+  const { results } = await index.searchVector("embedding", [0.25, 0.0], 2);
   expect(results.map((r) => r.id)).toEqual(["b", "a"]);
 }
 

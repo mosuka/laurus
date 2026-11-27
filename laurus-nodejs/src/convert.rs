@@ -5,7 +5,7 @@
 //! to/from JS values, so we work at the serde_json level.
 
 use chrono::DateTime;
-use laurus::{DataValue, Document};
+use laurus::{DataValue, Document, TrackTotalHits};
 use napi::Status;
 use serde_json::Value;
 
@@ -61,6 +61,56 @@ pub fn optional_unsigned_param(
     value: Option<f64>,
 ) -> napi::Result<Option<u32>> {
     value.map(|v| unsigned_param(context, name, v)).transpose()
+}
+
+/// Read a `trackTotalHits` argument or option as the HTTP gateway reads
+/// `"track_total_hits"` (Issue #1472): an integer from 0 to 4294967295
+/// counts exactly up to it, `true` counts every match, and `false`, `null`
+/// or `undefined` (`None`) counts nothing.
+///
+/// The range is that of every integer parameter ([`unsigned_param`], Issue
+/// #1612); `true` counts past it. A 0 is passed on: the engine rejects it.
+/// The value is taken as JSON so that a value of another type gets this
+/// error, naming the parameter; napi-rs itself rejects `NaN` and the
+/// infinities, which JSON cannot hold, with an `InvalidArg` error of its
+/// own.
+///
+/// # Arguments
+///
+/// * `context` - The method, or `SearchRequest`, which starts the error
+///   message.
+/// * `value` - The value passed.
+///
+/// # Errors
+///
+/// Returns an `InvalidArg` error such as
+/// `Index.search: trackTotalHits must be true, false or an integer from 0 to 4294967295, got "1000"`
+/// for any other value.
+pub fn track_total_hits_param(
+    context: &str,
+    value: Option<&Value>,
+) -> napi::Result<TrackTotalHits> {
+    let invalid = |got: String| {
+        napi::Error::new(
+            Status::InvalidArg,
+            format!(
+                "{context}: trackTotalHits must be true, false or an integer from 0 to {}, got {got}",
+                u32::MAX
+            ),
+        )
+    };
+    match value {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(TrackTotalHits::Disabled),
+        Some(Value::Bool(true)) => Ok(TrackTotalHits::Exact),
+        // A number is written as the other integer parameters write it.
+        Some(Value::Number(n)) => {
+            let number = n.as_f64().unwrap_or(f64::NAN);
+            unsigned_param(context, "trackTotalHits", number)
+                .map(|n| TrackTotalHits::UpTo(u64::from(n)))
+                .map_err(|_| invalid(js_number(number)))
+        }
+        Some(other) => Err(invalid(other.to_string())),
+    }
 }
 
 /// Write a number as JavaScript writes `NaN`, `Infinity` and `-Infinity`,

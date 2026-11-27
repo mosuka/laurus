@@ -9,11 +9,11 @@ use crate::query::{
 use laurus::vector::Vector;
 use laurus::{
     FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions, LexicalSearchQuery,
-    RescoreOptions, SearchRequestBuilder, SearchResult,
+    RescoreOptions, SearchRequestBuilder, SearchResult, TotalHitsRelation, TrackTotalHits,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyBool, PyDict, PyInt, PyList, PyString};
 
 // ---------------------------------------------------------------------------
 // Highlighting (Issue #1134)
@@ -151,7 +151,7 @@ impl PyWeightedSum {
 ///
 /// ```python
 /// rescore = laurus.LateInteractionRescore("body_colbert", "how do lifetimes work")
-/// results = index.search("body:lifetimes", rescore=rescore)
+/// results = index.search("body:lifetimes", rescore=rescore).results
 ///
 /// rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size=50)
 /// ```
@@ -231,7 +231,7 @@ impl PyLateInteractionRescore {
 /// ## Example
 ///
 /// ```python
-/// results = index.search("body:rust", group_by=laurus.GroupBy("_id", group_size=3))
+/// results = index.search("body:rust", group_by=laurus.GroupBy("_id", group_size=3)).results
 /// for result in results:
 ///     print(result.id, [hit.score for hit in result.inner_hits])
 /// ```
@@ -280,7 +280,8 @@ impl PyGroupBy {
 // SearchResult
 // ---------------------------------------------------------------------------
 
-/// A single search result returned by [`Index.search`].
+/// A single search result, an element of a [`SearchResponse`]'s `results`
+/// (Issue #1472).
 ///
 /// Attributes:
 ///     id (str): External document identifier.
@@ -369,6 +370,157 @@ pub fn to_py_search_result(py: Python, r: SearchResult) -> PyResult<PySearchResu
 }
 
 // ---------------------------------------------------------------------------
+// SearchResponse and TotalHits (Issue #1472)
+// ---------------------------------------------------------------------------
+
+/// The total hit count of a search, returned when `track_total_hits=` asks
+/// for one (Issue #1472).
+///
+/// Attributes:
+///     value (int): The number of matching documents counted.
+///     relation (str): `"eq"` when `value` is the number of matching
+///         documents, `"gte"` when counting stopped at the threshold and
+///         `value` is a lower bound. What a total counts for vector, hybrid
+///         and grouped searches is the engine's (`laurus/engine.md`, "Total
+///         hits").
+#[pyclass(name = "TotalHits", frozen)]
+pub struct PyTotalHits {
+    #[pyo3(get)]
+    pub value: u64,
+    #[pyo3(get)]
+    pub relation: String,
+}
+
+#[pymethods]
+impl PyTotalHits {
+    fn __repr__(&self) -> String {
+        format!(
+            "TotalHits(value={}, relation='{}')",
+            self.value, self.relation
+        )
+    }
+}
+
+/// Write a [`TotalHitsRelation`] as the HTTP gateway, MCP and the CLI do:
+/// `"eq"` for an exact total, `"gte"` for a lower bound.
+fn relation_name(relation: TotalHitsRelation) -> &'static str {
+    match relation {
+        TotalHitsRelation::Exact => "eq",
+        TotalHitsRelation::AtLeast => "gte",
+    }
+}
+
+/// The response of `Index.search`, and of each query of
+/// `Index.search_batch` (Issue #1472).
+///
+/// Attributes:
+///     results (list[SearchResult]): The page of results.
+///     total_hits (TotalHits | None): The total hit count, when
+///         `track_total_hits=` asked for one; `None` otherwise.
+#[pyclass(name = "SearchResponse", frozen)]
+pub struct PySearchResponse {
+    results: Vec<Py<PySearchResult>>,
+    total_hits: Option<Py<PyTotalHits>>,
+}
+
+#[pymethods]
+impl PySearchResponse {
+    #[getter]
+    pub fn results(&self, py: Python) -> Vec<Py<PySearchResult>> {
+        self.results.iter().map(|r| r.clone_ref(py)).collect()
+    }
+
+    #[getter]
+    pub fn total_hits(&self, py: Python) -> Option<Py<PyTotalHits>> {
+        self.total_hits.as_ref().map(|t| t.clone_ref(py))
+    }
+
+    fn __repr__(&self) -> String {
+        let total_hits = self.total_hits.as_ref().map_or_else(
+            || "None".to_string(),
+            |t| {
+                let t = t.get();
+                format!("TotalHits(value={}, relation='{}')", t.value, t.relation)
+            },
+        );
+        format!(
+            "SearchResponse(results={}, total_hits={total_hits})",
+            self.results.len()
+        )
+    }
+}
+
+/// Convert the engine's [`laurus::SearchResponse`] into a
+/// [`PySearchResponse`].
+pub fn to_py_search_response(
+    py: Python,
+    response: laurus::SearchResponse,
+) -> PyResult<PySearchResponse> {
+    let results = response
+        .results
+        .into_iter()
+        .map(|r| Py::new(py, to_py_search_result(py, r)?))
+        .collect::<PyResult<_>>()?;
+    let total_hits = response
+        .total_hits
+        .map(|t| {
+            Py::new(
+                py,
+                PyTotalHits {
+                    value: t.value,
+                    relation: relation_name(t.relation).to_string(),
+                },
+            )
+        })
+        .transpose()?;
+    Ok(PySearchResponse {
+        results,
+        total_hits,
+    })
+}
+
+/// Read a `track_total_hits=` argument as the HTTP gateway reads
+/// `"track_total_hits"` (Issue #1472): an `int` from 0 up counts exactly up
+/// to it, `True` counts every match, and `False` or `None` counts nothing.
+///
+/// `bool` is read before `int`, since `True` is an `int` in Python and would
+/// otherwise count up to 1. A 0 is passed on: the engine rejects it, which
+/// raises `ValueError`.
+///
+/// # Errors
+///
+/// Raises `TypeError` for a value of another type, and `ValueError` for a
+/// negative `int` or one above `u64::MAX`.
+pub fn track_total_hits_from_py(value: Option<&Bound<'_, PyAny>>) -> PyResult<TrackTotalHits> {
+    let Some(value) = value.filter(|v| !v.is_none()) else {
+        return Ok(TrackTotalHits::Disabled);
+    };
+    if value.is_instance_of::<PyBool>() {
+        return Ok(if value.extract::<bool>()? {
+            TrackTotalHits::Exact
+        } else {
+            TrackTotalHits::Disabled
+        });
+    }
+    let message = || {
+        let got = value
+            .repr()
+            .map_or_else(|_| "an unprintable value".to_string(), |r| r.to_string());
+        format!(
+            "track_total_hits must be True, False or an integer from 0 to {}, got {got}",
+            u64::MAX
+        )
+    };
+    if value.is_instance_of::<PyInt>() {
+        return value
+            .extract::<u64>()
+            .map(TrackTotalHits::UpTo)
+            .map_err(|_| PyValueError::new_err(message()));
+    }
+    Err(PyTypeError::new_err(message()))
+}
+
+// ---------------------------------------------------------------------------
 // SearchRequest
 // ---------------------------------------------------------------------------
 
@@ -387,7 +539,7 @@ pub fn to_py_search_result(py: Python, r: SearchResult) -> PyResult<PySearchResu
 ///     fusion=laurus.RRF(k=60.0),
 ///     limit=3,
 /// )
-/// results = index.search(request)
+/// results = index.search(request).results
 /// ```
 #[pyclass(name = "SearchRequest")]
 pub struct PySearchRequest {
@@ -415,6 +567,10 @@ pub struct PySearchRequest {
     pub rescore: Option<PyLateInteractionRescore>,
     /// Grouping of the results by a field's value (Issue #1297).
     pub group_by: Option<PyGroupBy>,
+    /// How many matches to count for the response's `total_hits`, read
+    /// from the `track_total_hits=` passed to the constructor (Issue
+    /// #1472).
+    pub track_total_hits: TrackTotalHits,
 }
 
 #[pymethods]
@@ -431,13 +587,18 @@ impl PySearchRequest {
         offset=0,
         highlight=None,
         rescore=None,
-        group_by=None
+        group_by=None,
+        track_total_hits=None
     ))]
     ///
     /// # Errors
     ///
     /// Raises `TypeError` if `fusion` is neither an `RRF` nor a
     /// `WeightedSum` (Issue #1555). `None` keeps the default.
+    ///
+    /// Raises `TypeError` or `ValueError` if `track_total_hits` is not
+    /// `True`, `False`, `None` or an integer from 0 to `u64::MAX` (Issue
+    /// #1472).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         query: Option<Py<PyAny>>,
@@ -450,6 +611,7 @@ impl PySearchRequest {
         highlight: Option<Py<PyAny>>,
         rescore: Option<PyLateInteractionRescore>,
         group_by: Option<PyGroupBy>,
+        track_total_hits: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self {
             query,
@@ -462,6 +624,7 @@ impl PySearchRequest {
             highlight,
             rescore,
             group_by,
+            track_total_hits: track_total_hits_from_py(track_total_hits)?,
         })
     }
 
@@ -538,6 +701,10 @@ impl PySearchRequest {
         if let Some(group_by) = &self.group_by {
             builder = builder.group_by(group_by.group_by.clone());
         }
+
+        // ── Total hit count (Issue #1472) ───────────────────────────────────
+        // Likewise.
+        builder = builder.track_total_hits(self.track_total_hits);
 
         // ── `query` with `lexical_query` / `vector_query` (Issue #1372) ───
         // A DSL string is searched together with `vector_query` (the
@@ -633,9 +800,10 @@ impl PySearchRequest {
 /// - A `PyRRF` / `PyWeightedSum` are not valid here
 ///
 /// When `query` is a `PySearchRequest`, `limit`/`offset`/`highlight`/
-/// `rescore`/`group_by` are used as-is from the request without
-/// overriding — same precedent as `limit`/`offset` already had here before
-/// highlighting existed.
+/// `rescore`/`group_by`/`track_total_hits` are used as-is from the request
+/// without overriding — same precedent as `limit`/`offset` already had here
+/// before highlighting existed.
+#[allow(clippy::too_many_arguments)]
 pub fn build_request_from_py(
     py: Python,
     query: &Bound<PyAny>,
@@ -644,13 +812,17 @@ pub fn build_request_from_py(
     highlight: Option<&Bound<PyAny>>,
     rescore: Option<&PyLateInteractionRescore>,
     group_by: Option<&PyGroupBy>,
+    track_total_hits: TrackTotalHits,
 ) -> PyResult<laurus::SearchRequest> {
     // Full SearchRequest object — use limit/offset as-is without overriding.
     if let Ok(req) = query.extract::<PyRef<PySearchRequest>>() {
         return req.build(py);
     }
 
-    let mut builder = SearchRequestBuilder::new().limit(limit).offset(offset);
+    let mut builder = SearchRequestBuilder::new()
+        .limit(limit)
+        .offset(offset)
+        .track_total_hits(track_total_hits);
 
     if let Some(h) = highlight {
         let options = py_to_highlight_options(h)?;

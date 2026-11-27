@@ -234,21 +234,21 @@ describe("Stats", () => {
 describe("Lexical search", () => {
   it("searches with DSL string", async () => {
     const index = await createTextIndex();
-    const results = await index.search("title:rust", 5);
+    const { results } = await index.search("title:rust", 5);
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].id).toBe("doc1");
   });
 
   it("searches with term query", async () => {
     const index = await createTextIndex();
-    const results = await index.searchTerm("body", "python", 5);
+    const { results } = await index.searchTerm("body", "python", 5);
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].id).toBe("doc2");
   });
 
   it("result has id, score, and document", async () => {
     const index = await createTextIndex();
-    const results = await index.search("title:rust", 1);
+    const { results } = await index.search("title:rust", 1);
     const r = results[0];
     expect(r.id).toBe("doc1");
     expect(r.score).toBeGreaterThan(0);
@@ -258,7 +258,7 @@ describe("Lexical search", () => {
 
   it("respects limit", async () => {
     const index = await createTextIndex();
-    const results = await index.search(
+    const { results } = await index.search(
       "body:programming OR body:python",
       1,
     );
@@ -273,14 +273,14 @@ describe("Lexical search", () => {
       10,
       1,
     );
-    if (all.length > 1) {
-      expect(offset[0].id).toBe(all[1].id);
+    if (all.results.length > 1) {
+      expect(offset.results[0].id).toBe(all.results[1].id);
     }
   });
 
   it("returns empty for no matches", async () => {
     const index = await createTextIndex();
-    const results = await index.search("title:nonexistent_xyz", 5);
+    const { results } = await index.search("title:nonexistent_xyz", 5);
     expect(results).toEqual([]);
   });
 
@@ -301,7 +301,7 @@ describe("Lexical search", () => {
 describe("Vector search", () => {
   it("searches with vector query", async () => {
     const index = await createVectorIndex();
-    const results = await index.searchVector(
+    const { results } = await index.searchVector(
       "embedding",
       [0.1, 0.2, 0.3, 0.4],
       2,
@@ -320,7 +320,7 @@ describe("Hybrid search", () => {
     const index = await createTextIndex();
     const req = new SearchRequest({ limit: 5 });
     req.setLexicalTerm(new TermQuery("title", "rust"));
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     expect(results.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -330,7 +330,7 @@ describe("Hybrid search", () => {
     req.setLexicalTerm(new TermQuery("title", "rust"));
     req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
     req.setRrfFusion(new RRF(60.0));
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     expect(results.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -350,7 +350,7 @@ describe("Hybrid search", () => {
     await index.commit();
     const req = new SearchRequest({ queryDsl: "title:rust", limit: 5 });
     req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     expect(results.map((r) => r.id).sort()).toEqual(["lexical", "vector"]);
   });
 
@@ -384,7 +384,7 @@ describe("Hybrid search", () => {
       limit: 5,
       offset: 0,
     });
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     expect(results.length).toBeGreaterThanOrEqual(1);
   });
 });
@@ -398,7 +398,7 @@ describe("Query types", () => {
     const index = await createTextIndex();
     const req = new SearchRequest({ limit: 5 });
     req.setLexicalPhrase(new PhraseQuery("title", ["introduction", "rust"]));
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     expect(results.some((r) => r.id === "doc1")).toBe(true);
   });
 
@@ -432,7 +432,7 @@ describe("Query types", () => {
     await index.putDocument("big", { price: 10.0 });
     await index.commit();
 
-    const ids = (results) => results.map((r) => r.id).sort();
+    const ids = ({ results }) => results.map((r) => r.id).sort();
     const search = (q) => {
       const req = new SearchRequest({ limit: 5 });
       req.setLexicalNumericRange(q);
@@ -470,7 +470,7 @@ describe("Query types", () => {
     await index.putDocument("next", { createdAt: "2025-01-01T00:00:00Z" });
     await index.commit();
 
-    const ids = (results) => results.map((r) => r.id).sort();
+    const ids = ({ results }) => results.map((r) => r.id).sort();
 
     // Date-only bounds are midnight UTC, inclusive on both ends.
     const req = new SearchRequest({ limit: 5 });

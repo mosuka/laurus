@@ -59,7 +59,7 @@ def test_geo3d_distance_query_small_radius(geo3d_index):
     """A 50 km sphere around Tokyo Tower should return Tower + Skytree only."""
     cx, cy, cz = TOKYO_TOWER
     query = laurus.Geo3dDistanceQuery.within_sphere("position", cx, cy, cz, 50_000.0)
-    results = geo3d_index.search(query, limit=10)
+    results = geo3d_index.search(query, limit=10).results
     ids = {r.id for r in results}
     assert ids == {"tokyo_tower", "tokyo_skytree"}
 
@@ -68,7 +68,7 @@ def test_geo3d_distance_query_wide_radius(geo3d_index):
     """A 200 km sphere additionally pulls in Mt. Fuji."""
     cx, cy, cz = TOKYO_TOWER
     query = laurus.Geo3dDistanceQuery.within_sphere("position", cx, cy, cz, 200_000.0)
-    results = geo3d_index.search(query, limit=10)
+    results = geo3d_index.search(query, limit=10).results
     ids = {r.id for r in results}
     assert ids == {"tokyo_tower", "tokyo_skytree", "mt_fuji"}
 
@@ -92,7 +92,7 @@ def test_geo3d_bounding_box_query(geo3d_index):
         -3_962_000.0, 3_340_000.0, 3_690_000.0,
         -3_954_000.0, 3_360_000.0, 3_710_000.0,
     )
-    results = geo3d_index.search(query, limit=10)
+    results = geo3d_index.search(query, limit=10).results
     ids = {r.id for r in results}
     assert ids == {"tokyo_tower", "tokyo_skytree"}
 
@@ -108,7 +108,7 @@ def test_geo3d_nearest_query(geo3d_index):
     only check membership)."""
     cx, cy, cz = MT_FUJI
     query = laurus.Geo3dNearestQuery.k_nearest("position", cx, cy, cz, 3)
-    results = geo3d_index.search(query, limit=3)
+    results = geo3d_index.search(query, limit=3).results
     assert len(results) == 3
     ids = {r.id for r in results}
     assert ids == {"mt_fuji", "tokyo_tower", "tokyo_skytree"}
@@ -124,7 +124,7 @@ def test_geo3d_nearest_query_with_radius_options(geo3d_index):
         initial_radius_m=10_000.0,
         max_radius_m=10_000_000.0,
     )
-    results = geo3d_index.search(query, limit=2)
+    results = geo3d_index.search(query, limit=2).results
     ids = {r.id for r in results}
     assert ids == {"tokyo_tower", "tokyo_skytree"}
 

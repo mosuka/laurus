@@ -67,21 +67,21 @@ def ids(results):
 
 
 def test_quoted_single_token_matches_without_positions(index):
-    assert ids(index.search('path:"file:///m/a.md"')) == ["a"]
-    assert ids(index.search('links:"https://example.com/a"')) == ["a"]
+    assert ids(index.search('path:"file:///m/a.md"').results) == ["a"]
+    assert ids(index.search('links:"https://example.com/a"').results) == ["a"]
 
 
 def test_one_term_phrase_query_object_matches_without_positions(index):
     query = laurus.PhraseQuery("path", ["file:///m/a.md"])
-    assert ids(index.search(query)) == ["a"]
+    assert ids(index.search(query).results) == ["a"]
 
 
 def test_term_query_is_unaffected(index):
-    assert ids(index.search(laurus.TermQuery("path", "file:///m/a.md"))) == ["a"]
+    assert ids(index.search(laurus.TermQuery("path", "file:///m/a.md")).results) == ["a"]
 
 
 def test_phrase_on_a_field_with_positions_still_matches(index):
-    assert ids(index.search('title:"rust search"')) == ["a"]
+    assert ids(index.search('title:"rust search"').results) == ["a"]
 
 
 def test_multi_term_phrase_without_positions_raises(index):

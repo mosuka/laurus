@@ -40,10 +40,10 @@ await index.commit();
 
 ```javascript
 // DSL string
-const results = await index.search("name:express", 5);
+const { results } = await index.search("name:express", 5);
 
 // Term query
-const results2 = await index.searchTerm(
+const { results: results2 } = await index.searchTerm(
   "description", "framework", 5,
 );
 
@@ -76,7 +76,7 @@ await index.putDocument("pg", {
 });
 await index.commit();
 
-const results = await index.searchVector(
+const { results } = await index.searchVector(
   "embedding", [0.1, 0.2, 0.3, 0.4], 3,
 );
 ```
@@ -97,7 +97,7 @@ req.setLexicalTerm(new TermQuery("name", "express"));
 req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
 req.setRrfFusion(new RRF(60.0));
 
-const results = await index.searchWithRequest(req);
+const { results } = await index.searchWithRequest(req);
 ```
 
 ## 6. Late-interaction rescore
@@ -126,7 +126,7 @@ await index.commit();
 
 // Lexical first stage, then reorder the top results by MaxSim:
 // "b" (score 1.4) now ranks above "a" (score 0.1).
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",
   vectors: [[1, 0], [0, 1]],
 });

@@ -4,15 +4,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::commit::JsCommitPolicy;
-use crate::convert::{data_value_to_json, json_to_document};
+use crate::convert::{data_value_to_json, json_to_document, track_total_hits_param};
 use crate::errors::{closed_err, index_dir_err, laurus_err};
 use crate::query::{JsQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery};
 use crate::schema::JsSchema;
 use crate::search::{
-    JsGroupByOptions, JsHighlightOptions, JsRescoreOptions, JsSearchRequest, JsSearchResult,
+    JsGroupByOptions, JsHighlightOptions, JsRescoreOptions, JsSearchRequest, JsSearchResponse,
     build_dsl_request, build_lexical_request, build_vector_request, js_group_by_options_to_core,
     js_highlight_options_to_core, js_rescore_options_to_core, limit_and_offset,
-    to_js_search_result,
+    to_js_search_response,
 };
 use crate::wal::JsWalSyncPolicy;
 use laurus::index_dir::IndexDirClaim;
@@ -54,16 +54,16 @@ use serde_json::Value;
 ///
 /// ```javascript
 /// // DSL string
-/// const results = await index.search("title:hello");
+/// const { results } = await index.search("title:hello");
 ///
 /// // Term query
-/// const results = await index.searchTerm("body", "rust");
+/// const { results } = await index.searchTerm("body", "rust");
 ///
 /// // Via SearchRequest for full control
 /// const req = new SearchRequest();
 /// req.setVectorTextQuery(new VectorTextQuery("embedding", "concurrent"));
 /// req.setRrfFusion(new RRF(60.0));
-/// const results = await index.searchWithRequest(req);
+/// const { results } = await index.searchWithRequest(req);
 /// ```
 #[napi(js_name = "Index")]
 pub struct JsIndex {
@@ -367,17 +367,28 @@ impl JsIndex {
     /// * `group_by` - Group the results by a field's value, e.g.
     ///   `{ field: "_id", groupSize: 3 }` (Issue #1297); `limit` and
     ///   `offset` then count groups.
+    /// * `track_total_hits` - How many matches to count for the response's
+    ///   `totalHits` (Issue #1472): an integer from 0 to 4294967295 counts
+    ///   exactly up to it, `true` counts every match, and `false`, `null` or
+    ///   `undefined` (the default) counts nothing. Counting has a cost, and
+    ///   what a total means for vector, hybrid and grouped searches is the
+    ///   engine's (`laurus/engine.md`, "Total hits").
     ///
     /// # Returns
     ///
-    /// An array of SearchResult objects.
+    /// A `SearchResponse`: `results`, an array of SearchResult objects, and
+    /// `totalHits`, `{ value, relation }` with `relation` `"eq"` or `"gte"`,
+    /// when `trackTotalHits` asked for one.
     ///
     /// # Errors
     ///
     /// Rejects with an `InvalidArg` error if `limit`, `offset` or an
     /// integer of `highlight`, `rescore` or `groupBy` is not an integer
-    /// from 0 to 4294967295 (Issue #1612).
+    /// from 0 to 4294967295 (Issue #1612), if `trackTotalHits` is not
+    /// `true`, `false`, `null` or such an integer, or, from the engine, if
+    /// it is 0 (Issue #1472).
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &self,
         query: String,
@@ -386,10 +397,13 @@ impl JsIndex {
         highlight: Option<JsHighlightOptions>,
         rescore: Option<JsRescoreOptions>,
         group_by: Option<JsGroupByOptions>,
-    ) -> Result<Vec<JsSearchResult>> {
+        #[napi(ts_arg_type = "number | boolean | null")] track_total_hits: Option<Value>,
+    ) -> Result<JsSearchResponse> {
         const CONTEXT: &str = "Index.search";
         let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let track_total_hits = track_total_hits_param(CONTEXT, track_total_hits.as_ref())?;
         let mut request = build_dsl_request(query, limit, offset);
+        request.track_total_hits = track_total_hits;
         request.lexical_options.highlight = highlight
             .as_ref()
             .map(|h| js_highlight_options_to_core(h, CONTEXT))
@@ -402,13 +416,8 @@ impl JsIndex {
             .as_ref()
             .map(|g| js_group_by_options_to_core(g, CONTEXT))
             .transpose()?;
-        let results = self
-            .engine()?
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        Ok(results.into_iter().map(to_js_search_result).collect())
+        let response = self.engine()?.search(request).await.map_err(laurus_err)?;
+        Ok(to_js_search_response(response))
     }
 
     /// Search using a term query.
@@ -423,7 +432,9 @@ impl JsIndex {
     ///
     /// # Returns
     ///
-    /// An array of SearchResult objects.
+    /// A `SearchResponse`: `results`, an array of SearchResult objects, and
+    /// no `totalHits` (Issue #1472); `search` and `searchWithRequest` can
+    /// ask for one.
     ///
     /// # Errors
     ///
@@ -438,7 +449,7 @@ impl JsIndex {
         limit: Option<f64>,
         offset: Option<f64>,
         highlight: Option<JsHighlightOptions>,
-    ) -> Result<Vec<JsSearchResult>> {
+    ) -> Result<JsSearchResponse> {
         const CONTEXT: &str = "Index.searchTerm";
         let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
         let highlight = highlight
@@ -448,13 +459,8 @@ impl JsIndex {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
         let mut request = build_lexical_request(&query, limit, offset)?;
         request.lexical_options.highlight = highlight;
-        let results = self
-            .engine()?
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        Ok(results.into_iter().map(to_js_search_result).collect())
+        let response = self.engine()?.search(request).await.map_err(laurus_err)?;
+        Ok(to_js_search_response(response))
     }
 
     /// Search using a pre-computed embedding vector.
@@ -468,7 +474,9 @@ impl JsIndex {
     ///
     /// # Returns
     ///
-    /// An array of SearchResult objects.
+    /// A `SearchResponse`: `results`, an array of SearchResult objects, and
+    /// no `totalHits` (Issue #1472); `search` and `searchWithRequest` can
+    /// ask for one.
     ///
     /// # Errors
     ///
@@ -481,20 +489,15 @@ impl JsIndex {
         vector: Vec<f64>,
         limit: Option<f64>,
         offset: Option<f64>,
-    ) -> Result<Vec<JsSearchResult>> {
+    ) -> Result<JsSearchResponse> {
         let (limit, offset) = limit_and_offset("Index.searchVector", limit, offset)?;
         let query = JsVectorQuery::VectorQuery(JsVectorQueryInner {
             field,
             vector: vector.into_iter().map(|v| v as f32).collect(),
         });
         let request = build_vector_request(&query, limit, offset);
-        let results = self
-            .engine()?
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        Ok(results.into_iter().map(to_js_search_result).collect())
+        let response = self.engine()?.search(request).await.map_err(laurus_err)?;
+        Ok(to_js_search_response(response))
     }
 
     /// Search using a text-based vector query (embedded by the registered embedder).
@@ -508,7 +511,9 @@ impl JsIndex {
     ///
     /// # Returns
     ///
-    /// An array of SearchResult objects.
+    /// A `SearchResponse`: `results`, an array of SearchResult objects, and
+    /// no `totalHits` (Issue #1472); `search` and `searchWithRequest` can
+    /// ask for one.
     ///
     /// # Errors
     ///
@@ -521,17 +526,12 @@ impl JsIndex {
         text: String,
         limit: Option<f64>,
         offset: Option<f64>,
-    ) -> Result<Vec<JsSearchResult>> {
+    ) -> Result<JsSearchResponse> {
         let (limit, offset) = limit_and_offset("Index.searchVectorText", limit, offset)?;
         let query = JsVectorQuery::VectorTextQuery(JsVectorTextQuery { field, text });
         let request = build_vector_request(&query, limit, offset);
-        let results = self
-            .engine()?
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        Ok(results.into_iter().map(to_js_search_result).collect())
+        let response = self.engine()?.search(request).await.map_err(laurus_err)?;
+        Ok(to_js_search_response(response))
     }
 
     /// Search using a full SearchRequest for advanced control.
@@ -542,20 +542,14 @@ impl JsIndex {
     ///
     /// # Returns
     ///
-    /// An array of SearchResult objects.
+    /// A `SearchResponse`: `results`, an array of SearchResult objects, and
+    /// `totalHits` when the request's `trackTotalHits` asked for one (Issue
+    /// #1472).
     #[napi]
-    pub async fn search_with_request(
-        &self,
-        request: &JsSearchRequest,
-    ) -> Result<Vec<JsSearchResult>> {
+    pub async fn search_with_request(&self, request: &JsSearchRequest) -> Result<JsSearchResponse> {
         let req = request.build()?;
-        let results = self
-            .engine()?
-            .search(req)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        Ok(results.into_iter().map(to_js_search_result).collect())
+        let response = self.engine()?.search(req).await.map_err(laurus_err)?;
+        Ok(to_js_search_response(response))
     }
 
     /// Execute multiple independent searches in one call.
@@ -573,12 +567,15 @@ impl JsIndex {
     ///   identically to every query in the batch (Issue #1134).
     /// * `group_by` - Group each query's results by a field's value,
     ///   applied identically to every query in the batch (Issue #1297).
+    /// * `track_total_hits` - How many matches to count for each query's
+    ///   `totalHits`, applied identically to every query in the batch and
+    ///   read as `search`'s (Issue #1472).
     ///
     /// # Returns
     ///
-    /// An array of arrays: `results[i]` is the result list for
-    /// `queries[i]`. Empty input returns `[]` without invoking the
-    /// engine.
+    /// An array of `SearchResponse` objects: `responses[i]` is the response
+    /// for `queries[i]`, with its own `totalHits`. Empty input returns `[]`
+    /// without invoking the engine.
     ///
     /// Issue [#718](https://github.com/mosuka/laurus/issues/718)
     /// Phase 3c of [#648](https://github.com/mosuka/laurus/issues/648).
@@ -587,7 +584,8 @@ impl JsIndex {
     ///
     /// Rejects with an `InvalidArg` error if `limit`, `offset` or an
     /// integer of `highlight` or `groupBy` is not an integer from 0 to
-    /// 4294967295 (Issue #1612), even for an empty `queries`.
+    /// 4294967295 (Issue #1612), or if `trackTotalHits` is not one of the
+    /// values `search` takes (Issue #1472), even for an empty `queries`.
     ///
     /// Rejects with a `StringExpected` error whose message starts with
     /// `queries[i]:` if an element is not a string, and with the error
@@ -603,9 +601,11 @@ impl JsIndex {
         offset: Option<f64>,
         highlight: Option<JsHighlightOptions>,
         group_by: Option<JsGroupByOptions>,
-    ) -> Result<Vec<Vec<JsSearchResult>>> {
+        #[napi(ts_arg_type = "number | boolean | null")] track_total_hits: Option<Value>,
+    ) -> Result<Vec<JsSearchResponse>> {
         const CONTEXT: &str = "Index.searchBatch";
         let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let track_total_hits = track_total_hits_param(CONTEXT, track_total_hits.as_ref())?;
         let highlight = highlight
             .as_ref()
             .map(|h| js_highlight_options_to_core(h, CONTEXT))
@@ -625,6 +625,7 @@ impl JsIndex {
                 let mut request = build_dsl_request(q, limit, offset);
                 request.lexical_options.highlight = highlight.clone();
                 request.group_by = group_by.clone();
+                request.track_total_hits = track_total_hits;
                 request
             })
             .collect();
@@ -637,13 +638,7 @@ impl JsIndex {
 
         Ok(batch_results
             .into_iter()
-            .map(|per_query_results| {
-                per_query_results
-                    .results
-                    .into_iter()
-                    .map(to_js_search_result)
-                    .collect()
-            })
+            .map(to_js_search_response)
             .collect())
     }
 

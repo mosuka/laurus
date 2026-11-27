@@ -49,16 +49,19 @@ class Index {
 | `deleteDocuments(id)` | 指定 ID の全バージョンを削除。 |
 | `commit()` | 書き込みをフラッシュし変更を検索可能にする。 |
 | `flushWal()` | WAL の永続性バリアを強制する。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照。 |
-| `search(query, limit?, offset?, highlight?, rescore?, groupBy?)` | DSL 文字列で検索。`rescore` は上位の結果を late interaction で並べ替えます。[Late interaction による再採点（Rescore）](#late-interaction-による再採点rescore)を参照。`groupBy` は結果をフィールドの値でグループ化します。[検索結果のグループ化](#検索結果のグループ化)を参照。 |
+| `search(query, limit?, offset?, highlight?, rescore?, groupBy?, trackTotalHits?)` | DSL 文字列で検索。`trackTotalHits` で総ヒット数を求められます。[総ヒット数](#総ヒット数)を参照。`rescore` は上位の結果を late interaction で並べ替えます。[Late interaction による再採点（Rescore）](#late-interaction-による再採点rescore)を参照。`groupBy` は結果をフィールドの値でグループ化します。[検索結果のグループ化](#検索結果のグループ化)を参照。 |
 | `searchTerm(field, term, limit?, offset?, highlight?)` | 完全一致 Term 検索。 |
 | `searchVector(field, vector, limit?, offset?)` | 事前計算ベクトルで検索。成分はすべて有限でなければならない（[VectorQuery](#vectorquery)を参照）。 |
 | `searchVectorText(field, text, limit?, offset?)` | テキストを自動埋め込みして検索。 |
-| `searchWithRequest(request)` | `SearchRequest` で検索。 |
-| `searchBatch(queries, limit?, offset?, highlight?, groupBy?)` | 複数の DSL 文字列クエリを並列実行します。`results[i]` は `queries[i]` に対応。戻り値は `Promise<Array<Array<JsSearchResult>>>`。空入力の場合は `[]` を返します。`highlight` と `groupBy` はすべてのクエリに同一に適用されます。文字列でない要素は、code `StringExpected` と位置を示すメッセージ（`queries[1]: expected a DSL string, got a number`）の例外を投げます。エンジンが断ったクエリは、`search` がそのクエリに投げるのと同じ例外を投げ、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
+| `searchWithRequest(request)` | `SearchRequest` で検索。総ヒット数は、その `trackTotalHits` で求めます。 |
+| `searchBatch(queries, limit?, offset?, highlight?, groupBy?, trackTotalHits?)` | 複数の DSL 文字列クエリを並列実行します。戻り値は `Promise<SearchResponse[]>` で、`responses[i]` は `queries[i]` のレスポンスです。各レスポンスは自分の `totalHits` を持ちます。空入力の場合は `[]` を返します。`highlight`・`groupBy`・`trackTotalHits` はすべてのクエリに同一に適用されます。文字列でない要素は、code `StringExpected` と位置を示すメッセージ（`queries[1]: expected a DSL string, got a number`）の例外を投げます。エンジンが断ったクエリは、`search` がそのクエリに投げるのと同じ例外を投げ、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats()` | インデックス統計（`documentCount`、`vectorFields`）を返す。 |
 
 ドキュメント操作と検索メソッドはすべて非同期で Promise を返します。
-`stats()` は同期メソッドです。
+`stats()` は同期メソッドです。検索メソッドはどれも
+[`SearchResponse`](#searchresponse) を返し、その `results` が結果のページです
+（Issue #1472）。`totalHits` を求められるのは `search`・`searchWithRequest`・
+`searchBatch` だけです。
 
 `stats()` は次の形のオブジェクトを返します:
 
@@ -590,6 +593,7 @@ interface SearchRequestOptions {
   highlight?: HighlightOptions;
   rescore?: RescoreOptions;
   groupBy?: GroupByOptions;
+  trackTotalHits?: number | boolean | null; // 総ヒット数を参照
 }
 
 class SearchRequest {
@@ -600,8 +604,9 @@ class SearchRequest {
 コンストラクタにはプリミティブな options を渡し、多態クエリ句は下記の
 per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` の
 `Either<&T, ...>` バリデーション制限を回避するため per-type 化されています。
-`highlight`、`rescore`、`groupBy` はプレーンなデータ（クラスインスタンスのユニオンでは
-ない）なので、セッターを介さず `SearchRequestOptions` に直接持たせています。
+`highlight`、`rescore`、`groupBy`、`trackTotalHits` はプレーンなデータ（クラスインスタンスの
+ユニオンではない）なので、セッターを介さず `SearchRequestOptions` に直接持たせています。
+コンストラクタは、`limit` と同じく `trackTotalHits` も検査します。
 
 ### DSL とフュージョンセッター
 
@@ -639,7 +644,7 @@ const req = new SearchRequest({ limit: 5 });
 req.setLexicalTerm(new TermQuery("title", "rust"));
 req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]));
 req.setRrfFusion(new RRF(60.0));
-const results = await index.searchWithRequest(req);
+const { results } = await index.searchWithRequest(req);
 ```
 
 ### ハイライト
@@ -660,7 +665,7 @@ interface HighlightOptions {
 必須なのは `fields` のみです。ハイライトは同じ呼び出しに渡したクエリに従い、`stored: true` のテキストフィールドのみハイライト可能です — 保存されていない、テキスト型でない、またはマッチしなかったフィールドは結果の `highlights` オブジェクトに現れません。
 
 ```javascript
-const results = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
+const { results } = await index.search("body:rust", 10, 0, { fields: ["body"], tag: "em" });
 // results[0].highlights => { body: ["<em>Rust</em> is a systems programming language."] }
 ```
 
@@ -713,7 +718,7 @@ reject されます。
 
 ```javascript
 // DSL 検索を、クエリのトークンベクトルで再採点します。
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",
   vectors: [[1, 0], [0, 1]],
 });
@@ -727,7 +732,7 @@ const req = new SearchRequest({
 req.setLexicalTerm(new TermQuery("body", "lifetimes"));
 req.setVectorQuery(new VectorQuery("body_vec", queryEmbedding));
 req.setRrfFusion(new RRF(60.0));
-const reranked = await index.searchWithRequest(req);
+const reranked = (await index.searchWithRequest(req)).results;
 ```
 
 ### 検索結果のグループ化
@@ -777,7 +782,7 @@ await index.addDocument("manual", { body: "Elided lifetimes follow three rules."
 await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
 await index.commit();
 
-const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+const { results } = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
   field: "_id",
   groupSize: 2,
 });
@@ -790,14 +795,59 @@ for (const r of results) {
 // 同じグループ化を SearchRequest で指定します。
 const req = new SearchRequest({ limit: 10, groupBy: { field: "_id", groupSize: 2 } });
 req.setLexicalTerm(new TermQuery("body", "lifetimes"));
-const grouped = await index.searchWithRequest(req);
+const grouped = (await index.searchWithRequest(req)).results;
 ```
+
+### 総ヒット数
+
+`search` の `trackTotalHits`、`searchBatch` の `trackTotalHits`、`SearchRequestOptions.trackTotalHits`（Issue #1472）は、一致する文書の数をレスポンスの `totalHits` に入れるよう求めます。HTTP gateway の `"track_total_hits"` と同じ値を受けます。
+
+| 値 | 数えるもの |
+| :--- | :--- |
+| `false`・`null`・`undefined`（既定） | 何も数えません。レスポンスに `totalHits` はありません。 |
+| 1 から 4294967295 までの整数 | 一致がその数より少なければ正確に数えます。数がその数に届くと、`totalHits.value` はその数で、relation は `"gte"` です。 |
+| `true` | すべての一致を数えます。 |
+
+数えるにはコストがかかります。数が上限に届くまで、block-max pruning が飛ばすはずの文書を飛ばせないためです。ベクトル・ハイブリッド・グループ化の検索で総数が何を数えるかは、エンジンが決めます。[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。`0` はエンジンのエラー（`track_total_hits must count at least 1 match, got UpTo(0)`）で reject されます。ほかの値は、[整数の引数](#整数の引数)と同じく、引数の名前を含む `InvalidArg` のエラー（`Index.search: trackTotalHits must be true, false or an integer from 0 to 4294967295, got "1000"`）で reject されます。napi-rs が変換できない `NaN` と無限大は、呼び出しの時点で `Failed to convert js number to serde_json::Number` を投げます。
+
+`body:rust` に一致する 5 つの文書に対して実行すると、次のようになります。
+
+```javascript
+let response = await index.search("body:rust", 2, 0, null, null, null, 3);
+console.log(response.results.length); // 2
+console.log(response.totalHits);      // { value: 3, relation: 'gte' }
+
+response = await index.search("body:rust", 2, 0, null, null, null, true);
+console.log(response.totalHits);      // { value: 5, relation: 'eq' }
+
+console.log((await index.search("body:rust", 2)).totalHits); // undefined
+```
+
+---
+
+## SearchResponse
+
+検索メソッドが返す値で、`searchBatch` の配列の各要素でもあります（Issue #1472）。TypeScript の宣言では、`SearchResult` を `JsSearchResult` と呼ぶのと同じく、`JsSearchResponse`・`JsTotalHits` という名前です。
+
+```typescript
+interface SearchResponse {
+  results: SearchResult[]; // 結果のページ
+  totalHits?: TotalHits;   // trackTotalHits を指定したときの総ヒット数
+}
+
+interface TotalHits {
+  value: number;              // 数えた一致する文書の数
+  relation: "eq" | "gte";     // value が正確な数なら "eq"、下限なら "gte"
+}
+```
+
+`totalHits` は、求めなければありません。グループ化しない検索の `groupKey` と同じ扱いです。relation は、HTTP gateway・MCP・CLI と同じ値です。[総ヒット数](#総ヒット数)を参照してください。
 
 ---
 
 ## SearchResult
 
-検索メソッドが配列として返す結果。
+検索の 1 件の結果で、`SearchResponse.results` の要素です。
 
 ```typescript
 interface SearchResult {

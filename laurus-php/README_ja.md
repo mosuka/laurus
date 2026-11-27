@@ -63,14 +63,14 @@ $index->putDocument("doc2", ["title" => "PHP Web 開発", "body" => "PHP によ�
 $index->commit();
 
 // DSL 文字列で検索
-$results = $index->search("title:rust", 5);
+$results = $index->search("title:rust", 5)->getResults();
 foreach ($results as $r) {
     $doc = $r->getDocument();
     printf("[%s] score=%.4f  %s\n", $r->getId(), $r->getScore(), $doc["title"]);
 }
 
 // クエリオブジェクトで検索
-$results = $index->search(new TermQuery("body", "php"), 5);
+$results = $index->search(new TermQuery("body", "php"), 5)->getResults();
 ```
 
 ## インデックスの種類
@@ -189,7 +189,7 @@ $bq->must(new TermQuery("body", "rust"));
 $bq->should(new TermQuery("title", "introduction"));
 $bq->mustNot(new TermQuery("body", "deprecated"));
 
-$results = $index->search($bq, 10);
+$results = $index->search($bq, 10)->getResults();
 ```
 
 ### 地理クエリ
@@ -199,10 +199,10 @@ use Laurus\GeoBoundingBoxQuery;
 use Laurus\GeoDistanceQuery;
 
 // 半径検索
-$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10.0), 10);
+$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10.0), 10)->getResults();
 
 // バウンディングボックス検索
-$results = $index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 35.0, 139.0, 36.0, 140.0), 10);
+$results = $index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 35.0, 139.0, 36.0, 140.0), 10)->getResults();
 ```
 
 ## ハイブリッド検索
@@ -222,7 +222,7 @@ $request = new SearchRequest(
     limit: 10,
     offset: 0,
 );
-$results = $index->search($request);
+$results = $index->search($request)->getResults();
 ```
 
 ### フュージョンアルゴリズム
@@ -239,7 +239,7 @@ $results = $index->search($request);
 ```php
 use Laurus\LateInteractionRescore;
 
-$results = $index->search("title:rust", 10, 0, null, new LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+$results = $index->search("title:rust", 10, 0, null, new LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]))->getResults();
 ```
 
 ## テキスト解析

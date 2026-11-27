@@ -77,7 +77,7 @@ index.put_document("doc2", { "title" => "Ruby Web 開発", "body" => "Ruby に�
 index.commit
 
 # 検索
-results = index.search("title:rust", limit: 5)
+results = index.search("title:rust", limit: 5).results
 results.each do |r|
   puts "[#{r.id}] score=#{format('%.4f', r.score)}  #{r.document['title']}"
 end

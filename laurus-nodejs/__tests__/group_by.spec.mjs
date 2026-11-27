@@ -61,17 +61,17 @@ function vectorRequest(groupBy) {
 describe("result grouping", () => {
   it("groups a SearchRequest's chunks by _id", async () => {
     const index = await createIndex();
-    const results = await index.searchWithRequest(vectorRequest({ field: "_id", groupSize: 2 }));
+    const { results } = await index.searchWithRequest(vectorRequest({ field: "_id", groupSize: 2 }));
     expect(groups(results)).toEqual(EXPECTED);
 
-    const oneEach = await index.searchWithRequest(vectorRequest({ field: "_id" }));
+    const oneEach = (await index.searchWithRequest(vectorRequest({ field: "_id" }))).results;
     expect(oneEach.map((r) => r.id)).toEqual(["a", "b", "c"]);
     expect(oneEach.every((r) => r.innerHits.length === 0)).toBe(true);
   });
 
   it("groups a DSL search", async () => {
     const index = await createIndex();
-    const results = await index.search("title:rust", 10, 0, undefined, undefined, {
+    const { results } = await index.search("title:rust", 10, 0, undefined, undefined, {
       field: "_id",
       groupSize: 2,
     });
@@ -82,7 +82,7 @@ describe("result grouping", () => {
 
   it("leaves an ungrouped search without groups", async () => {
     const index = await createIndex();
-    const results = await index.searchWithRequest(vectorRequest(undefined));
+    const { results } = await index.searchWithRequest(vectorRequest(undefined));
     expect(results).toHaveLength(CHUNKS.length);
     for (const r of results) {
       expect(r.groupKey).toBeUndefined();
@@ -96,7 +96,7 @@ describe("result grouping", () => {
       field: "_id",
       groupSize: 2,
     });
-    expect(batch.map(innerCounts)).toEqual([
+    expect(batch.map((r) => innerCounts(r.results))).toEqual([
       { a: 1, b: 1, c: 0 },
       { a: 1, b: 1, c: 0 },
     ]);

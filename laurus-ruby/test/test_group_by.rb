@@ -51,16 +51,16 @@ class TestGroupBy < Minitest::Test
   end
 
   def test_search_groups_chunks_by_id
-    results = @index.search(vector_query, group_by: Laurus::GroupBy.new("_id", group_size: 2))
+    results = @index.search(vector_query, group_by: Laurus::GroupBy.new("_id", group_size: 2)).results
     assert_equal EXPECTED, groups(results)
 
-    one_each = @index.search(vector_query, group_by: Laurus::GroupBy.new("_id"))
+    one_each = @index.search(vector_query, group_by: Laurus::GroupBy.new("_id")).results
     assert_equal %w[a b c], one_each.map(&:id)
     assert(one_each.all? { |r| r.inner_hits.empty? })
   end
 
   def test_ungrouped_results_have_no_group
-    results = @index.search(vector_query)
+    results = @index.search(vector_query).results
     assert_equal CHUNKS.size, results.size
     results.each do |r|
       assert_nil r.group_key
@@ -73,7 +73,7 @@ class TestGroupBy < Minitest::Test
       vector_query: vector_query,
       group_by: Laurus::GroupBy.new("_id", group_size: 2)
     )
-    assert_equal EXPECTED, groups(@index.search(request))
+    assert_equal EXPECTED, groups(@index.search(request).results)
   end
 
   def test_search_batch_groups_every_query
@@ -81,7 +81,7 @@ class TestGroupBy < Minitest::Test
       [vector_query, vector_query],
       group_by: Laurus::GroupBy.new("_id", group_size: 2)
     )
-    assert_equal [EXPECTED, EXPECTED], batch.map { |results| groups(results) }
+    assert_equal [EXPECTED, EXPECTED], batch.map { |response| groups(response.results) }
   end
 
   def test_group_by_attributes

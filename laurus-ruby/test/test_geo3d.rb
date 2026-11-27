@@ -51,7 +51,7 @@ class TestGeo3d < Minitest::Test
     q = Laurus::Geo3dDistanceQuery.within_sphere(
       "position", TOKYO_TOWER["x"], TOKYO_TOWER["y"], TOKYO_TOWER["z"], 50_000.0,
     )
-    results = idx.search(q, limit: 10)
+    results = idx.search(q, limit: 10).results
     ids = results.map(&:id).to_set
     assert_equal Set["tokyo_tower", "tokyo_skytree"], ids
   end
@@ -61,7 +61,7 @@ class TestGeo3d < Minitest::Test
     q = Laurus::Geo3dDistanceQuery.within_sphere(
       "position", TOKYO_TOWER["x"], TOKYO_TOWER["y"], TOKYO_TOWER["z"], 200_000.0,
     )
-    results = idx.search(q, limit: 10)
+    results = idx.search(q, limit: 10).results
     ids = results.map(&:id).to_set
     assert_equal Set["tokyo_tower", "tokyo_skytree", "mt_fuji"], ids
   end
@@ -80,7 +80,7 @@ class TestGeo3d < Minitest::Test
       -3_962_000.0,  3_340_000.0,  3_690_000.0,
       -3_954_000.0,  3_360_000.0,  3_710_000.0,
     )
-    results = idx.search(q, limit: 10)
+    results = idx.search(q, limit: 10).results
     ids = results.map(&:id).to_set
     assert_equal Set["tokyo_tower", "tokyo_skytree"], ids
   end
@@ -94,7 +94,7 @@ class TestGeo3d < Minitest::Test
     q = Laurus::Geo3dNearestQuery.k_nearest(
       "position", MT_FUJI["x"], MT_FUJI["y"], MT_FUJI["z"], 3,
     )
-    results = idx.search(q, limit: 3)
+    results = idx.search(q, limit: 3).results
     assert_equal 3, results.length
     ids = results.map(&:id).to_set
     assert_equal Set["mt_fuji", "tokyo_tower", "tokyo_skytree"], ids
@@ -110,7 +110,7 @@ class TestGeo3d < Minitest::Test
       initial_radius_m: 10_000.0,
       max_radius_m: 10_000_000.0,
     )
-    results = idx.search(q, limit: 2)
+    results = idx.search(q, limit: 2).results
     ids = results.map(&:id).to_set
     assert_equal Set["tokyo_tower", "tokyo_skytree"], ids
   end

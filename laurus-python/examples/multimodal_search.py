@@ -173,7 +173,7 @@ def main() -> None:
     print("[A] Text-to-Image: query='a photo of a cat'")
     print("=" * 60)
     query_vec = embed_text("a photo of a cat")
-    _print_results(index.search(laurus.VectorQuery("content_vec", query_vec), limit=3))
+    _print_results(index.search(laurus.VectorQuery("content_vec", query_vec), limit=3).results)
 
     # =====================================================================
     # [B] Text-to-Text: find text descriptions
@@ -186,7 +186,7 @@ def main() -> None:
         filter_query=laurus.TermQuery("type", "text"),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [C] Image-to-Anything: find documents similar to a given image
@@ -196,7 +196,7 @@ def main() -> None:
     print("=" * 60)
     query_img_bytes = _fake_image("cat_sleeping.jpg")
     query_vec = embed_image(query_img_bytes)
-    _print_results(index.search(laurus.VectorQuery("content_vec", query_vec), limit=3))
+    _print_results(index.search(laurus.VectorQuery("content_vec", query_vec), limit=3).results)
 
     print("\nMultimodal search example completed!")
 

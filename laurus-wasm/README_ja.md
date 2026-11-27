@@ -50,7 +50,7 @@ await index.putDocument("doc2", {
 await index.commit();
 
 // DSL 文字列で検索
-const results = await index.search("programming", 5);
+const { results } = await index.search("programming", 5);
 for (const r of results) {
   console.log(r.id, r.score, r.document.title);
 }
@@ -74,13 +74,13 @@ await index.deleteDocuments("id");
 await index.commit();                                  // フラッシュ + OPFS に永続化
 
 // 検索
-const results = await index.search("query DSL", limit, offset);
-const results = await index.searchTerm("field", "term", limit);
-const results = await index.searchVector("field", [0.1, ...], limit);
-const results = await index.searchVectorText("field", "text", limit);
+const { results } = await index.search("query DSL", limit, offset);
+const { results } = await index.searchTerm("field", "term", limit);
+const { results } = await index.searchVector("field", [0.1, ...], limit);
+const { results } = await index.searchVectorText("field", "text", limit);
 
 // 上位の結果を late interaction で再採点（searchVector / searchVectorText でも可）
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",            // MultiVector フィールド
   vectors: [[0.1, ...], ...], // token_callback Embedder があれば text: "query" も可
   windowSize: 100,            // 省略可（既定 100）

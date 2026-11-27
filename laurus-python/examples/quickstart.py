@@ -53,12 +53,12 @@ def main() -> None:
 
     # 4. Search with a TermQuery object
     print("[Search] TermQuery — 'django' in body:")
-    results = index.search(laurus.TermQuery("body", "django"), limit=5)
+    results = index.search(laurus.TermQuery("body", "django"), limit=5).results
     _print_results(results)
 
     # 5. Search with a DSL string
     print("\n[Search] DSL — 'python':")
-    results = index.search("python", limit=5)
+    results = index.search("python", limit=5).results
     _print_results(results)
 
     # 6. put_document replaces an existing document
@@ -73,7 +73,7 @@ def main() -> None:
     index.commit()
 
     print("[Search] DSL — 'broadcasting' (should find updated doc2):")
-    results = index.search("broadcasting", limit=5)
+    results = index.search("broadcasting", limit=5).results
     _print_results(results)
 
     print("\nQuickstart complete!")

@@ -128,7 +128,7 @@ OPFS で永続化されたインデックスを開くか、新規作成します
 
 - **戻り値:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?, fusion?)`
+#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?, fusion?, trackTotalHits?)`
 
 DSL 文字列クエリで検索します。
 
@@ -140,7 +140,8 @@ DSL 文字列クエリで検索します。
   - `rescore` (`RescoreOptions`, 省略可) -- 上位の結果を、MultiVector フィールドに対する late interaction で並べ替える（Issue #1351）。詳細は下記の [Late interaction による再採点](#late-interaction-による再採点)を参照
   - `groupBy` (`GroupByOptions`, 省略可) -- 結果をフィールドの値でグループ化する（Issue #1297）。詳細は下記の[検索結果のグループ化](#検索結果のグループ化)を参照
   - `fusion` (`FusionOptions`, 省略可) -- ハイブリッドのクエリが lexical と vector の結果を融合する方法を、RRF と WeightedSum から選ぶ（Issue #1554）。詳細は下記の[ハイブリッド検索の融合](#ハイブリッド検索の融合)を参照
-- **戻り値:** `Promise<SearchResult[]>`
+  - `trackTotalHits` (number または boolean, 省略可) -- 総ヒット数をレスポンスの `totalHits` に入れるよう求める（Issue #1472）。詳細は下記の[総ヒット数](#総ヒット数)を参照
+- **戻り値:** `Promise<SearchResponse>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
 
@@ -151,7 +152,7 @@ DSL 文字列クエリで検索します。
   - `term` (string) -- 検索ターム
   - `limit`, `offset` (number, 省略可)
   - `highlight` (`HighlightOptions`, 省略可) -- `search` の `highlight` 引数と同じ
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### `searchDateTimeRange(field, min?, max?, limit?, offset?, highlight?)`
 
@@ -162,7 +163,7 @@ DSL 文字列クエリで検索します。
   - `min`, `max` (string, 省略可) -- 両端を含む境界。省略（または `null`/`undefined`）でその側を開放。DSL の日時リテラルのいずれか: RFC 3339（`"2024-01-01T09:00:00+09:00"`、UTC に正規化）、オフセットなしの `"YYYY-MM-DDTHH:MM:SS[.fff]"`（UTC）、または `"YYYY-MM-DD"`（その日の 0 時 UTC）。`Date` は `date.toISOString()` で渡す
   - `limit`, `offset` (number, 省略可)
   - `highlight` (`HighlightOptions`, 省略可) -- `search` の `highlight` 引数と同じ
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 - **例外:** 境界が認識できる日時リテラルでない場合、エラーで reject されます
 
 #### ハイライト
@@ -183,7 +184,7 @@ interface HighlightOptions {
 必須なのは `fields` のみで、それ以外はエンジンの既定 `HighlightConfig`（タグ `"mark"`、約150文字のフラグメントを最大5件、`requireFieldMatch: true`）にフォールバックします。ハイライトは `search`/`searchTerm` に渡したクエリに従い、`stored: true` のテキストフィールドのみハイライト可能です — 保存されていない、テキスト型でない、またはマッチしなかったフィールドは結果の `highlights` オブジェクトに現れません。`highlight` を省略する（または `undefined` を渡す）と、すべての結果の `highlights` は空のままになります。
 
 ```js
-const results = await index.search("body:rust", 10, 0, {
+const { results } = await index.search("body:rust", 10, 0, {
   fields: ["body"],
   tag: "em",
 });
@@ -200,7 +201,7 @@ const results = await index.search("body:rust", 10, 0, {
   - `limit`, `offset` (number, 省略可)
   - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
   - `groupBy` (`GroupByOptions`, 省略可) -- `search` の `groupBy` 引数と同じ
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### `searchVectorText(field, text, limit?, offset?, rescore?, groupBy?)`
 
@@ -212,7 +213,7 @@ const results = await index.search("body:rust", 10, 0, {
   - `limit`, `offset` (number, 省略可)
   - `rescore` (`RescoreOptions`, 省略可) -- `search` の `rescore` 引数と同じ
   - `groupBy` (`GroupByOptions`, 省略可) -- `search` の `groupBy` 引数と同じ
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### Late interaction による再採点
 
@@ -240,13 +241,13 @@ interface RescoreOptions {
 
 ```js
 // 事前計算したクエリのトークンベクトルで、lexical 検索の上位を再採点する。
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",
   vectors: [[1, 0], [0, 1]],
 });
 
 // フィールドの token_callback Embedder にクエリのテキストを埋め込ませることもできる。
-const reranked = await index.searchVectorText("embedding", "how do lifetimes work", 10, 0, {
+const { results: reranked } = await index.searchVectorText("embedding", "how do lifetimes work", 10, 0, {
   field: "body_colbert",
   text: "how do lifetimes work",
   windowSize: 50,
@@ -280,7 +281,7 @@ await index.addDocument("manual", { body: "Elided lifetimes follow three rules."
 await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
 await index.commit();
 
-const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+const { results } = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
   field: "_id",
   groupSize: 2,
 });
@@ -310,7 +311,7 @@ type FusionOptions =
 
 ```js
 // キーワードの一致よりもベクトルの類似度を重くする。
-const results = await index.search(
+const { results } = await index.search(
   'title:rust embedding:"systems programming"',
   10,
   0,
@@ -319,6 +320,31 @@ const results = await index.search(
   undefined,
   { weightedSum: { lexicalWeight: 0.3, vectorWeight: 0.7 } },
 );
+```
+
+#### 総ヒット数
+
+`search` の `trackTotalHits`（Issue #1472）は、一致する文書の数をレスポンスの `totalHits` に入れるよう求めます。HTTP gateway の `"track_total_hits"` と同じ値を受けます。これを受けるのは `search` だけで、ほかの検索メソッドは `totalHits` の無いレスポンスを返します。
+
+| 値 | 数えるもの |
+| :--- | :--- |
+| `false`・`null`・`undefined`（既定） | 何も数えません。レスポンスに `totalHits` はありません。 |
+| 1 から 4294967295 までの整数 | 一致がその数より少なければ正確に数えます。数がその数に届くと、`totalHits.value` はその数で、relation は `"gte"` です。 |
+| `true` | すべての一致を数えます。 |
+
+数えるにはコストがかかります。数が上限に届くまで、block-max pruning が飛ばすはずの文書を飛ばせないためです。ベクトル・ハイブリッド・グループ化の検索で総数が何を数えるかは、エンジンが決めます。[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。`0` はエンジンのエラー（`track_total_hits must count at least 1 match, got UpTo(0)`）で reject されます。ほかの値は、[整数の引数](#整数の引数)と同じく、引数の名前を含むエラー（`Index.search: trackTotalHits must be true, false or an integer from 0 to 4294967295, got "1000"`）で reject されます。
+
+`body:rust` に一致する 5 つの文書に対して実行すると、次のようになります。
+
+```javascript
+let response = await index.search("body:rust", 2, 0, null, null, null, null, 3);
+console.log(response.results.length); // 2
+console.log(response.totalHits);      // { relation: 'gte', value: 3 }
+
+response = await index.search("body:rust", 2, 0, null, null, null, null, true);
+console.log(response.totalHits);      // { relation: 'eq', value: 5 }
+
+console.log((await index.search("body:rust", 2)).totalHits); // undefined
 ```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
@@ -332,7 +358,7 @@ const results = await index.search(
   - `x`, `y`, `z` (number) -- 中心 ECEF 座標（メートル）
   - `distanceM` (number) -- 中心からの最大距離（メートル）
   - `limit`, `offset` (number, 省略可)
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### `searchGeo3dBoundingBox(field, minX, minY, minZ, maxX, maxY, maxZ, limit?, offset?)`
 
@@ -342,7 +368,7 @@ const results = await index.search(
   - `field` (string) -- Geo3d フィールド名
   - `minX`, `minY`, `minZ`, `maxX`, `maxY`, `maxZ` (number) -- 範囲境界（メートル）
   - `limit`, `offset` (number, 省略可)
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### `searchGeo3dNearest(field, x, y, z, k, limit?, offset?, initialRadiusM?, maxRadiusM?)`
 
@@ -356,7 +382,7 @@ const results = await index.search(
   - `k` (number) -- 返す近傍件数
   - `limit`, `offset` (number, 省略可)
   - `initialRadiusM`, `maxRadiusM` (number, 省略可)
-- **戻り値:** `Promise<SearchResult[]>`
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### `stats()`
 
@@ -860,7 +886,25 @@ schema.addTextField("title", undefined, undefined, undefined, undefined, "ngram3
 有用です。ブラウザから呼び出す場合は、引き続き `JapaneseAnalyzer.fromBytes` +
 `addAnalyzer` を使用してください。
 
+## SearchResponse
+
+検索メソッドが返す値です（Issue #1472）。
+
+```typescript
+interface SearchResponse {
+  results: SearchResult[]; // 結果のページ
+  totalHits?: {            // search の trackTotalHits を指定したときの総ヒット数
+    value: number;           // 数えた一致する文書の数
+    relation: "eq" | "gte";  // value が正確な数なら "eq"、下限なら "gte"
+  };
+}
+```
+
+`totalHits` は、求めなければありません。HTTP gateway が `"total_hits"` を省くのと同じ扱いです。relation は、HTTP gateway・MCP・CLI と同じ値です。[総ヒット数](#総ヒット数)を参照してください。
+
 ## SearchResult
+
+検索の 1 件の結果で、`SearchResponse.results` の要素です。
 
 ```typescript
 interface SearchResult {

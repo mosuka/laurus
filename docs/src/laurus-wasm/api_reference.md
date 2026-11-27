@@ -131,7 +131,7 @@ durable persistence.
 
 - **Returns:** `Promise<void>`
 
-#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?, fusion?)`
+#### `search(query, limit?, offset?, highlight?, rescore?, groupBy?, fusion?, trackTotalHits?)`
 
 Search using a DSL string query.
 
@@ -143,7 +143,8 @@ Search using a DSL string query.
   - `rescore` (`RescoreOptions`, optional) -- Reorder the top results by late interaction against a multi-vector field (Issue #1351). See [Late-interaction rescore](#late-interaction-rescore) below.
   - `groupBy` (`GroupByOptions`, optional) -- Group the results by a field's value (Issue #1297). See [Result grouping](#result-grouping) below.
   - `fusion` (`FusionOptions`, optional) -- Choose how a hybrid query merges its lexical and vector results: RRF or WeightedSum (Issue #1554). See [Hybrid fusion](#hybrid-fusion) below.
-- **Returns:** `Promise<SearchResult[]>`
+  - `trackTotalHits` (number or boolean, optional) -- Ask for the total hit count in the response's `totalHits` (Issue #1472). See [Total hits](#total-hits) below.
+- **Returns:** `Promise<SearchResponse>`
 
 #### `searchTerm(field, term, limit?, offset?, highlight?)`
 
@@ -154,7 +155,7 @@ Search for an exact term.
   - `term` (string) -- Exact term.
   - `limit`, `offset` (number, optional)
   - `highlight` (`HighlightOptions`, optional) -- Same as `search`'s `highlight` argument.
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### `searchDateTimeRange(field, min?, max?, limit?, offset?, highlight?)`
 
@@ -165,7 +166,7 @@ Search a `DateTime` field for values within an inclusive range (Issue #1179). Qu
   - `min`, `max` (string, optional) -- Inclusive bounds; omit (or pass `null`/`undefined`) to leave a side open. Any DSL datetime literal: RFC 3339 (`"2024-01-01T09:00:00+09:00"`, normalized to UTC), naive `"YYYY-MM-DDTHH:MM:SS[.fff]"` (UTC), or `"YYYY-MM-DD"` (midnight UTC). Pass `date.toISOString()` for a `Date`.
   - `limit`, `offset` (number, optional)
   - `highlight` (`HighlightOptions`, optional) -- Same as `search`'s `highlight` argument.
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 - **Throws:** rejects with an error when a bound is not a recognized datetime literal.
 
 #### Highlighting
@@ -186,7 +187,7 @@ interface HighlightOptions {
 Only `fields` is required; everything else falls back to the engine's default `HighlightConfig` (tag `"mark"`, up to 5 fragments of ~150 characters, `requireFieldMatch: true`). Highlighting follows the query passed to `search`/`searchTerm`, and only `stored: true` text fields can be highlighted — a field that isn't stored, isn't a text field, or had no match is simply absent from the result's `highlights` object. Omitting `highlight` (or passing `undefined`) leaves every result's `highlights` empty.
 
 ```js
-const results = await index.search("body:rust", 10, 0, {
+const { results } = await index.search("body:rust", 10, 0, {
   fields: ["body"],
   tag: "em",
 });
@@ -203,7 +204,7 @@ Search by vector similarity.
   - `limit`, `offset` (number, optional)
   - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
   - `groupBy` (`GroupByOptions`, optional) -- Same as `search`'s `groupBy` argument.
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### `searchVectorText(field, text, limit?, offset?, rescore?, groupBy?)`
 
@@ -215,7 +216,7 @@ Search by text (embedded by the registered embedder).
   - `limit`, `offset` (number, optional)
   - `rescore` (`RescoreOptions`, optional) -- Same as `search`'s `rescore` argument.
   - `groupBy` (`GroupByOptions`, optional) -- Same as `search`'s `groupBy` argument.
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### Late-interaction rescore
 
@@ -243,13 +244,13 @@ The top `windowSize` results are sorted by MaxSim, and a rescored result's `scor
 
 ```js
 // Rescore the top lexical hits with precomputed query token vectors.
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",
   vectors: [[1, 0], [0, 1]],
 });
 
 // Or let the field's token_callback embedder embed the query text.
-const reranked = await index.searchVectorText("embedding", "how do lifetimes work", 10, 0, {
+const { results: reranked } = await index.searchVectorText("embedding", "how do lifetimes work", 10, 0, {
   field: "body_colbert",
   text: "how do lifetimes work",
   windowSize: 50,
@@ -283,7 +284,7 @@ await index.addDocument("manual", { body: "Elided lifetimes follow three rules."
 await index.addDocument("faq", { body: "Why do lifetimes appear in signatures?" });
 await index.commit();
 
-const results = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
+const { results } = await index.search("body:lifetimes", 10, 0, undefined, undefined, {
   field: "_id",
   groupSize: 2,
 });
@@ -313,7 +314,7 @@ Unless exactly one of `rrf` and `weightedSum` is set, the call throws `Invalid f
 
 ```js
 // Weigh the vector similarity more than the keyword match.
-const results = await index.search(
+const { results } = await index.search(
   'title:rust embedding:"systems programming"',
   10,
   0,
@@ -322,6 +323,31 @@ const results = await index.search(
   undefined,
   { weightedSum: { lexicalWeight: 0.3, vectorWeight: 0.7 } },
 );
+```
+
+#### Total hits
+
+`search`'s `trackTotalHits` (Issue #1472) asks for the number of matching documents in the response's `totalHits`, as the HTTP gateway's `"track_total_hits"` does. Only `search` takes it; the other search methods return a response without `totalHits`.
+
+| Value | Counts |
+| :--- | :--- |
+| `false`, `null` or `undefined` (the default) | Nothing: the response has no `totalHits`. |
+| An integer from 1 to 4294967295 | Exactly while fewer match. Once the count reaches it, `totalHits.value` is that number with the relation `"gte"`. |
+| `true` | Every match. |
+
+Counting has a cost: until the count reaches the threshold, a search cannot skip the documents block-max pruning would skip. What a total counts for vector, hybrid and grouped searches is the engine's; see [Total hits](../laurus/engine.md#total-hits). `0` rejects with the engine's error (`track_total_hits must count at least 1 match, got UpTo(0)`), and any other value with an error naming the parameter (`Index.search: trackTotalHits must be true, false or an integer from 0 to 4294967295, got "1000"`), as for the [integer arguments](#integer-arguments).
+
+Over five documents that match `body:rust`:
+
+```javascript
+let response = await index.search("body:rust", 2, 0, null, null, null, null, 3);
+console.log(response.results.length); // 2
+console.log(response.totalHits);      // { relation: 'gte', value: 3 }
+
+response = await index.search("body:rust", 2, 0, null, null, null, null, true);
+console.log(response.totalHits);      // { relation: 'eq', value: 5 }
+
+console.log((await index.search("body:rust", 2)).totalHits); // undefined
 ```
 
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
@@ -335,7 +361,7 @@ coordinate is within `distanceM` metres of the centre. See
   - `x`, `y`, `z` (number) -- Centre ECEF coordinate (metres).
   - `distanceM` (number) -- Maximum distance from the centre (metres).
   - `limit`, `offset` (number, optional)
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### `searchGeo3dBoundingBox(field, minX, minY, minZ, maxX, maxY, maxZ, limit?, offset?)`
 
@@ -345,7 +371,7 @@ Axis-aligned 3D bounding-box search over a 3D ECEF point field.
   - `field` (string) -- Geo3d field name.
   - `minX`, `minY`, `minZ`, `maxX`, `maxY`, `maxZ` (number) -- Box bounds (metres).
   - `limit`, `offset` (number, optional)
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### `searchGeo3dNearest(field, x, y, z, k, limit?, offset?, initialRadiusM?, maxRadiusM?)`
 
@@ -359,7 +385,7 @@ documents closest to `(x, y, z)`. The optional `initialRadiusM` and
   - `k` (number) -- Number of nearest neighbours to return.
   - `limit`, `offset` (number, optional)
   - `initialRadiusM`, `maxRadiusM` (number, optional)
-- **Returns:** `Promise<SearchResult[]>`
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### `stats()`
 
@@ -891,7 +917,25 @@ cannot resolve in a browser. It is only useful when `laurus-wasm` runs in
 a non-browser WASM host with a real filesystem; browser callers should
 continue to use `JapaneseAnalyzer.fromBytes` + `addAnalyzer`.
 
+## SearchResponse
+
+What every search method resolves to (Issue #1472).
+
+```typescript
+interface SearchResponse {
+  results: SearchResult[]; // The page of results
+  totalHits?: {            // With search's trackTotalHits, the total hit count
+    value: number;           // The number of matching documents counted
+    relation: "eq" | "gte";  // "eq" when value is exact, "gte" when it is a lower bound
+  };
+}
+```
+
+`totalHits` is absent unless asked for, as the HTTP gateway leaves out `"total_hits"`. The relation is written as the HTTP gateway, MCP and the CLI write it. See [Total hits](#total-hits).
+
 ## SearchResult
+
+One result of a search, an element of `SearchResponse.results`.
 
 ```typescript
 interface SearchResult {

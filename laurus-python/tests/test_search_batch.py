@@ -4,7 +4,7 @@ These tests cover the Python-facing batched search API:
 
 - Empty input returns an empty list without invoking the engine.
 - Single-query batch matches the single-query ``search()`` result.
-- Multi-query batch preserves input order and returns one result list
+- Multi-query batch preserves input order and returns one response
   per input query.
 - DSL strings, ``Query`` objects, and ``SearchRequest`` are all accepted.
 """
@@ -32,25 +32,27 @@ def test_search_batch_empty(index):
 
 def test_search_batch_single_query_matches_search(index):
     """search_batch([q]) should match search(q) for an equivalent query."""
-    serial = index.search("title:rust", limit=5)
+    serial = index.search("title:rust", limit=5).results
     batch = index.search_batch(["title:rust"], limit=5)
     assert len(batch) == 1
-    assert len(batch[0]) == len(serial)
-    for b, s in zip(batch[0], serial):
+    assert len(batch[0].results) == len(serial)
+    for b, s in zip(batch[0].results, serial):
         assert b.id == s.id
 
 
 def test_search_batch_multi_query_preserves_order(index):
-    """Multi-query batch returns one list per input, in input order."""
+    """Multi-query batch returns one response per input, in input order."""
     queries = ["title:rust", "body:python", "title:distributed"]
     expected_top_ids = ["doc1", "doc2", "doc3"]
 
     batch = index.search_batch(queries, limit=5)
     assert len(batch) == len(queries)
 
-    for results, expected_id in zip(batch, expected_top_ids):
-        assert len(results) >= 1, f"expected at least 1 hit for query targeting {expected_id}"
-        assert results[0].id == expected_id
+    for response, expected_id in zip(batch, expected_top_ids):
+        assert len(response.results) >= 1, (
+            f"expected at least 1 hit for query targeting {expected_id}"
+        )
+        assert response.results[0].id == expected_id
 
 
 def test_search_batch_with_query_objects(index):
@@ -61,8 +63,8 @@ def test_search_batch_with_query_objects(index):
     ]
     batch = index.search_batch(queries, limit=5)
     assert len(batch) == 2
-    assert batch[0][0].id == "doc1"
-    assert batch[1][0].id == "doc2"
+    assert batch[0].results[0].id == "doc1"
+    assert batch[1].results[0].id == "doc2"
 
 
 def test_search_batch_with_search_requests(index):
@@ -73,17 +75,17 @@ def test_search_batch_with_search_requests(index):
     ]
     batch = index.search_batch(requests)
     assert len(batch) == 2
-    assert batch[0][0].id == "doc1"
-    assert batch[1][0].id == "doc2"
+    assert batch[0].results[0].id == "doc1"
+    assert batch[1].results[0].id == "doc2"
 
 
 def test_search_batch_no_match_returns_empty_inner_list(index):
-    """A query with no matches yields an empty inner list, not a missing entry."""
+    """A query with no matches yields a response with empty results, not a missing entry."""
     queries = ["title:rust", "title:nonexistent_xyz"]
     batch = index.search_batch(queries, limit=5)
     assert len(batch) == 2
-    assert len(batch[0]) >= 1
-    assert batch[1] == []
+    assert len(batch[0].results) >= 1
+    assert batch[1].results == []
 
 
 def test_search_batch_limit_per_query(index):
@@ -91,8 +93,8 @@ def test_search_batch_limit_per_query(index):
     queries = ["body:programming OR body:data", "body:programming OR body:data"]
     batch = index.search_batch(queries, limit=1)
     assert len(batch) == 2
-    for results in batch:
-        assert len(results) <= 1
+    for response in batch:
+        assert len(response.results) <= 1
 
 
 def test_search_batch_engine_error_names_the_query(index):

@@ -2,7 +2,7 @@
 //! numbers passed to integer parameters.
 
 use chrono::DateTime;
-use laurus::{DataValue, Document};
+use laurus::{DataValue, Document, TrackTotalHits};
 use serde_json::Value;
 use wasm_bindgen::JsValue;
 
@@ -65,6 +65,55 @@ pub fn optional_unsigned_param(
     value: Option<f64>,
 ) -> Result<Option<u32>, JsValue> {
     value.map(|v| unsigned_param(context, name, v)).transpose()
+}
+
+/// Read `search`'s `trackTotalHits` as the HTTP gateway reads
+/// `"track_total_hits"` (Issue #1472): an integer from 0 to 4294967295
+/// counts exactly up to it, `true` counts every match, and `false`, `null`
+/// or `undefined` (`None`) counts nothing.
+///
+/// The range is that of every integer parameter ([`unsigned_param`], Issue
+/// #1612); `true` counts past it. A 0 is passed on: the engine rejects it.
+///
+/// # Arguments
+///
+/// * `context` - The method, which starts the error message.
+/// * `value` - The value passed.
+///
+/// # Errors
+///
+/// Returns an error string such as
+/// `Index.search: trackTotalHits must be true, false or an integer from 0 to 4294967295, got "1000"`
+/// for any other value, the value written as `JSON.stringify` writes it
+/// (a number as JavaScript writes it).
+pub fn track_total_hits_param(
+    context: &str,
+    value: Option<&JsValue>,
+) -> Result<TrackTotalHits, JsValue> {
+    let Some(value) = value.filter(|v| !v.is_null() && !v.is_undefined()) else {
+        return Ok(TrackTotalHits::Disabled);
+    };
+    if let Some(flag) = value.as_bool() {
+        return Ok(if flag {
+            TrackTotalHits::Exact
+        } else {
+            TrackTotalHits::Disabled
+        });
+    }
+    let got = match value.as_f64() {
+        Some(number) => match unsigned_param(context, "trackTotalHits", number) {
+            Ok(n) => return Ok(TrackTotalHits::UpTo(u64::from(n))),
+            Err(_) => js_number(number),
+        },
+        None => js_sys::JSON::stringify(value)
+            .ok()
+            .and_then(|s| s.as_string())
+            .unwrap_or_else(|| format!("{value:?}")),
+    };
+    Err(JsValue::from_str(&format!(
+        "{context}: trackTotalHits must be true, false or an integer from 0 to {}, got {got}",
+        u32::MAX
+    )))
 }
 
 /// Write a number as JavaScript writes `NaN`, `Infinity` and `-Infinity`,

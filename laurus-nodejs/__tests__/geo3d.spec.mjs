@@ -65,7 +65,7 @@ describe("Geo3dDistanceQuery", () => {
         50_000.0,
       ),
     );
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     const ids = new Set(results.map((r) => r.id));
     expect(ids).toEqual(new Set(["tokyo_tower", "tokyo_skytree"]));
   });
@@ -82,7 +82,7 @@ describe("Geo3dDistanceQuery", () => {
         200_000.0,
       ),
     );
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     const ids = new Set(results.map((r) => r.id));
     expect(ids).toEqual(new Set(["tokyo_tower", "tokyo_skytree", "mt_fuji"]));
   });
@@ -107,7 +107,7 @@ describe("Geo3dBoundingBoxQuery", () => {
         3_710_000.0,
       ),
     );
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     const ids = new Set(results.map((r) => r.id));
     expect(ids).toEqual(new Set(["tokyo_tower", "tokyo_skytree"]));
   });
@@ -120,7 +120,7 @@ describe("Geo3dNearestQuery", () => {
     req.setLexicalGeo3dNearest(
       Geo3dNearestQuery.kNearest("position", MT_FUJI.x, MT_FUJI.y, MT_FUJI.z, 3),
     );
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     expect(results).toHaveLength(3);
     const ids = new Set(results.map((r) => r.id));
     expect(ids).toEqual(new Set(["mt_fuji", "tokyo_tower", "tokyo_skytree"]));
@@ -142,7 +142,7 @@ describe("Geo3dNearestQuery", () => {
         10_000_000.0,
       ),
     );
-    const results = await index.searchWithRequest(req);
+    const { results } = await index.searchWithRequest(req);
     const ids = new Set(results.map((r) => r.id));
     expect(ids).toEqual(new Set(["tokyo_tower", "tokyo_skytree"]));
   });

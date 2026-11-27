@@ -35,8 +35,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records and returns `nil`. Useful when running under a group-commit policy (see below). |
-| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil, group_by: nil) -> Array<SearchResult>` | Execute a search query. `rescore:` takes a `LateInteractionRescore` that reorders the top results (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). `group_by:` takes a `GroupBy` that groups the results by a field's value (Issue #1297); `limit:` and `offset:` then count groups. Any other value raises `TypeError`. See [GroupBy](#groupby). |
-| `search_batch(queries, limit: 10, offset: 0, highlight: nil, group_by: nil) -> Array<Array<SearchResult>>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight:` and `group_by:` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore:` keyword; a `SearchRequest` element is rescored by its own `rescore:`. A query that cannot be converted or that the engine rejects raises the exception `search` raises for it, with the query's position in front of the message: `queries[1]: ...` (Issue #1627). |
+| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil, group_by: nil, track_total_hits: nil) -> SearchResponse` | Execute a search query and return a [`SearchResponse`](#searchresponse) with the page of results in `results`. `track_total_hits:` asks for the total hit count (Issue #1472); see [Total hits](#total-hits). `rescore:` takes a `LateInteractionRescore` that reorders the top results (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). `group_by:` takes a `GroupBy` that groups the results by a field's value (Issue #1297); `limit:` and `offset:` then count groups. Any other value raises `TypeError`. See [GroupBy](#groupby). |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil, group_by: nil, track_total_hits: nil) -> Array<SearchResponse>` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `responses[i]` is the [`SearchResponse`](#searchresponse) of `queries[i]`, with its own `total_hits`. Empty input returns `[]`. `highlight:`, `group_by:` and `track_total_hits:` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore:` keyword; a `SearchRequest` element is rescored by its own `rescore:`. A query that cannot be converted or that the engine rejects raises the exception `search` raises for it, with the query's position in front of the message: `queries[1]: ...` (Issue #1627). |
 | `stats -> Hash` | Return index statistics (`"document_count"`, `"vector_fields"`). |
 
 ### `search` query argument
@@ -48,9 +48,34 @@ The `query` parameter accepts any of the following:
 - A **vector query object** (`VectorQuery`, `VectorTextQuery`)
 - A **`SearchRequest`** for full control
 
-When `query` is a `SearchRequest`, its own `limit:`, `offset:`, `highlight:`, `rescore:` and `group_by:` are used and the keyword arguments of `search` are ignored.
+When `query` is a `SearchRequest`, its own `limit:`, `offset:`, `highlight:`, `rescore:`, `group_by:` and `track_total_hits:` are used and the keyword arguments of `search` are ignored.
 
 The same value kinds are accepted as the elements of `search_batch`'s `queries` Array — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
+
+### Total hits
+
+`search`, `search_batch` and `SearchRequest.new` take `track_total_hits:` (Issue #1472), which asks for the number of matching documents in the response's `total_hits`, as the HTTP gateway's `"track_total_hits"` does:
+
+| Value | Counts |
+| :--- | :--- |
+| `nil` or `false` (the default) | Nothing: `total_hits` is `nil`. |
+| An Integer from 1 up | Exactly while fewer match. Once the count reaches it, `total_hits` is that number with the relation `"gte"`. |
+| `true` | Every match. |
+
+Counting has a cost: until the count reaches the threshold, a search cannot skip the documents block-max pruning would skip. What a total counts for vector, hybrid and grouped searches is the engine's; see [Total hits](../laurus/engine.md#total-hits). `0` raises `ArgumentError` from the engine (`track_total_hits must count at least 1 match, got UpTo(0)`), a negative Integer or one above `u64::MAX` raises `ArgumentError`, and a value of another class raises `TypeError` (`track_total_hits must be true, false or an Integer from 0 to 18446744073709551615, got "1000"`): a truthy value such as `"1000"` or `:all` is not read as `true`.
+
+Over five documents that match `body:rust`:
+
+```ruby
+response = index.search("body:rust", limit: 2, track_total_hits: 3)
+response.results.length # => 2
+response.total_hits     # => TotalHits(value=3, relation='gte')
+
+response = index.search("body:rust", limit: 2, track_total_hits: true)
+response.total_hits     # => TotalHits(value=5, relation='eq')
+
+index.search("body:rust", limit: 2).total_hits # => nil
+```
 
 ### Highlighting
 
@@ -60,7 +85,7 @@ The same value kinds are accepted as the elements of `search_batch`'s `queries` 
 - A **Hash** with a required `fields` key (String or Symbol) plus any of the optional `HighlightConfig` knobs — `max_fragments`, `fragment_size`, `tag`, `css_class`, `require_field_match`, `max_analyzed_chars`, `return_entire_field_if_no_highlight` (String or Symbol keys both work) — e.g. `highlight: {fields: ["body"], tag: "em", max_fragments: 2}`
 
 ```ruby
-results = index.search("body:rust", highlight: ["body"])
+results = index.search("body:rust", highlight: ["body"]).results
 results[0].highlights # => {"body" => ["<mark>Rust</mark> is a systems programming language."]}
 ```
 
@@ -493,6 +518,7 @@ Laurus::SearchRequest.new(
   highlight: nil,
   rescore: nil,
   group_by: nil,
+  track_total_hits: nil,
 )
 ```
 
@@ -508,6 +534,7 @@ Laurus::SearchRequest.new(
 | `highlight:` | Same Array-or-Hash shape as `Index#search`'s `highlight:` (Issue #1134). See [Highlighting](#highlighting). |
 | `rescore:` | A `LateInteractionRescore` that reorders the top results of the request — lexical, vector, or hybrid (Issue #1351); any other value raises `TypeError`. See [LateInteractionRescore](#lateinteractionrescore). |
 | `group_by:` | A `GroupBy` that groups the results of the request (Issue #1297); any other value raises `TypeError`. See [GroupBy](#groupby). |
+| `track_total_hits:` | How many matches to count for the response's `total_hits` (Issue #1472), read as `Index#search`'s; see [Total hits](#total-hits). Another value raises `TypeError` or `ArgumentError` when the request is constructed. |
 
 ---
 
@@ -545,7 +572,7 @@ index.put_document("b", { "title" => "rust language", "tokens" => [[0.9, 0.2]] }
 index.commit
 
 rescore = Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size: 50)
-results = index.search("title:rust", rescore: rescore)
+results = index.search("title:rust", rescore: rescore).results
 results.map(&:id) # => ["b", "a"] -- "b" has MaxSim 1.1, "a" 0.1
 
 # With a "candle_colbert" embedder on the field, the query can be text.
@@ -587,16 +614,38 @@ index.add_document("manual", { "body" => "Elided lifetimes follow three rules." 
 index.add_document("faq", { "body" => "Why do lifetimes appear in signatures?" })
 index.commit
 
-results = index.search("body:lifetimes", group_by: Laurus::GroupBy.new("_id", group_size: 2))
+results = index.search("body:lifetimes", group_by: Laurus::GroupBy.new("_id", group_size: 2)).results
 results.map { |r| [r.group_key, r.inner_hits.map { |hit| hit.document["body"] }] }
 # => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
 ```
 
 ---
 
+## SearchResponse
+
+Returned by `Index#search`, and for each query by `Index#search_batch` (Issue #1472).
+
+```ruby
+response.results    # => Array          -- The page of results (SearchResult)
+response.total_hits # => TotalHits|nil  -- With track_total_hits:, the total hit count
+```
+
+`inspect` gives `SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))`.
+
+### TotalHits
+
+```ruby
+total.value    # => Integer -- The number of matching documents counted
+total.relation # => String  -- "eq" when value is exact, "gte" when it is a lower bound
+```
+
+The relation is written as the HTTP gateway, MCP and the CLI write it. See [Total hits](#total-hits).
+
+---
+
 ## SearchResult
 
-Returned by `Index#search`.
+One result of a search, an element of `SearchResponse#results`.
 
 ```ruby
 result.id         # => String   -- External document identifier

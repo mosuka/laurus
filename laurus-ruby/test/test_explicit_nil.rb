@@ -36,7 +36,7 @@ class TestExplicitNil < Minitest::Test
   end
 
   def search_request(**kwargs)
-    hits(@index.search(Laurus::SearchRequest.new(**kwargs)))
+    hits(@index.search(Laurus::SearchRequest.new(**kwargs)).results)
   end
 
   def lexical
@@ -48,7 +48,7 @@ class TestExplicitNil < Minitest::Test
   end
 
   def nearest(**kwargs)
-    hits(@index.search(Laurus::Geo3dNearestQuery.k_nearest("p", *TOKYO_TOWER.values, 2, **kwargs)))
+    hits(@index.search(Laurus::Geo3dNearestQuery.k_nearest("p", *TOKYO_TOWER.values, 2, **kwargs)).results)
   end
 
   # [keyword, call with `nil`, call without the keyword]
@@ -66,16 +66,16 @@ class TestExplicitNil < Minitest::Test
        -> { Laurus::WalSyncPolicy.group.inspect }],
       ["WalSyncPolicy.group max_interval_ms:", -> { Laurus::WalSyncPolicy.group(max_interval_ms: nil).inspect },
        -> { Laurus::WalSyncPolicy.group.inspect }],
-      ["Index#search highlight:", -> { hits(@index.search("title:rust", highlight: nil)) },
-       -> { hits(@index.search("title:rust")) }],
-      ["Index#search rescore:", -> { hits(@index.search("title:rust", rescore: nil)) },
-       -> { hits(@index.search("title:rust")) }],
-      ["Index#search group_by:", -> { hits(@index.search("title:rust", group_by: nil)) },
-       -> { hits(@index.search("title:rust")) }],
-      ["Index#search_batch highlight:", -> { @index.search_batch(["title:rust"], highlight: nil).map { |r| hits(r) } },
-       -> { @index.search_batch(["title:rust"]).map { |r| hits(r) } }],
-      ["Index#search_batch group_by:", -> { @index.search_batch(["title:rust"], group_by: nil).map { |r| hits(r) } },
-       -> { @index.search_batch(["title:rust"]).map { |r| hits(r) } }],
+      ["Index#search highlight:", -> { hits(@index.search("title:rust", highlight: nil).results) },
+       -> { hits(@index.search("title:rust").results) }],
+      ["Index#search rescore:", -> { hits(@index.search("title:rust", rescore: nil).results) },
+       -> { hits(@index.search("title:rust").results) }],
+      ["Index#search group_by:", -> { hits(@index.search("title:rust", group_by: nil).results) },
+       -> { hits(@index.search("title:rust").results) }],
+      ["Index#search_batch highlight:", -> { @index.search_batch(["title:rust"], highlight: nil).map { |r| hits(r.results) } },
+       -> { @index.search_batch(["title:rust"]).map { |r| hits(r.results) } }],
+      ["Index#search_batch group_by:", -> { @index.search_batch(["title:rust"], group_by: nil).map { |r| hits(r.results) } },
+       -> { @index.search_batch(["title:rust"]).map { |r| hits(r.results) } }],
       ["add_text_field analyzer:", -> { toml { |s| s.add_text_field("t", analyzer: nil) } },
        -> { toml { |s| s.add_text_field("t") } }],
       ["add_hnsw_field quantizer:", -> { toml { |s| s.add_hnsw_field("v", 4, quantizer: nil) } },

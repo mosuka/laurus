@@ -34,7 +34,7 @@ def test_reopen_without_schema_loads_persisted_schema_and_data(tmp_path):
     idx.close()
 
     reopened = laurus.Index(path=str(tmp_path))
-    results = reopened.search("title:hello", limit=5)
+    results = reopened.search("title:hello", limit=5).results
     assert len(results) == 1
 
 

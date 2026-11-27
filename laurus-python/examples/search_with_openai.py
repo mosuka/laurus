@@ -104,7 +104,9 @@ def main() -> None:
     print("[A] Vector Search: 'database ORM queries'")
     print("=" * 60)
     _print_results(
-        index.search(laurus.VectorQuery("text_vec", embed(client, "database ORM queries")), limit=3)
+        index.search(
+            laurus.VectorQuery("text_vec", embed(client, "database ORM queries")), limit=3
+        ).results
     )
 
     # =====================================================================
@@ -118,7 +120,7 @@ def main() -> None:
         filter_query=laurus.TermQuery("category", "testing"),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [C] Filtered Vector Search — numeric range filter
@@ -131,7 +133,7 @@ def main() -> None:
         filter_query=laurus.NumericRangeQuery("page", min=1, max=1),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [D] Lexical Search
@@ -139,7 +141,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("[D] Lexical Search: 'fixtures'")
     print("=" * 60)
-    _print_results(index.search(laurus.TermQuery("text", "fixtures"), limit=3))
+    _print_results(index.search(laurus.TermQuery("text", "fixtures"), limit=3).results)
 
     # =====================================================================
     # [E] Hybrid Search (RRF)
@@ -153,7 +155,7 @@ def main() -> None:
         fusion=laurus.RRF(k=60.0),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     print("\nSearch with OpenAI example completed!")
 

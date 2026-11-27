@@ -173,7 +173,7 @@ echo str_repeat("=", 60) . PHP_EOL;
 echo "[A] Text-to-Image: query='Laravel admin panel'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 $queryVec = embed_text("Laravel admin panel");
-print_results($index->search(new VectorQuery("content_vec", $queryVec), 3));
+print_results($index->search(new VectorQuery("content_vec", $queryVec), 3)->getResults());
 
 // =====================================================================
 // [B] Text-to-Text: find text descriptions
@@ -189,7 +189,7 @@ $request = new SearchRequest(
     null,
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [C] Image-to-Anything: find documents similar to a given image
@@ -199,6 +199,6 @@ echo "[C] Image-to-Anything: query from 'symfony_profiler.png'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 $queryImgBytes = fake_image("symfony_profiler.png");
 $queryVec = embed_image($queryImgBytes);
-print_results($index->search(new VectorQuery("content_vec", $queryVec), 3));
+print_results($index->search(new VectorQuery("content_vec", $queryVec), 3)->getResults());
 
 echo PHP_EOL . "Multimodal search example completed!" . PHP_EOL;

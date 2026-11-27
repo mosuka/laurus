@@ -161,21 +161,21 @@ class TestIndex < Minitest::Test
 
   def test_search_dsl
     idx = create_index
-    results = idx.search("title:rust", limit: 5)
+    results = idx.search("title:rust", limit: 5).results
     assert results.length >= 1
     assert_equal "doc1", results[0].id
   end
 
   def test_search_term_query
     idx = create_index
-    results = idx.search(Laurus::TermQuery.new("body", "python"), limit: 5)
+    results = idx.search(Laurus::TermQuery.new("body", "python"), limit: 5).results
     assert results.length >= 1
     assert_equal "doc2", results[0].id
   end
 
   def test_search_result_has_id_and_score
     idx = create_index
-    results = idx.search("title:rust", limit: 1)
+    results = idx.search("title:rust", limit: 1).results
     r = results[0]
     assert_equal "doc1", r.id
     assert r.score > 0
@@ -183,14 +183,14 @@ class TestIndex < Minitest::Test
 
   def test_search_limit
     idx = create_index
-    results = idx.search("body:programming OR body:python", limit: 1)
+    results = idx.search("body:programming OR body:python", limit: 1).results
     assert results.length <= 1
   end
 
   def test_search_offset
     idx = create_index
-    all_results = idx.search("body:programming OR body:data", limit: 10)
-    offset_results = idx.search("body:programming OR body:data", limit: 10, offset: 1)
+    all_results = idx.search("body:programming OR body:data", limit: 10).results
+    offset_results = idx.search("body:programming OR body:data", limit: 10, offset: 1).results
     if all_results.length > 1
       assert_equal all_results[1].id, offset_results[0].id
     end
@@ -198,7 +198,7 @@ class TestIndex < Minitest::Test
 
   def test_search_no_results
     idx = create_index
-    results = idx.search("title:nonexistent_xyz", limit: 5)
+    results = idx.search("title:nonexistent_xyz", limit: 5).results
     assert_equal [], results
   end
 
@@ -217,7 +217,7 @@ class TestIndex < Minitest::Test
 
   def test_vector_query
     idx = create_vector_index
-    results = idx.search(Laurus::VectorQuery.new("embedding", [0.1, 0.2, 0.3, 0.4]), limit: 2)
+    results = idx.search(Laurus::VectorQuery.new("embedding", [0.1, 0.2, 0.3, 0.4]), limit: 2).results
     assert results.length >= 1
     assert_equal "doc1", results[0].id
   end
@@ -234,7 +234,7 @@ class TestIndex < Minitest::Test
   def test_search_request_lexical_only
     idx = create_index
     req = Laurus::SearchRequest.new(lexical_query: Laurus::TermQuery.new("title", "rust"), limit: 5)
-    results = idx.search(req)
+    results = idx.search(req).results
     assert results.length >= 1
   end
 
@@ -246,7 +246,7 @@ class TestIndex < Minitest::Test
       fusion: Laurus::RRF.new(k: 60.0),
       limit: 5
     )
-    results = idx.search(req)
+    results = idx.search(req).results
     assert results.length >= 1
   end
 
@@ -266,7 +266,7 @@ class TestIndex < Minitest::Test
       vector_query: Laurus::VectorQuery.new("embedding", [0.1, 0.2, 0.3, 0.4]),
       limit: 5
     )
-    assert_equal %w[lexical vector], idx.search(req).map(&:id).sort
+    assert_equal %w[lexical vector], idx.search(req).results.map(&:id).sort
   end
 
   # Issue #1372: a `query` that cannot be combined is rejected, not dropped.
@@ -302,10 +302,10 @@ class TestIndex < Minitest::Test
   def test_search_request_applies_filter_query
     idx = create_index
     query = "body:programming OR body:python"
-    assert_equal %w[doc1 doc2], idx.search(query).map(&:id).sort
+    assert_equal %w[doc1 doc2], idx.search(query).results.map(&:id).sort
 
     req = Laurus::SearchRequest.new(query: query, filter_query: Laurus::TermQuery.new("title", "rust"))
-    assert_equal ["doc1"], idx.search(req).map(&:id)
+    assert_equal ["doc1"], idx.search(req).results.map(&:id)
   end
 
   # ---------------------------------------------------------------------------
@@ -314,13 +314,13 @@ class TestIndex < Minitest::Test
 
   def test_phrase_query
     idx = create_index
-    results = idx.search(Laurus::PhraseQuery.new("title", ["introduction", "rust"]), limit: 5)
+    results = idx.search(Laurus::PhraseQuery.new("title", ["introduction", "rust"]), limit: 5).results
     assert results.any? { |r| r.id == "doc1" }
   end
 
   def test_fuzzy_query
     idx = create_index
-    results = idx.search(Laurus::FuzzyQuery.new("title", "pythn", max_edits: 1), limit: 5)
+    results = idx.search(Laurus::FuzzyQuery.new("title", "pythn", max_edits: 1), limit: 5).results
     assert results.any? { |r| r.id == "doc2" }
   end
 
@@ -331,7 +331,7 @@ class TestIndex < Minitest::Test
     idx.put_document("doc1", { "year" => 2020 })
     idx.put_document("doc2", { "year" => 2023 })
     idx.commit
-    results = idx.search(Laurus::NumericRangeQuery.new("year", min: 2022, max: 2024), limit: 5)
+    results = idx.search(Laurus::NumericRangeQuery.new("year", min: 2022, max: 2024), limit: 5).results
     assert_equal 1, results.length
     assert_equal "doc2", results[0].id
   end
@@ -361,7 +361,7 @@ class TestIndex < Minitest::Test
   # Issue #1601: an infinite bound compares as a number, like an open side.
   def test_numeric_range_query_infinite_bound_is_an_open_side
     idx = price_index
-    results = idx.search(Laurus::NumericRangeQuery.new("price", min: 0.0, max: Float::INFINITY), limit: 5)
+    results = idx.search(Laurus::NumericRangeQuery.new("price", min: 0.0, max: Float::INFINITY), limit: 5).results
     assert_equal %w[big small], results.map(&:id).sort
   end
 
@@ -380,7 +380,7 @@ class TestIndex < Minitest::Test
   def test_datetime_range_query_with_date_only_bounds
     idx = datetime_index
     q = Laurus::DateTimeRangeQuery.new("created_at", min: "2024-01-01", max: "2024-12-31")
-    assert_equal %w[jan jun], idx.search(q, limit: 5).map(&:id).sort
+    assert_equal %w[jan jun], idx.search(q, limit: 5).results.map(&:id).sort
     assert_includes q.inspect, "DateTimeRangeQuery"
   end
 
@@ -388,14 +388,14 @@ class TestIndex < Minitest::Test
     idx = datetime_index
     # A Time with an offset is normalized to UTC (21:00+09:00 == 12:00Z).
     q = Laurus::DateTimeRangeQuery.new("created_at", min: Time.new(2024, 6, 15, 21, 0, 0, "+09:00"))
-    assert_equal %w[jun next], idx.search(q, limit: 5).map(&:id).sort
+    assert_equal %w[jun next], idx.search(q, limit: 5).results.map(&:id).sort
     q = Laurus::DateTimeRangeQuery.new("created_at", max: "2024-06-15T12:00:00")
-    assert_equal %w[jan jun], idx.search(q, limit: 5).map(&:id).sort
+    assert_equal %w[jan jun], idx.search(q, limit: 5).results.map(&:id).sort
   end
 
   def test_datetime_range_query_dsl_form_reaches_the_index
     idx = datetime_index
-    assert_equal ["jun"], idx.search("created_at:{2024-01-01 TO 2024-12-31}", limit: 5).map(&:id)
+    assert_equal ["jun"], idx.search("created_at:{2024-01-01 TO 2024-12-31}", limit: 5).results.map(&:id)
   end
 
   def test_datetime_range_query_rejects_malformed_bound
@@ -412,13 +412,13 @@ class TestIndex < Minitest::Test
     q = Laurus::BooleanQuery.new
     q.must(Laurus::TermQuery.new("body", "programming"))
     q.must_not(Laurus::TermQuery.new("title", "python"))
-    results = idx.search(q, limit: 5)
+    results = idx.search(q, limit: 5).results
     assert results.all? { |r| r.id != "doc2" }
   end
 
   def test_wildcard_query
     idx = create_index
-    results = idx.search(Laurus::WildcardQuery.new("title", "py*"), limit: 5)
+    results = idx.search(Laurus::WildcardQuery.new("title", "py*"), limit: 5).results
     assert results.any? { |r| r.id == "doc2" }
   end
 
