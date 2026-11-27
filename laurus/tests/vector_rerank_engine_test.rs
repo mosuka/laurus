@@ -143,14 +143,17 @@ async fn engine_search_with_rerank_factor_succeeds_on_stage2_field() -> laurus::
     // #841 hit with factor 3, where doc1 once fell outside the rescored
     // top-3. The Stage-2 wiring this test guards (sidecar emitted, pool
     // loaded, score changed by rerank) is unaffected by the factor.
-    let with_rerank = engine.search(vector_request(&query, Some(4))).await?;
+    let with_rerank = engine
+        .search(vector_request(&query, Some(4)))
+        .await?
+        .results;
     assert_eq!(with_rerank.len(), 1, "expected exactly 1 hit");
     assert_eq!(
         with_rerank[0].id, "doc1",
         "doc1 should be the closest match to the rerank-augmented query"
     );
 
-    let without_rerank = engine.search(vector_request(&query, None)).await?;
+    let without_rerank = engine.search(vector_request(&query, None)).await?.results;
     assert_eq!(without_rerank.len(), 1);
     assert_eq!(without_rerank[0].id, "doc1");
 
@@ -212,7 +215,8 @@ async fn engine_search_with_rerank_factor_silently_falls_back_on_stage1_field() 
     // because the searcher silently degrades to int8 ranking.
     let results = engine
         .search(vector_request(&[0.95, 0.05, 0.0, 0.0], Some(5)))
-        .await?;
+        .await?
+        .results;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "doc1");
     Ok(())

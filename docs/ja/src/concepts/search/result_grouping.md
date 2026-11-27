@@ -26,7 +26,7 @@ let request = SearchRequestBuilder::new()
     .group_by(GroupBy::new("_id").group_size(3))
     .limit(10)
     .build();
-for result in engine.search(request).await? {
+for result in engine.search(request).await?.results {
     // グループの最上位の chunk と、同じ文書の残り最大 2 件。
     println!("{} {}", result.id, result.score);
     for hit in &result.inner_hits {

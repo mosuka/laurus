@@ -57,6 +57,7 @@ async fn rust_scores(engine: &Engine, fields: &[&str]) -> HashMap<String, HashMa
         let results = engine
             .search(request)
             .await
+            .map(|response| response.results)
             .unwrap_or_else(|e| panic!("{field}:rust: {e}"));
         let by_id = results
             .iter()

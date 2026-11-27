@@ -338,11 +338,15 @@ async fn the_dsl_accepts_a_box_across_the_antimeridian() {
             .lexical_query(LexicalSearchQuery::from(dsl))
             .limit(10)
             .build();
-        engine.search(request).await.map(|hits| {
-            let mut ids: Vec<String> = hits.into_iter().map(|hit| hit.id).collect();
-            ids.sort();
-            ids
-        })
+        engine
+            .search(request)
+            .await
+            .map(|response| response.results)
+            .map(|hits| {
+                let mut ids: Vec<String> = hits.into_iter().map(|hit| hit.id).collect();
+                ids.sort();
+                ids
+            })
     };
     assert_eq!(
         search("loc:geo_bbox(-20, 175, -15, -175)").await.unwrap(),

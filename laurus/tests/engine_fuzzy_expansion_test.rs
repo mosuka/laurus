@@ -101,6 +101,7 @@ async fn hits(engine: &Engine, request: SearchRequestBuilder) -> Vec<(String, f3
         .search(request.build())
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| (hit.id, hit.score))
         .collect()
@@ -823,7 +824,11 @@ async fn a_limit_of_no_terms_is_rejected() {
                 request(term("every")).filter_query(query.clone_box()),
             ),
         ] {
-            match engine.search(request.build()).await {
+            match engine
+                .search(request.build())
+                .await
+                .map(|response| response.results)
+            {
                 Err(LaurusError::InvalidArgument(message)) => {
                     assert!(
                         message.contains("max_expansions"),
@@ -858,7 +863,11 @@ async fn a_boost_out_of_range_is_rejected() {
             ),
         ];
         for (what, query) in queries {
-            match engine.search(request(query).build()).await {
+            match engine
+                .search(request(query).build())
+                .await
+                .map(|response| response.results)
+            {
                 Err(LaurusError::InvalidArgument(message)) => {
                     assert!(message.contains("boost"), "{what}, {boost}: {message}")
                 }

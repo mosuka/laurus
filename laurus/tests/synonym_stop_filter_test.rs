@@ -75,6 +75,7 @@ async fn search(engine: &Engine, dsl: &str) -> Result<Vec<String>> {
     let mut ids: Vec<String> = engine
         .search(request)
         .await?
+        .results
         .into_iter()
         .map(|hit| hit.id)
         .collect();

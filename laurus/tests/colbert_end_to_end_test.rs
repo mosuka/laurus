@@ -92,7 +92,8 @@ async fn test_text_ingest_and_text_rescore_with_a_real_model() -> Result<()> {
                     .limit(4)
                     .build(),
             )
-            .await?;
+            .await?
+            .results;
         assert_eq!(results.len(), 4, "{query}");
         assert_eq!(results[0].id, expected, "{query}: {results:?}");
         // Cosine MaxSim over 32 query tokens.

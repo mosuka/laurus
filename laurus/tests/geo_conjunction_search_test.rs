@@ -77,7 +77,7 @@ async fn dsl_hits(engine: &Engine, dsl: &str) -> Result<Vec<String>> {
         .limit(10)
         .query_dsl(dsl.to_string())
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     Ok(results.iter().map(|h| h.id.clone()).collect())
 }
 

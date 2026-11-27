@@ -138,7 +138,7 @@ async fn test_hybrid_search_unification() -> std::result::Result<(), Box<dyn std
         .limit(10)
         .build();
 
-    let res_vector = engine.search(req_vector).await?;
+    let res_vector = engine.search(req_vector).await?.results;
     assert!(!res_vector.is_empty(), "Vector search should return hits");
     let top_id = res_vector[0].id.clone();
 
@@ -150,7 +150,7 @@ async fn test_hybrid_search_unification() -> std::result::Result<(), Box<dyn std
         .limit(10)
         .build();
 
-    let res_lexical = engine.search(req_lexical).await?;
+    let res_lexical = engine.search(req_lexical).await?.results;
     assert!(!res_lexical.is_empty(), "Lexical search should return hits");
     assert_ne!(
         res_lexical[0].id, top_id,
@@ -171,7 +171,7 @@ async fn test_hybrid_search_unification() -> std::result::Result<(), Box<dyn std
         .limit(10)
         .build();
 
-    let res_hybrid = engine.search(req_hybrid).await?;
+    let res_hybrid = engine.search(req_hybrid).await?.results;
     assert!(!res_hybrid.is_empty());
 
     assert_eq!(

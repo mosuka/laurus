@@ -122,6 +122,7 @@ async fn try_search(engine: &Engine, query: Vec<f32>, limit: usize) -> Result<Ve
     Ok(engine
         .search(request)
         .await?
+        .results
         .into_iter()
         .map(|r| (r.id, r.score))
         .collect())

@@ -147,6 +147,7 @@ async fn try_search(engine: &Engine, dimension: usize) -> laurus::Result<Vec<(St
     Ok(engine
         .search(request)
         .await?
+        .results
         .into_iter()
         .map(|hit| (hit.id, hit.score))
         .collect())

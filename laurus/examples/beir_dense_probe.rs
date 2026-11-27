@@ -462,7 +462,7 @@ async fn search(
         builder = builder.vector_rerank_factor(RERANK_FACTOR);
     }
     let started = Instant::now();
-    let results = engine.search(builder.build()).await?;
+    let results = engine.search(builder.build()).await?.results;
     let millis = started.elapsed().as_secs_f64() * 1e3;
     Ok((
         results.into_iter().map(|r| (r.id, r.score)).collect(),

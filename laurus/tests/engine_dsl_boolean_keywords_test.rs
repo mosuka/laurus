@@ -77,7 +77,11 @@ async fn wrong_cases(engine: &Engine, cases: &[(&str, Vec<&'static str>)]) -> Ve
             ),
         ];
         for (route, builder) in routes {
-            match engine.search(builder.limit(100).build()).await {
+            match engine
+                .search(builder.limit(100).build())
+                .await
+                .map(|response| response.results)
+            {
                 Ok(hits) => {
                     let mut found: Vec<String> = hits.into_iter().map(|hit| hit.id).collect();
                     found.sort();

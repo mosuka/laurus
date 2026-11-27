@@ -74,7 +74,7 @@ async fn bare_japanese_query_matches_partially_overlapping_documents() -> Result
 
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("吾輩は猫").await?;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let ids: Vec<&str> = results.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(
@@ -114,7 +114,7 @@ async fn quoted_japanese_phrase_still_requires_adjacency() -> Result<()> {
 
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("title:\"吾輩は猫である\"").await?;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let ids: Vec<&str> = results.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(
@@ -148,7 +148,7 @@ async fn dsl_query_uses_the_per_field_analyzer_not_the_standard_analyzer() -> Re
 
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("形態素解析").await?;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     assert!(
         !results.is_empty(),

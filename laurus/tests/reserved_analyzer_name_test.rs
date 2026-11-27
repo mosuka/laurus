@@ -38,7 +38,7 @@ async fn engine_with_hello_world(schema: Schema) -> Result<Engine> {
 
 async fn hits(engine: &Engine, dsl: &str) -> Result<usize> {
     let request = SearchRequestBuilder::new().query_dsl(dsl).limit(10).build();
-    Ok(engine.search(request).await?.len())
+    Ok(engine.search(request).await?.results.len())
 }
 
 #[tokio::test]

@@ -240,7 +240,8 @@ async fn test_cache_hit_returns_correct_results() {
                 .build(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     let second = engine
         .search(
             SearchRequestBuilder::new()
@@ -248,7 +249,8 @@ async fn test_cache_hit_returns_correct_results() {
                 .build(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .results;
 
     assert!(!first.is_empty());
     assert_eq!(first[0].id, "doc1");

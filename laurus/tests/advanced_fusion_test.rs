@@ -77,7 +77,7 @@ async fn test_advanced_fusion_normalization() -> laurus::Result<()> {
         })
         .build();
 
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     assert_eq!(results.len(), 2);
 
     // Without normalization, vector scores (cosine similarity with small values)
@@ -141,7 +141,7 @@ async fn test_field_boosts() -> laurus::Result<()> {
         .add_field_boost("body", 1.0)
         .build();
 
-    let res_a = engine.search(req_a).await?;
+    let res_a = engine.search(req_a).await?.results;
     // res_a[0].id is the external ID (String)
     let docs_a = engine.get_documents(&res_a[0].id).await?;
     let doc_a = &docs_a[0];
@@ -163,7 +163,7 @@ async fn test_field_boosts() -> laurus::Result<()> {
         .add_field_boost("body", 10.0)
         .build();
 
-    let res_b = engine.search(req_b).await?;
+    let res_b = engine.search(req_b).await?.results;
     let docs_b = engine.get_documents(&res_b[0].id).await?;
     let doc_b = &docs_b[0];
     assert_eq!(
@@ -244,7 +244,7 @@ async fn test_base_weight_affects_weighted_sum_fusion() -> laurus::Result<()> {
         })
         .build();
 
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     assert_eq!(results.len(), 2);
     assert_eq!(
         results[0].id,
@@ -329,7 +329,7 @@ async fn test_base_weight_affects_vector_only_query_through_the_engine() -> laur
         }]))
         .build();
 
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     assert_eq!(results.len(), 2);
     assert_eq!(
         results[0].id,
@@ -442,7 +442,10 @@ async fn out_of_range_fusion_parameters_are_rejected() {
                     .build(),
             ),
         ] {
-            let result = engine.search(request).await;
+            let result = engine
+                .search(request)
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
                 wrong.push(format!("{shape} {fusion:?}: {:?}", result.map(|r| r.len())));
             }
@@ -467,7 +470,8 @@ async fn boundary_fusion_parameters_are_accepted() {
         engine
             .search(hybrid(FusionAlgorithm::RRF { k: 0.0 }).build())
             .await
-            .unwrap(),
+            .unwrap()
+            .results,
     );
     assert_eq!(
         rrf,
@@ -489,7 +493,8 @@ async fn boundary_fusion_parameters_are_accepted() {
                     .build(),
                 )
                 .await
-                .unwrap(),
+                .unwrap()
+                .results,
         );
         let expected: Vec<(String, f32)> = expected
             .iter()
@@ -509,7 +514,8 @@ async fn boundary_fusion_parameters_are_accepted() {
                 .build(),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .results,
     );
     assert_eq!(
         weighted,

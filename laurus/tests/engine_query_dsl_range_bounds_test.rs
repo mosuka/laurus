@@ -83,7 +83,10 @@ async fn a_numeric_bound_next_to_a_string_bound_is_rejected() {
         "price:[5 TO abc]",
     ] {
         for (route, builder) in requests(dsl) {
-            let result = engine.search(builder.build()).await;
+            let result = engine
+                .search(builder.build())
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::Query(m)) if m.contains(expected)) {
                 wrong.push(format!("{route} {dsl}: {:?}", result.map(|r| r.len())));
             }
@@ -105,7 +108,10 @@ async fn a_range_bound_too_large_for_an_f64_is_rejected() {
     ] {
         let expected = format!("range bound {bound} does not fit a 64-bit float");
         for (route, builder) in requests(dsl) {
-            let result = engine.search(builder.build()).await;
+            let result = engine
+                .search(builder.build())
+                .await
+                .map(|response| response.results);
             if !matches!(&result, Err(LaurusError::InvalidArgument(m)) if m.contains(&expected)) {
                 wrong.push(format!("{route} {dsl}: {:?}", result.map(|r| r.len())));
             }
@@ -132,6 +138,7 @@ async fn numbers_written_in_digits_still_search() {
             let found = engine
                 .search(builder.build())
                 .await
+                .map(|response| response.results)
                 .map(|results| results.len());
             if !matches!(found, Ok(n) if n == hits) {
                 wrong.push(format!("{route} {dsl}: {found:?}, expected {hits}"));

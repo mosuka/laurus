@@ -112,6 +112,7 @@ async fn search(engine: &Engine, query: Vec<f32>, limit: usize) -> Vec<(String, 
         .search(request)
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|r| (r.id, r.score))
         .collect()

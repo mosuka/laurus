@@ -198,7 +198,10 @@ fn by_field(field: &'static str) -> impl Fn(&SearchResult) -> Option<String> {
 }
 
 async fn ranking(engine: &Engine, builder: SearchRequestBuilder) -> Result<Vec<SearchResult>> {
-    engine.search(builder.limit(100).build()).await
+    engine
+        .search(builder.limit(100).build())
+        .await
+        .map(|response| response.results)
 }
 
 #[tokio::test]
@@ -214,7 +217,8 @@ async fn chunks_collapse_by_id_in_every_search_type() -> Result<()> {
                         .limit(10)
                         .build(),
                 )
-                .await?;
+                .await?
+                .results;
             assert_eq!(
                 grouped_titles(&grouped),
                 fold(&ungrouped, by_id, group_size, 10),
@@ -251,7 +255,8 @@ async fn offset_and_limit_count_groups() -> Result<()> {
                 .limit(2)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(grouped_titles(&page), all[1..3].to_vec());
     Ok(())
 }
@@ -308,7 +313,8 @@ async fn groups_by_a_text_and_an_integer_field() -> Result<()> {
                     .limit(10)
                     .build(),
             )
-            .await?;
+            .await?
+            .results;
         assert_eq!(
             grouped_titles(&grouped),
             fold(&ungrouped, by_field(field), group_size, 10),
@@ -328,7 +334,8 @@ async fn a_hit_without_a_value_forms_its_own_group() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     let groups: Vec<(Option<DataValue>, Vec<String>)> = grouped
         .iter()
         .map(|leader| {
@@ -373,7 +380,8 @@ async fn grouping_follows_a_field_sort() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(
         grouped_titles(&grouped),
         fold(&ungrouped, by_field("parent"), 2, 10)
@@ -405,7 +413,8 @@ async fn widens_the_pool_when_one_document_fills_the_top() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     let ids: Vec<&str> = grouped.iter().map(|result| result.id.as_str()).collect();
     assert_eq!(ids, ["big", "x", "y"]);
     assert_eq!(title(&grouped[0]), "big chunk 0");
@@ -423,7 +432,8 @@ async fn stops_when_the_first_stage_runs_out() -> Result<()> {
                     .limit(50)
                     .build(),
             )
-            .await?;
+            .await?
+            .results;
         let expected = match mode {
             // "d" does not mention rust.
             Mode::Lexical => 3,
@@ -476,12 +486,12 @@ async fn the_rescored_order_chooses_each_leader() -> Result<()> {
         engine.search(builder.build())
     };
 
-    let plain = search(false).await?;
+    let plain = search(false).await?.results;
     assert_eq!(
         plain.iter().map(title).collect::<Vec<_>>(),
         ["a first stage", "b"]
     );
-    let rescored = search(true).await?;
+    let rescored = search(true).await?.results;
     assert_eq!(
         rescored.iter().map(title).collect::<Vec<_>>(),
         ["a rescored", "b"]
@@ -511,7 +521,8 @@ async fn a_replaced_document_groups_by_its_new_value() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     let groups: Vec<(Option<DataValue>, Vec<String>)> = grouped
         .iter()
         .map(|leader| {
@@ -548,7 +559,8 @@ async fn inner_hits_are_highlighted() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     let a = grouped
         .iter()
         .find(|result| result.id == "a")
@@ -564,7 +576,7 @@ async fn inner_hits_are_highlighted() -> Result<()> {
     Ok(())
 }
 
-fn assert_invalid(result: Result<Vec<SearchResult>>, fragment: &str) {
+fn assert_invalid(result: Result<laurus::SearchResponse>, fragment: &str) {
     match result {
         Err(LaurusError::InvalidArgument(message)) => {
             assert!(message.contains(fragment), "{message}");
@@ -611,7 +623,7 @@ async fn rejects_requests_that_cannot_group() -> Result<()> {
     assert_invalid(search(GroupBy::new("tags"), 0, 10).await, "multi_valued");
     assert_invalid(search(GroupBy::new("no_dv"), 0, 10).await, "doc_values");
 
-    assert!(search(GroupBy::new("_id"), 0, 0).await?.is_empty());
+    assert!(search(GroupBy::new("_id"), 0, 0).await?.results.is_empty());
     Ok(())
 }
 
@@ -627,7 +639,8 @@ async fn an_ungrouped_search_returns_no_group_fields() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(results.len(), 6, "every rust chunk, ungrouped");
     assert!(
         results
@@ -725,7 +738,8 @@ async fn a_grouped_search_with_limit_0_rejects_what_limit_1_rejects() -> Result<
 
     let valid = engine
         .search(grouped(0).lexical_query(rust(1.0)).build())
-        .await?;
+        .await?
+        .results;
     assert!(valid.is_empty(), "a valid request with limit 0: {valid:?}");
     Ok(())
 }

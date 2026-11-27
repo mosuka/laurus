@@ -428,6 +428,7 @@ async fn search(
     engine
         .search(request.build())
         .await
+        .map(|response| response.results)
         .map(|hits| hits.into_iter().map(|hit| (hit.id, hit.score)).collect())
         .map_err(|e| format!("a search failed: {e}"))
 }

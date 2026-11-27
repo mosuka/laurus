@@ -125,7 +125,8 @@ async fn scored(engine: &Engine) -> Result<Vec<(String, f32)>> {
                 .limit(DOC_COUNT)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     Ok(results.into_iter().map(|r| (r.id, r.score)).collect())
 }
 

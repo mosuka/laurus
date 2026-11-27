@@ -200,7 +200,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 ### Warmup
@@ -236,6 +236,48 @@ call multiple times and is a no-op for lexical-only workloads.
 | `vector_options` | `VectorSearchOptions` | Default | Parameters controlling vector search behavior |
 | `rescore` | `Option<RescoreOptions>` | None | Second stage that reorders the top first-stage candidates ([Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)) |
 | `group_by` | `Option<GroupBy>` | None | Group the ranked hits by a field's value; when set, `limit` and `offset` count groups ([Result Grouping](../concepts/search/result_grouping.md)) |
+| `track_total_hits` | `TrackTotalHits` | `Disabled` | How many matches to count for `SearchResponse::total_hits`: `Disabled` (none), `UpTo(n)` or `Exact` (see [Total hits](#total-hits)) |
+
+### Total hits
+
+`Engine::search` returns a `SearchResponse`, which holds the page of `results` and, when the request asks for one, `total_hits`: a `TotalHits` with a `value` and a `relation`, `Exact` or `AtLeast` (Issue #1472). As in Lucene and Elasticsearch, counting has a cost: until the count reaches the threshold, a search cannot skip the documents that block-max pruning would skip. So nothing is counted by default.
+
+| `track_total_hits` | `total_hits` |
+| :--- | :--- |
+| `Disabled` (default) | `None` |
+| `UpTo(n)` | `Exact(count)` below `n`, `AtLeast(n)` from `n` on. `n` must be at least 1; `UpTo(0)` is rejected with `InvalidArgument` |
+| `Exact` | `Exact(count)`, which visits every match |
+
+What the total counts depends on the search:
+
+| Search | `total_hits` |
+| :--- | :--- |
+| Lexical | The documents that match the query (and the filter) at or above the lexical `min_score`, by the rule above |
+| Vector | `AtLeast` the number of hits the search ranked: an approximate search has no set of matches to count |
+| Hybrid, `Union` | `AtLeast` the larger of the lexical total's value and the number of fused candidates |
+| Hybrid, `Intersection` | `AtLeast` the number of fused candidates; the lexical count is only an upper bound there |
+| With `group_by` | The documents of the search the groups are formed from, not the groups. A grouped search with `limit` 0 still counts |
+| A filter that matches nothing | `Exact(0)` |
+
+```rust
+use laurus::{SearchRequestBuilder, TotalHitsRelation, TrackTotalHits};
+
+let response = engine
+    .search(
+        SearchRequestBuilder::new()
+            .query_dsl("body:rust")
+            .limit(10)
+            .track_total_hits(TrackTotalHits::UpTo(10_000))
+            .build(),
+    )
+    .await?;
+if let Some(total) = response.total_hits {
+    let prefix = if total.relation == TotalHitsRelation::AtLeast { "at least " } else { "" };
+    println!("{prefix}{} matches, showing {}", total.value, response.results.len());
+}
+```
+
+`Engine::search_batch` returns one `SearchResponse` per request.
 
 ### LexicalSearchOptions
 

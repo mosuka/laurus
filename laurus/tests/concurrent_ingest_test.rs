@@ -396,7 +396,7 @@ fn concurrent_dynamic_puts_add_each_new_field_once() {
             .query_dsl(format!("shared:[0 TO {}]", PER_THREAD - 1))
             .limit(THREADS * PER_THREAD + 1)
             .build();
-        let hits = engine.search(request).await.unwrap().len();
+        let hits = engine.search(request).await.unwrap().results.len();
         if hits != THREADS * PER_THREAD {
             wrong.push(format!("shared:[..] finds {hits} documents"));
         }

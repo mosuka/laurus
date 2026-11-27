@@ -601,7 +601,7 @@ fn bench_term_query(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(query))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -617,7 +617,7 @@ fn bench_term_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(query))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -642,7 +642,7 @@ fn bench_term_query_varying_limit(c: &mut Criterion) {
             .lexical_query(LexicalSearchQuery::Obj(query))
             .limit(10)
             .build();
-        engine.search(request).await.unwrap()
+        engine.search(request).await.unwrap().results
     });
     assert!(
         !probe_small.is_empty(),
@@ -665,7 +665,7 @@ fn bench_term_query_varying_limit(c: &mut Criterion) {
                             .lexical_query(LexicalSearchQuery::Obj(query))
                             .limit(limit)
                             .build();
-                        black_box(engine.search(request).await.unwrap())
+                        black_box(engine.search(request).await.unwrap().results)
                     }
                 });
             },
@@ -701,7 +701,7 @@ fn bench_field_sorted_query(c: &mut Criterion) {
                 })
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -730,7 +730,7 @@ fn bench_field_sorted_query(c: &mut Criterion) {
                                 })
                                 .limit(limit)
                                 .build();
-                            black_box(engine.search(request).await.unwrap())
+                            black_box(engine.search(request).await.unwrap().results)
                         }
                     });
                 },
@@ -758,7 +758,7 @@ fn bench_boolean_query(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -777,7 +777,7 @@ fn bench_boolean_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -795,7 +795,7 @@ fn bench_boolean_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -816,7 +816,7 @@ fn bench_boolean_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -833,7 +833,7 @@ fn bench_boolean_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -875,7 +875,7 @@ fn bench_topk_or_skewed_tf(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -894,7 +894,7 @@ fn bench_topk_or_skewed_tf(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -917,7 +917,7 @@ fn bench_topk_or_skewed_tf(c: &mut Criterion) {
                             .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                             .limit(10)
                             .build();
-                        black_box(engine.search(request).await.unwrap())
+                        black_box(engine.search(request).await.unwrap().results)
                     }
                 });
             },
@@ -955,7 +955,7 @@ fn bench_topk_or_multi_segment(c: &mut Criterion) {
                     .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                     .limit(10)
                     .build();
-                engine.search(request).await.unwrap()
+                engine.search(request).await.unwrap().results
             });
             assert!(
                 !probe.is_empty(),
@@ -975,7 +975,7 @@ fn bench_topk_or_multi_segment(c: &mut Criterion) {
                             .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                             .limit(10)
                             .build();
-                        black_box(engine.search(request).await.unwrap())
+                        black_box(engine.search(request).await.unwrap().results)
                     }
                 });
             });
@@ -1020,7 +1020,7 @@ fn bench_seek_skewed(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -1038,7 +1038,7 @@ fn bench_seek_skewed(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -1068,7 +1068,7 @@ fn bench_phrase_query(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(query))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -1087,7 +1087,7 @@ fn bench_phrase_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(query))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -1104,7 +1104,7 @@ fn bench_phrase_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(query))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -1127,7 +1127,7 @@ fn bench_fuzzy_query(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(query))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -1143,7 +1143,7 @@ fn bench_fuzzy_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(query))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -1157,7 +1157,7 @@ fn bench_fuzzy_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(query))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -1183,7 +1183,7 @@ fn bench_wildcard_query(c: &mut Criterion) {
                 .lexical_query(LexicalSearchQuery::Obj(query))
                 .limit(10)
                 .build();
-            engine.search(request).await.unwrap()
+            engine.search(request).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -1199,7 +1199,7 @@ fn bench_wildcard_query(c: &mut Criterion) {
                         .lexical_query(LexicalSearchQuery::Obj(query))
                         .limit(10)
                         .build();
-                    black_box(engine.search(request).await.unwrap())
+                    black_box(engine.search(request).await.unwrap().results)
                 }
             });
         });
@@ -1217,7 +1217,7 @@ fn bench_dsl_query(c: &mut Criterion) {
             .lexical_query(LexicalSearchQuery::Dsl("body:programming".to_string()))
             .limit(10)
             .build();
-        engine.search(request).await.unwrap()
+        engine.search(request).await.unwrap().results
     });
     assert!(
         !probe.is_empty(),
@@ -1235,7 +1235,7 @@ fn bench_dsl_query(c: &mut Criterion) {
                     .lexical_query(LexicalSearchQuery::Dsl("body:programming".to_string()))
                     .limit(10)
                     .build();
-                black_box(engine.search(request).await.unwrap())
+                black_box(engine.search(request).await.unwrap().results)
             }
         });
     });
@@ -1250,7 +1250,7 @@ fn bench_dsl_query(c: &mut Criterion) {
                     ))
                     .limit(10)
                     .build();
-                black_box(engine.search(request).await.unwrap())
+                black_box(engine.search(request).await.unwrap().results)
             }
         });
     });
@@ -1265,7 +1265,7 @@ fn bench_dsl_query(c: &mut Criterion) {
                     ))
                     .limit(10)
                     .build();
-                black_box(engine.search(request).await.unwrap())
+                black_box(engine.search(request).await.unwrap().results)
             }
         });
     });

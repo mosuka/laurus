@@ -34,7 +34,7 @@ async fn test_wal_recovery_uncommitted() -> laurus::Result<()> {
         let search_request = laurus::SearchRequestBuilder::new()
             .lexical_query(LexicalSearchQuery::Obj(query))
             .build();
-        let search_results = engine.search(search_request).await?;
+        let search_results = engine.search(search_request).await?.results;
         assert_eq!(search_results.len(), 0);
 
         let doc1 = Document::builder()
@@ -60,7 +60,7 @@ async fn test_wal_recovery_uncommitted() -> laurus::Result<()> {
         let search_request = laurus::SearchRequestBuilder::new()
             .lexical_query(LexicalSearchQuery::Obj(query))
             .build();
-        let search_results = engine.search(search_request).await?;
+        let search_results = engine.search(search_request).await?.results;
         assert_eq!(
             search_results.len(),
             1,
@@ -114,7 +114,7 @@ async fn test_wal_recovery_group_commit_flush_wal() -> laurus::Result<()> {
         let search_request = laurus::SearchRequestBuilder::new()
             .lexical_query(LexicalSearchQuery::Obj(query))
             .build();
-        let search_results = engine.search(search_request).await?;
+        let search_results = engine.search(search_request).await?.results;
         assert_eq!(
             search_results.len(),
             1,
@@ -170,7 +170,7 @@ async fn test_commit_policy_every_docs_crash_recovery() -> laurus::Result<()> {
             .lexical_query(LexicalSearchQuery::Obj(query))
             .limit(10)
             .build();
-        let results = engine.search(search_request).await?;
+        let results = engine.search(search_request).await?.results;
         assert_eq!(
             results.len(),
             5,

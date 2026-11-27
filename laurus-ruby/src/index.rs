@@ -435,8 +435,9 @@ impl RbIndex {
         )?;
 
         let engine = self.engine()?;
-        let results =
-            without_gvl(|| self.rt.block_on(engine.search(request))).map_err(laurus_err)?;
+        let results = without_gvl(|| self.rt.block_on(engine.search(request)))
+            .map_err(laurus_err)?
+            .results;
 
         let arr = ruby.ary_new_capa(results.len());
         for r in results {
@@ -544,8 +545,8 @@ impl RbIndex {
 
         let outer = ruby.ary_new_capa(batch_results.len());
         for per_query_results in batch_results {
-            let inner = ruby.ary_new_capa(per_query_results.len());
-            for r in per_query_results {
+            let inner = ruby.ary_new_capa(per_query_results.results.len());
+            for r in per_query_results.results {
                 let rb_result = to_rb_search_result(r);
                 inner.push(ruby.into_value(rb_result))?;
             }

@@ -112,7 +112,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 
 for result in &results {
     println!("ID: {}, Score: {:.4}", result.id, result.score);
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
         .limit(10)
         .build();
 
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     for r in &results {
         println!("{}: score={:.4}", r.id, r.score);
     }

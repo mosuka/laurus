@@ -67,7 +67,7 @@ async fn lexical_search_highlights_requested_stored_text_field() -> Result<()> {
         .lexical_query(term("body", "rust"))
         .highlight(vec!["body".to_string()])
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     assert_eq!(results.len(), 1);
     let hit = only(&results, "doc1");
@@ -91,7 +91,7 @@ async fn dsl_request_highlights_after_setting_lexical_options() -> Result<()> {
 
     let mut request = engine.unified_query_parser()?.parse("body:rust").await?;
     request.lexical_options.highlight = Some(HighlightOptions::new(vec!["body".to_string()]));
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     assert!(only(&results, "doc1").highlights["body"][0].contains("<mark>Rust</mark>"));
     Ok(())
@@ -104,7 +104,7 @@ async fn highlights_are_empty_when_not_requested() -> Result<()> {
     let request = SearchRequestBuilder::new()
         .lexical_query(term("body", "rust"))
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     assert!(!results.is_empty());
     assert!(results.iter().all(|r| r.highlights.is_empty()));
@@ -151,7 +151,7 @@ async fn hybrid_search_highlights_lexical_matches_only() -> Result<()> {
         .fusion_algorithm(FusionAlgorithm::RRF { k: 60.0 })
         .highlight(vec!["title".to_string()])
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     assert_eq!(
         results.len(),
@@ -193,7 +193,7 @@ async fn non_stored_field_is_not_highlighted() -> Result<()> {
         .lexical_query(term("body", "rust"))
         .highlight(vec!["body".to_string()])
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let hit = only(&results, "doc1");
     assert!(
@@ -233,7 +233,7 @@ async fn non_text_and_unknown_fields_are_skipped() -> Result<()> {
             "title".to_string(),
         ])
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let keys: Vec<&String> = only(&results, "doc1").highlights.keys().collect();
     assert_eq!(keys, [&"title".to_string()]);
@@ -266,7 +266,7 @@ async fn require_field_match_false_highlights_terms_from_other_fields() -> Resul
         .lexical_query(term("title", "rust"))
         .highlight(fields())
         .build();
-    let hit_strict = engine.search(strict).await?;
+    let hit_strict = engine.search(strict).await?.results;
     let strict_keys: Vec<&String> = only(&hit_strict, "doc1").highlights.keys().collect();
     assert_eq!(strict_keys, [&"title".to_string()]);
 
@@ -275,7 +275,7 @@ async fn require_field_match_false_highlights_terms_from_other_fields() -> Resul
         .highlight(fields())
         .highlight_config(HighlightConfig::default().require_field_match(false))
         .build();
-    let hit_relaxed = engine.search(relaxed).await?;
+    let hit_relaxed = engine.search(relaxed).await?.results;
     let highlights = &only(&hit_relaxed, "doc1").highlights;
     assert!(highlights.contains_key("title") && highlights.contains_key("body"));
     Ok(())
@@ -294,7 +294,7 @@ async fn highlight_config_tag_and_css_class_are_applied() -> Result<()> {
                 .css_class("hl".to_string()),
         )
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let fragment = &only(&results, "doc1").highlights["body"][0];
     assert!(
@@ -328,7 +328,7 @@ async fn filter_query_terms_are_not_highlighted() -> Result<()> {
         .filter_query(Box::new(TermQuery::new("category", "rust")))
         .highlight(vec!["title".to_string(), "category".to_string()])
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let highlights = &only(&results, "doc1").highlights;
     assert!(highlights["title"][0].contains("<mark>search</mark>"));
@@ -367,7 +367,7 @@ async fn per_field_keyword_analyzer_drives_highlighting() -> Result<()> {
         .parse(r#"category:"Rust Lang""#)
         .await?;
     request.lexical_options.highlight = Some(HighlightOptions::new(vec!["category".to_string()]));
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let fragment = &only(&results, "doc1").highlights["category"][0];
     assert_eq!(fragment, "<mark>Rust Lang</mark>");
@@ -405,7 +405,7 @@ async fn per_field_japanese_analyzer_drives_highlighting() -> Result<()> {
 
     let mut request = engine.unified_query_parser()?.parse("body:猫").await?;
     request.lexical_options.highlight = Some(HighlightOptions::new(vec!["body".to_string()]));
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     let fragment = &only(&results, "doc1").highlights["body"][0];
     assert!(fragment.contains("<mark>猫</mark>"), "{fragment}");
@@ -428,8 +428,8 @@ async fn search_batch_propagates_highlights() -> Result<()> {
         .await?;
 
     assert_eq!(batches.len(), 2);
-    assert!(only(&batches[0], "doc1").highlights["body"][0].contains("<mark>Rust</mark>"));
-    assert!(only(&batches[1], "doc1").highlights.is_empty());
+    assert!(only(&batches[0].results, "doc1").highlights["body"][0].contains("<mark>Rust</mark>"));
+    assert!(only(&batches[1].results, "doc1").highlights.is_empty());
     Ok(())
 }
 
@@ -469,7 +469,7 @@ async fn multi_valued_text_field_is_highlighted_per_element() -> Result<()> {
         .lexical_query(term("notes", "fox"))
         .highlight(vec!["notes".to_string()])
         .build();
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
     let notes = &only(&results, "doc1").highlights["notes"];
     assert_eq!(
         notes.len(),
@@ -494,7 +494,7 @@ async fn multi_valued_text_field_is_highlighted_per_element() -> Result<()> {
             ..HighlightConfig::default()
         })
         .build();
-    let results = engine.search(capped).await?;
+    let results = engine.search(capped).await?.results;
     assert_eq!(only(&results, "doc1").highlights["notes"].len(), 1);
     Ok(())
 }
@@ -531,7 +531,7 @@ async fn phrase_hits_are_highlighted_at_the_same_slop() -> Result<()> {
             .lexical_query(LexicalSearchQuery::Obj(Box::new(query) as Box<dyn Query>))
             .highlight(vec!["body".to_string()])
             .build();
-        let results = engine.search(request).await?;
+        let results = engine.search(request).await?.results;
 
         let mut hits: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         hits.sort_unstable();

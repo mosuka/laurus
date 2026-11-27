@@ -78,6 +78,7 @@ async fn hits(engine: &Engine, request: SearchRequestBuilder) -> Vec<(String, f3
         .search(request.build())
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| (hit.id, hit.score))
         .collect()

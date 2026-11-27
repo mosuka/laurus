@@ -61,6 +61,7 @@ async fn find(engine: &Engine, term: &str) -> Result<Vec<String>, String> {
                 .build(),
         )
         .await
+        .map(|response| response.results)
         .map(|results| results.into_iter().map(|r| r.id).collect())
         .map_err(|e| e.to_string())
 }

@@ -76,7 +76,8 @@ fn field_sort_desc_single_segment() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(3)
-                .sort_by_field_desc("popularity"),
+                .sort_by_field_desc("popularity")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
 
@@ -86,7 +87,8 @@ fn field_sort_desc_single_segment() {
         vec![9, 8, 7]
     );
     assert_eq!(
-        results.total_hits, 12,
+        results.total_hits.unwrap().value,
+        12,
         "total_hits must be the true match count"
     );
 }
@@ -116,7 +118,8 @@ fn field_sort_multi_segment() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(3)
-                .sort_by_field_desc("popularity"),
+                .sort_by_field_desc("popularity")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
 
@@ -127,7 +130,8 @@ fn field_sort_multi_segment() {
     // #944 Phase A: the per-segment fanout must preserve the documented
     // true-match-count contract by summing per-segment totals.
     assert_eq!(
-        results.total_hits, 12,
+        results.total_hits.unwrap().value,
+        12,
         "total_hits must remain the true match count under the fanout"
     );
 }
@@ -285,7 +289,8 @@ fn field_sort_prefix_query_total_hits_with_pruning() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(3)
-                .sort_by_field_desc("popularity"),
+                .sort_by_field_desc("popularity")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
     assert_eq!(
@@ -294,7 +299,8 @@ fn field_sort_prefix_query_total_hits_with_pruning() {
         "the newest segment holds the whole answer"
     );
     assert_eq!(
-        results.total_hits, 24,
+        results.total_hits.unwrap().value,
+        24,
         "pruned segments must still contribute their exact match count \
          once the fanout rewrites the query before counting"
     );
@@ -537,7 +543,8 @@ fn field_sort_disjoint_segment_ranges_matches_unpruned() {
         .search(
             LexicalSearchRequest::new(query.clone_box())
                 .limit(3)
-                .sort_by_field_desc("popularity"),
+                .sort_by_field_desc("popularity")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
     assert_eq!(
@@ -546,7 +553,8 @@ fn field_sort_disjoint_segment_ranges_matches_unpruned() {
         "the newest segment holds the whole answer"
     );
     assert_eq!(
-        results.total_hits, 24,
+        results.total_hits.unwrap().value,
+        24,
         "pruned segments must still contribute their exact match count"
     );
 
@@ -555,14 +563,15 @@ fn field_sort_disjoint_segment_ranges_matches_unpruned() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(3)
-                .sort_by_field_asc("popularity"),
+                .sort_by_field_asc("popularity")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
     assert_eq!(
         asc.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
-    assert_eq!(asc.total_hits, 24);
+    assert_eq!(asc.total_hits.unwrap().value, 24);
 }
 
 /// #944 Phase B: when a document lacks the sort field it sorts as `Null`
@@ -591,7 +600,8 @@ fn field_sort_with_missing_values_across_segments() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(4)
-                .sort_by_field_desc("popularity"),
+                .sort_by_field_desc("popularity")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
 
@@ -600,5 +610,5 @@ fn field_sort_with_missing_values_across_segments() {
         results.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
         vec![4, 2, 1, 3]
     );
-    assert_eq!(results.total_hits, 4);
+    assert_eq!(results.total_hits.unwrap().value, 4);
 }

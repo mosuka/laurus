@@ -109,6 +109,7 @@ async fn search(engine: &Engine, query: Vec<f32>, limit: usize) -> Result<Vec<St
     engine
         .search(request)
         .await
+        .map(|response| response.results)
         .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
         .map_err(|e| e.to_string())
 }

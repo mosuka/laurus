@@ -93,15 +93,17 @@ pub struct SearchHit {
 /// # Fields
 ///
 /// - `hits` - Ranked list of [`SearchHit`] entries, ordered by descending score.
-/// - `total_hits` - Total number of documents that matched the query (may exceed `hits.len()`
-///   when a limit is applied).
+/// - `total_hits` - The number of documents at or above `min_score` that
+///   matched the query, exact up to the threshold the request's
+///   `track_total_hits` chose and a lower bound from it on, or `None` when
+///   no total was asked for (Issue #1472).
 /// - `max_score` - The highest relevance score among all results, useful for normalization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LexicalSearchResults {
     /// The search hits.
     pub hits: Vec<SearchHit>,
-    /// Total number of matching documents.
-    pub total_hits: u64,
+    /// The total number of matches, or `None` when none was asked for.
+    pub total_hits: Option<crate::lexical::search::searcher::TotalHits>,
     /// Maximum score in the results.
     pub max_score: f32,
 }

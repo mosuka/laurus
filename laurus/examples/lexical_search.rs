@@ -144,7 +144,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[1b] Search for 'programming' in category (KeywordAnalyzer — exact):");
@@ -158,7 +159,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[1c] Search for in_print=true (boolean field):");
@@ -171,7 +173,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[1d] DSL: 'body:rust'");
@@ -183,7 +186,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -204,7 +208,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[2b] Phrase 'systems programming language' in body:");
@@ -218,7 +223,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[2c] DSL: 'body:\"machine learning\"'");
@@ -230,7 +236,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -250,7 +257,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[3b] Fuzzy 'javascritp' (transposed, edit distance 1):");
@@ -263,7 +271,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[3c] DSL: 'programing~2'");
@@ -275,7 +284,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -295,7 +305,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[4b] Wildcard 'pro*' in body:");
@@ -308,7 +319,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[4c] DSL: 'body:pro*'");
@@ -320,7 +332,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -340,7 +353,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[5b] Books published after 2020:");
@@ -353,7 +367,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[5c] DSL: 'price:[40 TO 60]'");
@@ -365,7 +380,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -385,7 +401,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[6b] Bounding box — US West Coast (33, -123) to (48, -117):");
@@ -400,7 +417,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -421,7 +439,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[7b] OR: category='programming' OR category='web-development':");
@@ -435,7 +454,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[7c] NOT: 'programming' in body, NOT 'python':");
@@ -449,7 +469,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[7d] DSL: '+body:programming -body:python'");
@@ -461,7 +482,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // =====================================================================
@@ -488,7 +510,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[8b] SpanContaining: 'quick..fox' containing 'brown':");
@@ -508,7 +531,8 @@ async fn main() -> Result<()> {
                 .limit(5)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\nLexical search example completed successfully!");

@@ -389,6 +389,7 @@ async fn found(engine: &Engine) -> BTreeSet<String> {
         .search(request)
         .await
         .unwrap()
+        .results
         .into_iter()
         .map(|hit| hit.id)
         .collect()

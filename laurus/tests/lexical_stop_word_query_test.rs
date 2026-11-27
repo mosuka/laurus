@@ -45,7 +45,8 @@ async fn test_engine(body_analyzer: &str) -> Result<Engine> {
 async fn search(engine: &Engine, dsl: &str) -> Result<Vec<(String, f32)>> {
     let results = engine
         .search(SearchRequestBuilder::new().query_dsl(dsl).limit(10).build())
-        .await?;
+        .await?
+        .results;
     let mut hits: Vec<_> = results.into_iter().map(|hit| (hit.id, hit.score)).collect();
     hits.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(hits)

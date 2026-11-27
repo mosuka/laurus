@@ -280,7 +280,7 @@ fn bench_commit(c: &mut Criterion) {
                     ))))
                     .limit(10)
                     .build();
-                let hits = engine.search(request).await.unwrap();
+                let hits = engine.search(request).await.unwrap().results;
                 assert!(
                     !hits.is_empty(),
                     "commit probe must produce searchable docs at n={n}"

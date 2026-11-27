@@ -613,7 +613,7 @@ async fn query_dsl_accepts_the_reserved_id_field() -> Result<()> {
 
     let parser = engine.unified_query_parser()?;
     let request = parser.parse("_id:doc-001").await?;
-    let results = engine.search(request).await?;
+    let results = engine.search(request).await?.results;
 
     assert_eq!(
         results.len(),

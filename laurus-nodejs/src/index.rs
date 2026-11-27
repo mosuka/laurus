@@ -402,7 +402,12 @@ impl JsIndex {
             .as_ref()
             .map(|g| js_group_by_options_to_core(g, CONTEXT))
             .transpose()?;
-        let results = self.engine()?.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine()?
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
 
@@ -443,7 +448,12 @@ impl JsIndex {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
         let mut request = build_lexical_request(&query, limit, offset)?;
         request.lexical_options.highlight = highlight;
-        let results = self.engine()?.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine()?
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
 
@@ -478,7 +488,12 @@ impl JsIndex {
             vector: vector.into_iter().map(|v| v as f32).collect(),
         });
         let request = build_vector_request(&query, limit, offset);
-        let results = self.engine()?.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine()?
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
 
@@ -510,7 +525,12 @@ impl JsIndex {
         let (limit, offset) = limit_and_offset("Index.searchVectorText", limit, offset)?;
         let query = JsVectorQuery::VectorTextQuery(JsVectorTextQuery { field, text });
         let request = build_vector_request(&query, limit, offset);
-        let results = self.engine()?.search(request).await.map_err(laurus_err)?;
+        let results = self
+            .engine()?
+            .search(request)
+            .await
+            .map_err(laurus_err)?
+            .results;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
 
@@ -529,7 +549,12 @@ impl JsIndex {
         request: &JsSearchRequest,
     ) -> Result<Vec<JsSearchResult>> {
         let req = request.build()?;
-        let results = self.engine()?.search(req).await.map_err(laurus_err)?;
+        let results = self
+            .engine()?
+            .search(req)
+            .await
+            .map_err(laurus_err)?
+            .results;
         Ok(results.into_iter().map(to_js_search_result).collect())
     }
 
@@ -614,6 +639,7 @@ impl JsIndex {
             .into_iter()
             .map(|per_query_results| {
                 per_query_results
+                    .results
                     .into_iter()
                     .map(to_js_search_result)
                     .collect()

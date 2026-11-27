@@ -42,7 +42,7 @@ async fn test_engine_unified_deletion() -> laurus::Result<()> {
             "title", "hello",
         ))))
         .build();
-    let res_lexical = engine.search(req_lexical).await?;
+    let res_lexical = engine.search(req_lexical).await?.results;
     assert_eq!(res_lexical.len(), 1, "Should be found lexically");
 
     // Vector check
@@ -53,7 +53,7 @@ async fn test_engine_unified_deletion() -> laurus::Result<()> {
             fields: Some(vec!["embedding".into()]),
         }]))
         .build();
-    let res_vector = engine.search(req_vector).await?;
+    let res_vector = engine.search(req_vector).await?.results;
     assert_eq!(res_vector.len(), 1, "Should be found via vector");
 
     // 5. Delete by ID
@@ -69,7 +69,8 @@ async fn test_engine_unified_deletion() -> laurus::Result<()> {
                 ))))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res_lexical_after.len(), 0, "Should be deleted lexically");
 
     let res_vector_after = engine
@@ -82,7 +83,8 @@ async fn test_engine_unified_deletion() -> laurus::Result<()> {
                 }]))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res_vector_after.len(), 0, "Should be deleted via vector");
 
     Ok(())
@@ -129,7 +131,8 @@ async fn test_engine_upsert() -> laurus::Result<()> {
                 ))))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res.len(), 1);
 
     // 5. Index updated document with SAME ID "doc1"
@@ -151,7 +154,8 @@ async fn test_engine_upsert() -> laurus::Result<()> {
                 ))))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res_old.len(), 0, "Old version should be replaced");
 
     // New version lookup should succeed
@@ -163,7 +167,8 @@ async fn test_engine_upsert() -> laurus::Result<()> {
                 ))))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res_new.len(), 1, "New version should be found");
 
     // Vector check for new vector
@@ -177,7 +182,8 @@ async fn test_engine_upsert() -> laurus::Result<()> {
                 }]))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res_vec.len(), 1, "New vector should be found");
 
     Ok(())
@@ -262,7 +268,8 @@ async fn test_engine_double_delete() -> laurus::Result<()> {
                 ))))
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     assert_eq!(res.len(), 0, "Document should remain deleted");
 
     Ok(())

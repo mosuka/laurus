@@ -310,7 +310,8 @@ async fn handle_search(engine: &Engine, query_str: &str, format: OutputFormat) -
     let results = engine
         .search(request)
         .await
-        .context("Failed to execute search")?;
+        .context("Failed to execute search")?
+        .results;
     output::print_search_results(&results, format);
     Ok(())
 }

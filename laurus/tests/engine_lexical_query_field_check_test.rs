@@ -171,7 +171,11 @@ async fn lexical_queries_and_filters_are_checked_against_the_lexical_fields() {
     let engine = engine().await;
     let mut wrong = Vec::new();
     for (case, request, expect) in requests() {
-        let result = engine.search(request).await.map(|hits| hits.len());
+        let result = engine
+            .search(request)
+            .await
+            .map(|response| response.results)
+            .map(|hits| hits.len());
         let ok = match (&expect, &result) {
             (Expect::Rejected(text), Err(LaurusError::InvalidArgument(message))) => {
                 message.contains(text)
@@ -221,7 +225,11 @@ async fn a_bare_term_searches_the_remaining_default_fields() {
             0,
         ),
     ] {
-        let result = engine.search(request).await.map(|found| found.len());
+        let result = engine
+            .search(request)
+            .await
+            .map(|response| response.results)
+            .map(|found| found.len());
         if !matches!(result, Ok(n) if n == hits) {
             wrong.push(format!("{case}: {result:?}"));
         }

@@ -173,7 +173,7 @@ fn bench_engine_search_batch(c: &mut Criterion) {
                     let queries = build_queries(b);
                     let mut all = Vec::with_capacity(queries.len());
                     for q in queries {
-                        let r = engine.search(q).await.expect("search");
+                        let r = engine.search(q).await.expect("search").results;
                         all.push(r);
                     }
                     black_box(all);
@@ -205,7 +205,7 @@ fn bench_engine_search_batch(c: &mut Criterion) {
                     let queries = build_vector_queries(b);
                     let mut all = Vec::with_capacity(queries.len());
                     for q in queries {
-                        let r = vector_engine.search(q).await.expect("search");
+                        let r = vector_engine.search(q).await.expect("search").results;
                         all.push(r);
                     }
                     black_box(all);

@@ -19,7 +19,7 @@ let request = SearchRequestBuilder::new()
     )
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 `add_text()` メソッドはテキストをクエリペイロードとして格納します。検索時に、エンジンが設定されたエンベッダーを使用してテキストをエンベディングし、ベクトルインデックスを検索します。
@@ -285,7 +285,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 フィルタークエリはまず Lexical インデックス上で実行されて許可されるドキュメント ID のセットを特定し、その後 Vector 検索がそれらの ID に制限されます。
@@ -410,7 +410,7 @@ let request = SearchRequestBuilder::new()
     )
     .limit(10)
     .build();
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 Embedder がない場合は、文書のトークンベクトルを作ったのと同じモデルで、
@@ -582,7 +582,7 @@ async fn main() -> laurus::Result<()> {
             )
             .limit(5)
             .build()
-    ).await?;
+    ).await?.results;
 
     for r in &results {
         println!("{}: score={:.4}", r.id, r.score);

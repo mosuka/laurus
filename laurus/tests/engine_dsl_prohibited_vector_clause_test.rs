@@ -95,7 +95,8 @@ async fn found(engine: &Engine, dsl: &str) -> Result<Vec<String>> {
                 .limit(100)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     let mut ids: Vec<String> = hits.into_iter().map(|hit| hit.id).collect();
     ids.sort();
     Ok(ids)

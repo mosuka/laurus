@@ -34,7 +34,8 @@ async fn engine() -> Engine {
 async fn search(engine: &Engine, dsl: &str) -> Result<f32> {
     let hits = engine
         .search(SearchRequestBuilder::new().query_dsl(dsl).limit(10).build())
-        .await?;
+        .await?
+        .results;
     assert_eq!(hits.len(), 1, "{dsl}");
     Ok(hits[0].score)
 }

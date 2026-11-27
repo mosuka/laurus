@@ -199,7 +199,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 ### ウォームアップ
@@ -234,6 +234,48 @@ OS page cache に pre-fault します。HNSW グラフと IVF の centroid は�
 | `vector_options` | `VectorSearchOptions` | デフォルト | Vector検索の動作パラメータ（スコアモード等） |
 | `rescore` | `Option<RescoreOptions>` | None | 1段目の上位候補を並べ替える再採点（[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)） |
 | `group_by` | `Option<GroupBy>` | None | 順位付けした hit のフィールド値によるグループ化。指定すると `limit` と `offset` はグループの数を数える（[検索結果のグループ化](../concepts/search/result_grouping.md)） |
+| `track_total_hits` | `TrackTotalHits` | `Disabled` | `SearchResponse::total_hits` のために一致をいくつまで数えるか。`Disabled`（数えない）、`UpTo(n)`、`Exact`（[総ヒット数](#総ヒット数)参照） |
+
+### 総ヒット数
+
+`Engine::search` は `SearchResponse` を返します。`SearchResponse` は、結果のページ `results` と、リクエストが求めたときは `total_hits` を持ちます。`total_hits` は `TotalHits` で、値 `value` と、`Exact`（正確）か `AtLeast`（下限）かを表す `relation` を持ちます（Issue #1472）。Lucene・Elasticsearch と同じく、数えることにはコストがあります。数えた件数が上限に届くまで、検索は block-max の打ち切りが読み飛ばす文書を読み飛ばせません。そのため、既定では数えません。
+
+| `track_total_hits` | `total_hits` |
+| :--- | :--- |
+| `Disabled`（既定） | `None` |
+| `UpTo(n)` | `n` より少なければ `Exact(件数)`、`n` 以上なら `AtLeast(n)`。`n` は 1 以上で、`UpTo(0)` は `InvalidArgument` で断る |
+| `Exact` | `Exact(件数)`。すべての一致を読む |
+
+何を数えるかは検索の種類で決まります。
+
+| 検索 | `total_hits` |
+| :--- | :--- |
+| lexical | クエリ（と filter）に一致し、lexical の `min_score` 以上の文書。上の規則で数える |
+| ベクトル | 検索が順位を付けた hit の数の `AtLeast`。近似の検索には数えるべき一致の集合がない |
+| ハイブリッド、`Union` | lexical の総数の値と、合わせた候補の数の大きい方の `AtLeast` |
+| ハイブリッド、`Intersection` | 合わせた候補の数の `AtLeast`。ここでは lexical の件数は上限にしかならない |
+| `group_by` あり | グループの数ではなく、グループを作る元の検索の文書の数。`limit` が 0 のグループ化でも数える |
+| 何にも一致しない filter | `Exact(0)` |
+
+```rust
+use laurus::{SearchRequestBuilder, TotalHitsRelation, TrackTotalHits};
+
+let response = engine
+    .search(
+        SearchRequestBuilder::new()
+            .query_dsl("body:rust")
+            .limit(10)
+            .track_total_hits(TrackTotalHits::UpTo(10_000))
+            .build(),
+    )
+    .await?;
+if let Some(total) = response.total_hits {
+    let prefix = if total.relation == TotalHitsRelation::AtLeast { "at least " } else { "" };
+    println!("{prefix}{} matches, showing {}", total.value, response.results.len());
+}
+```
+
+`Engine::search_batch` は、リクエストごとに 1 つの `SearchResponse` を返します。
 
 ### LexicalSearchOptions
 

@@ -105,7 +105,8 @@ fn field_sort_falls_back_when_a_segments_dv_file_is_missing() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(6)
-                .sort_by_field_asc("score"),
+                .sort_by_field_asc("score")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
 
@@ -119,7 +120,7 @@ fn field_sort_falls_back_when_a_segments_dv_file_is_missing() {
         "docs in the segment with the deleted .dv file must still sort by \
          their true stored score, not collapse to Null"
     );
-    assert_eq!(results.total_hits, 6);
+    assert_eq!(results.total_hits.unwrap().value, 6);
 }
 
 /// #1127: the two-wave fanout's pruning floor now comes from the value
@@ -171,7 +172,8 @@ fn field_sort_prunes_against_a_floor_from_the_stored_document_fallback() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(4)
-                .sort_by_field_desc("score"),
+                .sort_by_field_desc("score")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
     assert_eq!(
@@ -180,7 +182,8 @@ fn field_sort_prunes_against_a_floor_from_the_stored_document_fallback() {
         "the lead's fallback-ranked top-4 must be the answer"
     );
     assert_eq!(
-        results.total_hits, 12,
+        results.total_hits.unwrap().value,
+        12,
         "pruned segments must still be counted exactly"
     );
 
@@ -193,14 +196,15 @@ fn field_sort_prunes_against_a_floor_from_the_stored_document_fallback() {
         .search(
             LexicalSearchRequest::new(query)
                 .limit(4)
-                .sort_by_field_asc("score"),
+                .sort_by_field_asc("score")
+                .track_total_hits(laurus::TrackTotalHits::Exact),
         )
         .unwrap();
     assert_eq!(
         results.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
         vec![1, 2, 3, 4]
     );
-    assert_eq!(results.total_hits, 12);
+    assert_eq!(results.total_hits.unwrap().value, 12);
 }
 
 #[test]

@@ -18,7 +18,7 @@ let request = SearchRequestBuilder::new()
     .limit(10)
     .build();
 
-let results = engine.search(request).await?;
+let results = engine.search(request).await?.results;
 ```
 
 ## Query Types
@@ -403,8 +403,11 @@ Field-sorted searches (`sort_by: Field { .. }`) always scan every candidate
 document — there is no early termination for field sorts, unlike the
 block-max-driven early termination available for score sorts. This
 guarantees the returned hits are the true top-K by field value rather than
-an early-terminated approximation, and it means `total_hits` reflects the
-true number of matches rather than a scan-truncated count.
+an early-terminated approximation, and it means a total, when one is asked
+for with `track_total_hits`, is exact below its threshold however many
+segments the index has. A score-sorted search counts exactly up to the
+threshold too, by not pruning until it is reached (see
+[Total hits](../../laurus/engine.md#total-hits)).
 
 When `timeout_ms` is set, the time budget is enforced **cooperatively during**
 the search: the scan loops (including each segment of a multi-segment fanout)

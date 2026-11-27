@@ -343,7 +343,7 @@ fn bench_hybrid_rrf(c: &mut Criterion) {
         // Sanity: hybrid search must produce non-empty fused results.
         let probe = rt.block_on(async {
             let req = build_hybrid_request(FusionAlgorithm::RRF { k: 60.0 }, 10);
-            engine.search(req).await.unwrap()
+            engine.search(req).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -355,7 +355,7 @@ fn bench_hybrid_rrf(c: &mut Criterion) {
                 let engine = &engine;
                 async move {
                     let req = build_hybrid_request(FusionAlgorithm::RRF { k: 60.0 }, 10);
-                    black_box(engine.search(req).await.unwrap())
+                    black_box(engine.search(req).await.unwrap().results)
                 }
             });
         });
@@ -380,7 +380,7 @@ fn bench_hybrid_weighted_sum(c: &mut Criterion) {
                 },
                 10,
             );
-            engine.search(req).await.unwrap()
+            engine.search(req).await.unwrap().results
         });
         assert!(
             !probe.is_empty(),
@@ -398,7 +398,7 @@ fn bench_hybrid_weighted_sum(c: &mut Criterion) {
                         },
                         10,
                     );
-                    black_box(engine.search(req).await.unwrap())
+                    black_box(engine.search(req).await.unwrap().results)
                 }
             });
         });
@@ -417,7 +417,7 @@ fn bench_hybrid_top_k_sweep(c: &mut Criterion) {
 
     let probe = rt.block_on(async {
         let req = build_hybrid_request(FusionAlgorithm::RRF { k: 60.0 }, 10);
-        engine.search(req).await.unwrap()
+        engine.search(req).await.unwrap().results
     });
     assert!(
         !probe.is_empty(),
@@ -433,7 +433,7 @@ fn bench_hybrid_top_k_sweep(c: &mut Criterion) {
                     let engine = &engine;
                     async move {
                         let req = build_hybrid_request(FusionAlgorithm::RRF { k: 60.0 }, k);
-                        black_box(engine.search(req).await.unwrap())
+                        black_box(engine.search(req).await.unwrap().results)
                     }
                 });
             },

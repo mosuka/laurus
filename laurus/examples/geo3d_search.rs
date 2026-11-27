@@ -101,7 +101,8 @@ async fn main() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     println!("\n[1b] Centre: Tokyo Tower, radius: 200 km");
@@ -113,7 +114,8 @@ async fn main() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // ─── PART 2: Geo3dBoundingBoxQuery (3D AABB) ────────────────────────
@@ -138,7 +140,8 @@ async fn main() -> Result<()> {
                 .limit(10)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     // ─── PART 3: Geo3dNearestQuery (k-NN) ───────────────────────────────
@@ -152,7 +155,8 @@ async fn main() -> Result<()> {
                 .limit(3)
                 .build(),
         )
-        .await?;
+        .await?
+        .results;
     common::print_search_results(&results);
 
     Ok(())
