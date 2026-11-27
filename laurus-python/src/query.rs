@@ -252,6 +252,8 @@ impl PyFuzzyQuery {
 
 /// Wildcard pattern lexical query (`*` = any sequence, `?` = any character).
 ///
+/// A backslash takes the next character literally (`\*` matches `*`).
+///
 /// ## Example
 ///
 /// ```python

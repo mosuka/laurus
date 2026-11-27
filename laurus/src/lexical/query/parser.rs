@@ -19,7 +19,8 @@
 //! - Fuzzy search: `roam~2`
 //! - Range queries: `[100 TO 500]`, `{A TO Z}`, and datetime ranges such as
 //!   `[2024-01-01 TO 2024-12-31]` or `[2024-01-01T00:00:00Z TO *]` (#1179)
-//! - Wildcards: `te?t`, `test*`
+//! - Wildcards: `te?t`, `test*`, with the characters of a term, `a-b*` and
+//!   `te\*t*` too, read as in Lucene's `WildcardQuery` (#1745)
 //! - Boosting: `jakarta^4`; a group's boost multiplies the boosts inside
 //!   it, so `(jakarta^2 apache)^3` boosts `jakarta` by 6 (#1568)
 //! - Grouping: `(title:hello OR body:world)`
@@ -2072,6 +2073,38 @@ mod tests {
         let parser = create_test_parser().with_default_field("content");
         let query = parser.parse("hel*").unwrap();
         assert!(format!("{query:?}").contains("WildcardQuery"));
+    }
+
+    /// Issue #1745: a wildcard takes the characters of a term, `-`, `'` and
+    /// an escaped special character among them, as Lucene's `WILDTERM`
+    /// does, and goes to `WildcardQuery` as written, escapes and all. It
+    /// used to end before them and leave a bare `*` as a clause of its own.
+    #[test]
+    fn a_wildcard_takes_the_characters_of_a_term() {
+        let parser = create_test_parser().with_default_field("content");
+        let mut wrong = Vec::new();
+        for (dsl, field, pattern) in [
+            ("title:a-b*", "title", "a-b*"),
+            ("title:it's*", "title", "it's*"),
+            (r"title:te\*t*", "title", r"te\*t*"),
+            (r"title:a\:b*", "title", r"a\:b*"),
+            ("title:a*b-c?", "title", "a*b-c?"),
+            ("foo*-bar", "content", "foo*-bar"),
+            ("hel*", "content", "hel*"),
+        ] {
+            let query = match parser.parse(dsl) {
+                Ok(query) => query,
+                Err(e) => {
+                    wrong.push(format!("{dsl}: {e}"));
+                    continue;
+                }
+            };
+            match query.as_any().downcast_ref::<WildcardQuery>() {
+                Some(wildcard) if (wildcard.field(), wildcard.pattern()) == (field, pattern) => {}
+                _ => wrong.push(format!("{dsl}: {query:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

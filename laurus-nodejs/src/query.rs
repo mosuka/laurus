@@ -278,6 +278,8 @@ impl JsFuzzyQuery {
 
 /// Wildcard pattern lexical query (`*` = any sequence, `?` = any character).
 ///
+/// A backslash takes the next character literally (`\*` matches `*`).
+///
 /// ## Example
 ///
 /// ```javascript
@@ -298,7 +300,8 @@ impl JsWildcardQuery {
     /// # Arguments
     ///
     /// * `field` - The field name to search in.
-    /// * `pattern` - The wildcard pattern (`*` = any sequence, `?` = single character).
+    /// * `pattern` - The wildcard pattern (`*` = any sequence, `?` = single character,
+    ///   a backslash = the next character literally).
     #[napi(constructor)]
     pub fn new(field: String, pattern: String) -> Self {
         Self { field, pattern }

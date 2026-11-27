@@ -132,6 +132,8 @@ te?t
 test*
 ```
 
+Both match any character, a line break too. A wildcard takes the characters of a term, `-`, `'` and an escaped special character among them, so `a-b*`, `it's*` and `foo*-bar` are one wildcard each, as in Lucene; to exclude `bar`, put a space before the `-`: `foo* -bar`. A backslash before a special character of the DSL (`+ - ! ( ) { } [ ] ^ " ~ * ? : \ /`) makes it literal: `te\*t*` finds the terms that start with `te*t`. Until Issue #1745 a wildcard ended before any character but a letter, a digit or `_`, and left a bare `*`, which matched every term of the default field; and `*` and `?` did not match a line break.
+
 A wildcard matches every document that has a matching term, however many terms match, and each match scores the boost (`1.0` unless `^` sets another). It used to find only the documents of 50 of the matching terms, the least frequent ones (Issue #1740). The more terms match, the more a search costs, and a pattern that starts with `?` or `*` is compared with every term of the field.
 
 ### Range Query
@@ -297,10 +299,11 @@ query          = { SOI ~ boolean_query ~ EOI }
 boolean_query  = { clause ~ (boolean_op ~ clause | clause)* }
 clause         = { required_clause | prohibited_clause | sub_clause }
 required_clause   = { "+" ~ sub_clause }
-prohibited_clause = { "-" ~ sub_clause }
+prohibited_clause = { ("-" | not_op) ~ sub_clause }
 sub_clause     = { grouped_query | field_query | term_query }
 grouped_query  = { "(" ~ boolean_query ~ ")" ~ boost? }
-boolean_op     = { ^"AND" | ^"OR" }
+boolean_op     = @{ ("AND" | "OR") ~ !keyword_tail }
+not_op         = @{ "NOT" ~ !keyword_tail }
 field_query    = { field ~ ":" ~ field_value }
 field_value    = { geo3d_query | geo_query | range_query | phrase_query
                  | fuzzy_term | wildcard_term | simple_term }
@@ -321,6 +324,8 @@ phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
 proximity      = { "~" ~ number }
 fuzzy_term     = { term ~ "~" ~ fuzziness? ~ boost? }
 wildcard_term  = { wildcard_pattern ~ boost? }
+wildcard_pattern = @{ escaped_char* ~ wildcard_char
+                    ~ (escaped_char | wildcard_char)* }
 simple_term    = { term ~ boost? }
 boost          = { "^" ~ boost_value }
 ```

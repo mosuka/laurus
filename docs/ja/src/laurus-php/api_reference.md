@@ -349,7 +349,7 @@ new \Laurus\FuzzyQuery(string $field, string $term, int $maxEdits = 2)
 new \Laurus\WildcardQuery(string $field, string $pattern)
 ```
 
-ワイルドカードパターン検索。`*` は任意の文字列、`?` は任意の1文字に一致します。
+ワイルドカードパターン検索。`*` は任意の文字列、`?` は任意の1文字に、改行も含めて一致します。バックスラッシュは次の1文字をそのままの文字にするので、`'te\*'` は `te*` に一致します。
 
 ### NumericRangeQuery
 

@@ -346,7 +346,7 @@ Laurus::FuzzyQuery.new(field, term, max_edits: 2)
 Laurus::WildcardQuery.new(field, pattern)
 ```
 
-ワイルドカードパターン検索。`*` は任意の文字列、`?` は任意の1文字に一致します。
+ワイルドカードパターン検索。`*` は任意の文字列、`?` は任意の1文字に、改行も含めて一致します。バックスラッシュは次の1文字をそのままの文字にするので、`'te\*'` は `te*` に一致します。
 
 ### NumericRangeQuery
 

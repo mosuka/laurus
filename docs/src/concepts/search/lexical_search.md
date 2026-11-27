@@ -112,8 +112,11 @@ use laurus::lexical::query::wildcard::WildcardQuery;
 // '?' matches exactly one character, '*' matches zero or more
 let query = WildcardQuery::new("filename", "*.pdf")?;
 let query = WildcardQuery::new("body", "pro*")?;
-let query = WildcardQuery::new("body", "col?r")?;  // matches "color" and "colour"
+let query = WildcardQuery::new("body", "col?r")?;  // matches "color", not "colour"
+let query = WildcardQuery::new("body", r"why\?")?;  // matches "why?"
 ```
+
+A pattern reads as in Lucene's `WildcardQuery`. `*` and `?` match any characters, line breaks included. A backslash takes the next character literally, whatever it is (`\*`, `\?` and `\\` match `*`, `?` and `\`, and `\d` matches `d`), and at the end of a pattern is a backslash itself. Every other character matches itself, `.` and `+` too, so no pattern is an error, short of one too long for the regexp engine (100,000 `?`, for example). Until Issue #1745 the backslash went to the regexp with the next character: `te\dt` matched `te1t`, and `a\pb` was an error.
 
 ### PrefixQuery
 
