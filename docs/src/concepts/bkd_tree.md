@@ -197,6 +197,25 @@ The legacy `BKDTree::range_search` API is now a thin wrapper around
 range parameters and converts unbounded `None` slots into `±INFINITY`. The
 visitor handles inclusive-vs-exclusive boundary checks itself.
 
+### 2D Geographic Queries
+
+The visitors of [`laurus::lexical::query::geo`](search/lexical_search.md)
+target `Geo` fields, a 2D BKD of `[lat, lon]` in degrees:
+
+| Query | Region tested by `compare` | Per-point check in `visit` |
+| :--- | :--- | :--- |
+| `GeoDistanceQuery` | the circle's lat/lon bounds vs. cell AABB: `Outside` or `Crosses` | point inside the bounds; the query then keeps those within the haversine radius |
+| `GeoBoundingBoxQuery` | the box vs. cell AABB: `Outside` or `Crosses` | point inside the box |
+| `GeoPolygonQuery` | the polygon vs. cell AABB: `Inside`, `Outside` or `Crosses` | point inside the polygon |
+
+The distance and box queries score by distance, so they never return
+`Inside`, which reports doc ids without coordinates. `GeoPolygonQuery`
+scores every hit the same and needs no coordinates of a cell inside the
+polygon: `compare` returns `Inside` when no edge of a ring comes near the
+cell and its corner is inside, and the reader collects the cell's documents
+through `visit_inside`. A cell an edge passes through is `Crosses`, and its
+points are tested one by one.
+
 ### 3D Geographic Queries
 
 Three additional visitors live in [`laurus::lexical::query::geo3d`](geo3d.md)
@@ -208,8 +227,9 @@ and target `Geo3d` (3D ECEF) fields:
 | `Geo3dBoundingBoxQuery` | query AABB vs. cell AABB | point inside query AABB |
 | `Geo3dNearestQuery` (k-NN) | expanding sphere around the query point | distance ≤ current k-th best |
 
-The same primitive could host any future spatial query — for example, polygon
-queries or great-circle 2D `Geo` queries — by writing a new visitor.
+The same primitive could host any future spatial query — for example, a
+polygon of `Geo3d` points or great-circle 2D `Geo` queries — by writing a new
+visitor.
 
 ## Reader Internals
 

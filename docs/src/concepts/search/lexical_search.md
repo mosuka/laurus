@@ -294,6 +294,48 @@ also matches points stored with the other sign, which is the same meridian,
 and a box with zero width or height matches the points on its line or point.
 `min_lat > max_lat` is an error.
 
+### GeoPolygonQuery
+
+Match documents with a point of a `Geo` field inside a polygon, which may
+have holes (Issue #1596).
+
+```rust
+use laurus::lexical::query::geo::{GeoPolygon, GeoPolygonQuery};
+
+// A square with a square hole: the exterior ring first, then the holes,
+// each a list of (lat, lon), closed or not
+let query = GeoPolygonQuery::within_polygon(
+    "location",
+    &[(35.0, 139.0), (35.0, 140.0), (36.0, 140.0), (36.0, 139.0)],
+    &[&[(35.4, 139.4), (35.4, 139.6), (35.6, 139.6), (35.6, 139.4)]],
+)?;
+
+// Or from a GeoPolygon of GeoPoints
+let polygon = GeoPolygon::new(exterior, holes)?;
+let query = GeoPolygonQuery::new("location", polygon).with_boost(2.0);
+```
+
+Every hit scores the boost (`1.0` unless set), as Lucene's polygon query
+does, and a multi-valued field matches when any of its points is inside.
+Its edges are straight lines in latitude and longitude. A point on an edge
+or vertex of the exterior matches, and one on an edge or vertex of a hole
+does not, as in Lucene.
+
+An edge takes the shorter way between its two vertices: the way whose
+longitudes differ by 180 degrees or less. An edge from 170 to -170 degrees
+is 20 degrees wide and crosses the antimeridian, so a polygon over the
+Pacific needs no splitting, and a point on ±180° matches whichever sign it
+is stored with. An edge wider than 180 degrees needs a vertex in between.
+`GeoPolygon::new` rejects a ring with fewer than 3 distinct points, a
+coordinate out of range, an edge across exactly 180 degrees of longitude,
+which could go either way, and a ring around a pole. Self-intersection is
+not checked, as in Lucene.
+
+Through the BKD tree, a cell inside the polygon is taken whole, without
+testing its points one by one; only the points of the cells an edge passes
+through are tested. Segments without a BKD tree for the field scan the
+stored documents, as the other geo queries do.
+
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 
 Three queries target 3D `Geo3d` fields backed by ECEF Cartesian coordinates

@@ -55,7 +55,12 @@ geo3d_nearest = {
 // 2D geo queries (latitude / longitude in degrees, distance in km):
 //   field:geo_distance(lat, lon, distance_m)
 //   field:geo_bbox(min_lat, min_lon, max_lat, max_lon)
-geo_query = { geo_distance | geo_bbox }
+//   field:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
+// A polygon's first ring is the exterior and the others are holes, each a
+// list of latitude and longitude pairs (issue #1596).
+geo_query = { geo_distance | geo_bbox | geo_polygon }
+geo_polygon = { ^"geo_polygon" ~ "(" ~ geo_ring ~ ("," ~ geo_ring)* ~ ")" }
+geo_ring = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
 geo_distance = {
     ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float ~ "," ~ signed_float ~ ")"
 }

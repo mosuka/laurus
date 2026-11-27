@@ -203,19 +203,21 @@ created_at:{2024-01-01 TO 2025-01-01}
 
 ### 2D Geographic Queries (`geo_*`)
 
-Two function-style forms target `Geo` (2D latitude / longitude) fields. All
+Three function-style forms target `Geo` (2D latitude / longitude) fields. All
 arguments are signed floats; latitudes / longitudes are in degrees and the
 distance is in metres:
 
 ```text
 location:geo_distance(lat, lon, distance_m)
 location:geo_bbox(min_lat, min_lon, max_lat, max_lon)
+location:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
 ```
 
 | Form | Behaviour |
 | :--- | :--- |
 | `geo_distance(lat, lon, distance_m)` | All docs whose stored `(lat, lon)` lies within `distance_m` metres of the given centre. |
 | `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | All docs whose stored `(lat, lon)` lies inside the latitude / longitude rectangle, edges included. With `min_lon > max_lon` the box crosses the antimeridian (±180°), as in GeoJSON; an edge on exactly ±180° matches points stored with either sign. |
+| `geo_polygon((lat, lon, ...), (lat, lon, ...), ...)` | All docs with a stored `(lat, lon)` inside the polygon (Issue #1596). The first ring is the exterior and the others are holes, each a list of latitude and longitude pairs, closed or not, with at least 3 distinct points. A point on an edge or vertex of the exterior matches, and one on a hole's edge or vertex does not, as in Lucene. An edge takes the shorter way between its two vertices, so an edge from 170 to -170 degrees crosses the antimeridian; an edge wider than 180 degrees needs a vertex in between, and a ring around a pole is rejected. Every hit scores the boost. |
 
 Examples:
 
@@ -228,6 +230,13 @@ location:geo_bbox(35.0, 139.0, 36.0, 140.0)
 
 # Across the antimeridian: 175 degrees east to 175 degrees west
 location:geo_bbox(-20.0, 175.0, -15.0, -175.0)
+
+# A square with a square hole
+location:geo_polygon((35.0, 139.0, 35.0, 140.0, 36.0, 140.0, 36.0, 139.0),
+                     (35.4, 139.4, 35.4, 139.6, 35.6, 139.6, 35.6, 139.4))
+
+# Over the Pacific: the edges from 170 to -170 degrees cross the antimeridian
+location:geo_polygon((-20.0, 170.0, -20.0, -170.0, -10.0, -170.0, -10.0, 170.0))
 ```
 
 > The query field must be declared as a `Geo` field in the schema. Latitudes
@@ -319,11 +328,13 @@ geo3d_bbox     = { ^"geo3d_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ signed_float ~ "," ~ signed_float ~ ")" }
 geo3d_nearest  = { ^"geo3d_nearest" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ unsigned_int ~ ")" }
-geo_query      = { geo_distance | geo_bbox }
+geo_query      = { geo_distance | geo_bbox | geo_polygon }
 geo_distance   = { ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ ")" }
 geo_bbox       = { ^"geo_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
+geo_polygon    = { ^"geo_polygon" ~ "(" ~ geo_ring ~ ("," ~ geo_ring)* ~ ")" }
+geo_ring       = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
 phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
 phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity      = { "~" ~ number }
