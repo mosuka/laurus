@@ -207,9 +207,10 @@ target `Geo` fields, a 2D BKD of `[lat, lon]` in degrees:
 | `GeoDistanceQuery` | the circle's lat/lon bounds vs. cell AABB: `Outside` or `Crosses` | point inside the bounds; the query then keeps those within the haversine radius |
 | `GeoBoundingBoxQuery` | the box vs. cell AABB: `Outside` or `Crosses` | point inside the box |
 | `GeoPolygonQuery` | the polygon vs. cell AABB: `Inside`, `Outside` or `Crosses` | point inside the polygon |
+| `GeoPolylineQuery` | each edge's lat/lon bounds widened by the distance vs. cell AABB: `Outside` or `Crosses` | point inside an edge's bounds and within the distance of the great-circle arcs |
 
-The distance and box queries score by distance, so they never return
-`Inside`, which reports doc ids without coordinates. `GeoPolygonQuery`
+The distance, box and polyline queries score by distance, so they never
+return `Inside`, which reports doc ids without coordinates. `GeoPolygonQuery`
 scores every hit the same and needs no coordinates of a cell inside the
 polygon: `compare` returns `Inside` when no edge of a ring comes near the
 cell and its corner is inside, and the reader collects the cell's documents
@@ -218,7 +219,7 @@ points are tested one by one.
 
 ### 3D Geographic Queries
 
-Three additional visitors live in [`laurus::lexical::query::geo3d`](geo3d.md)
+Four additional visitors live in [`laurus::lexical::query::geo3d`](geo3d.md)
 and target `Geo3d` (3D ECEF) fields:
 
 | Query | Region tested by `compare` | Per-point check in `visit` |
@@ -226,10 +227,10 @@ and target `Geo3d` (3D ECEF) fields:
 | `Geo3dDistanceQuery` | sphere `(centre, radius)` vs. cell AABB | Euclidean distance ≤ radius |
 | `Geo3dBoundingBoxQuery` | query AABB vs. cell AABB | point inside query AABB |
 | `Geo3dNearestQuery` (k-NN) | expanding sphere around the query point | distance ≤ current k-th best |
+| `Geo3dPolylineQuery` | each segment vs. cell AABB widened by the distance | Euclidean distance to the segments ≤ distance |
 
 The same primitive could host any future spatial query — for example, a
-polygon of `Geo3d` points or great-circle 2D `Geo` queries — by writing a new
-visitor.
+polygon of `Geo3d` points — by writing a new visitor.
 
 ## Reader Internals
 

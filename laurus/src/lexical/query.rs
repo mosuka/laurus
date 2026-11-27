@@ -26,10 +26,11 @@ pub use boolean::{BooleanQuery, BooleanQueryBuilder};
 pub use fuzzy::FuzzyQuery;
 pub use geo::{
     GeoBoundingBox, GeoBoundingBoxQuery, GeoDistanceQuery, GeoPoint, GeoPolygon, GeoPolygonQuery,
+    GeoPolyline, GeoPolylineQuery,
 };
 pub use geo3d::{
     Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dMatch, Geo3dMatcher, Geo3dNearestQuery,
-    Geo3dScorer,
+    Geo3dPolyline, Geo3dPolylineQuery, Geo3dScorer,
 };
 pub use graph_phrase::{GraphPhraseQuery, PhraseArc};
 pub use multi_term::MultiTermQuery;
@@ -688,6 +689,25 @@ mod leaf_field_tests {
             (
                 "Geo3dNearestQuery",
                 Box::new(Geo3dNearestQuery::new(field, ecef(1.0), 10)),
+            ),
+            (
+                "GeoPolylineQuery",
+                Box::new(
+                    GeoPolylineQuery::within_distance(
+                        field,
+                        &[(34.0, 138.0), (36.0, 140.0)],
+                        1_000.0,
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "Geo3dPolylineQuery",
+                Box::new(Geo3dPolylineQuery::new(
+                    field,
+                    Geo3dPolyline::new(vec![ecef(0.0), ecef(1.0)]).unwrap(),
+                    1_000.0,
+                )),
             ),
             (
                 "GraphPhraseQuery",

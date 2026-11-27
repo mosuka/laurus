@@ -327,6 +327,45 @@ BKD ツリーを使うときは、多角形の中のセルを点ごとに判定�
 辺が通るセルの点だけを 1 つずつ判定します。そのフィールドの BKD ツリーを
 持たないセグメントは、ほかの地理クエリと同じく保存済みドキュメントを走査します。
 
+### GeoPolylineQuery
+
+`Geo` フィールドの点が、頂点を順につないだ折れ線から指定の距離以内にある
+ドキュメントにマッチします。道路、線路、川、経路の近くを探すときに使います
+（Issue #1596）。
+
+```rust
+use laurus::lexical::query::geo::{GeoPolyline, GeoPolylineQuery};
+
+// 東京から名古屋を経て大阪へ向かう経路から 2 km 以内。頂点は (lat, lon)
+let query = GeoPolylineQuery::within_distance(
+    "location",
+    &[(35.68, 139.76), (35.17, 136.91), (34.69, 135.50)],
+    2_000.0,
+)?;
+
+// GeoPoint の GeoPolyline からも作れる
+let polyline = GeoPolyline::new(vertices)?;
+let query = GeoPolylineQuery::new("location", polyline, 2_000.0).with_boost(2.0);
+```
+
+距離は `GeoDistanceQuery` と同じく地表の距離です。各辺は 2 つの頂点の間の
+短いほうの大円の弧で、点から弧の最も近い点まで（垂線の足が弧の外なら近い端
+まで）を測るので、端と角は丸くなります。多角形の辺は緯度・経度の上の直線
+ですが、折れ線の辺は大円に沿うので、`(10, 0)` から `(10, 170)` への弧は
+中ほどで北緯約 63.7 度まで上がります。点数は `GeoDistanceQuery` と同じく、
+ドキュメントの最も近い点による `1 - d / distance_m` で、頂点が 1 つなら
+`GeoDistanceQuery` と同じドキュメントと点数になります。`GeoPolyline::new`
+は 1 つ以上の頂点を受け（同じ頂点が続いてもよく、長さ 0 の辺はその点）、
+範囲外の座標と、対蹠点（とそこから約 640 m 以内）を結ぶ辺を拒否します。
+対蹠点を結ぶ最短の弧は 1 つに決まらないためです。日付変更線をまたぐ辺に
+特別な書き方は要りません。
+
+BKD ツリーを使うときは、どの辺の範囲とも離れたセルを刈ります。辺の範囲は、
+頂点の間にある弧の最も高い緯度を含めた緯度と、短いほうの経度を、距離だけ
+広げたものです。残ったセルの点は、点数に距離が要るので 1 つずつ測ります。
+そのフィールドの BKD ツリーを持たないセグメントは、保存済みドキュメントを
+走査します。
+
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 
 3 種類のクエリが、ECEF 直交座標（メートル）にバックアップされた 3D の
@@ -366,6 +405,35 @@ geo3d クエリはフィールドがインデックスされていること（`i
 デフォルト）を必要とします。これらは完全にフィールドの BKD tree 上で動作し、
 BKD tree を持たないセグメントからはヒットを返しません — 3D クエリには
 保存済みドキュメントへのフォールバックはありません。
+
+### Geo3dPolylineQuery
+
+`Geo3d` フィールドの点が、頂点を順につないだ線分から指定の距離以内にある
+ドキュメントにマッチします。飛行経路、トンネル、ケーブルの近くを探すときに
+使います（Issue #1596）。
+
+```rust
+use laurus::lexical::query::geo3d::{Geo3dPolyline, Geo3dPolylineQuery};
+use laurus::util::ecef::wgs84_to_ecef;
+
+// 高度 1,000 m の飛行経路から 500 m 以内
+let path = Geo3dPolyline::new(vec![
+    wgs84_to_ecef(35.0, 139.0, 1_000.0),
+    wgs84_to_ecef(35.4, 139.6, 1_000.0),
+])?;
+let query = Geo3dPolylineQuery::new("position", path, 500.0);
+```
+
+距離は ECEF のユークリッド距離で、点数は `Geo3dDistanceQuery` と同じく、
+ドキュメントの最も近い点による `1 - distance / radius`（`[0, 1]` に収める）
+です。頂点が 1 つなら `Geo3dDistanceQuery` と同じドキュメントと点数に
+なります。辺は弦なので、地表の 2 点を結ぶ辺は地表より下を通り、長さ `L` の
+辺の中ほどで約 `L² / 8R` 沈みます（100 km で 196 m、1,000 km で約 20 km）。
+長い距離を地表に沿わせたい経路には、頂点を増やすか、`Geo` フィールドと
+`GeoPolylineQuery` を使います。`Geo3dPolyline::new` は 1 つ以上の頂点を
+受け（同じ頂点が続いてもよい）、NaN と無限大の座標を拒否します。ほかの 3D
+クエリと同じくフィールドの BKD ツリーだけを読み、どの線分も、距離だけ四方に
+広げたセルと交わらなければ、そのセルを刈ります。
 
 ### SpanQuery
 

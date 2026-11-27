@@ -90,7 +90,7 @@ A schema with a `Geo3d` field for 3D ECEF positions:
 }
 ```
 
-See [3D Geographic Search (ECEF)](../concepts/geo3d.md) for the coordinate system; `Geo3d` is queryable via the `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` DSL forms (see the **search** tool below).
+See [3D Geographic Search (ECEF)](../concepts/geo3d.md) for the coordinate system; `Geo3d` is queryable via the `geo3d_distance` / `geo3d_bbox` / `geo3d_nearest` / `geo3d_polyline` DSL forms (see the **search** tool below).
 
 ---
 
@@ -440,6 +440,7 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `position:geo3d_distance(x, y, z, distance_m)` | Sphere with center `(x, y, z)` and maximum distance in meters |
 | `position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | 3D axis-aligned bounding box |
 | `position:geo3d_nearest(x, y, z, k)` | k nearest neighbors to `(x, y, z)` |
+| `position:geo3d_polyline((x, y, z, ...), distance_m)` | Within `distance_m` meters of the straight segments through the vertices `(x, y, z)`, in order |
 
 `position` is the field name; substitute the actual `Geo3d`-typed field declared in your schema. See [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic-queries-geo3d_) for the full DSL syntax.
 

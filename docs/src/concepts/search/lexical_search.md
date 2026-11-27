@@ -336,6 +336,48 @@ testing its points one by one; only the points of the cells an edge passes
 through are tested. Segments without a BKD tree for the field scan the
 stored documents, as the other geo queries do.
 
+### GeoPolylineQuery
+
+Match documents with a point of a `Geo` field within a distance of a
+polyline, its vertices joined in order: along a road, a railway, a river or
+a route (Issue #1596).
+
+```rust
+use laurus::lexical::query::geo::{GeoPolyline, GeoPolylineQuery};
+
+// Within 2 km of a route from Tokyo through Nagoya to Osaka, (lat, lon)
+let query = GeoPolylineQuery::within_distance(
+    "location",
+    &[(35.68, 139.76), (35.17, 136.91), (34.69, 135.50)],
+    2_000.0,
+)?;
+
+// Or from a GeoPolyline of GeoPoints
+let polyline = GeoPolyline::new(vertices)?;
+let query = GeoPolylineQuery::new("location", polyline, 2_000.0).with_boost(2.0);
+```
+
+The distance is on the surface, as `GeoDistanceQuery`'s: each edge is the
+shorter great-circle arc between its vertices, and a point is measured to
+the arc's closest point, or to the nearer end past it, so the ends and
+corners are round. A polygon's edges are straight lines in latitude and
+longitude; a polyline's follow great circles, so the arc from `(10, 0)` to
+`(10, 170)` rises to about 63.7 degrees north midway. The score is
+`1 - d / distance_m` by the closest point of a document, as
+`GeoDistanceQuery`'s, and a single vertex finds what `GeoDistanceQuery`
+finds, with the same scores. `GeoPolyline::new` takes one vertex or more,
+repeated vertices included (an edge of length 0 is its point), and rejects
+a coordinate out of range and an edge between antipodal points, or points
+within about 640 m of them, which no single shortest arc joins. An edge
+across the antimeridian needs nothing special.
+
+Through the BKD tree, a cell is pruned when it is apart from every edge's
+bounds: the edge's latitudes, including the arc's highest between its
+vertices, and its longitudes the shorter way, widened by the distance; the
+points of the other cells are measured one by one, as the score needs each
+one's distance. Segments without a BKD tree for the field scan the stored
+documents.
+
 ### Geo3dDistanceQuery / Geo3dBoundingBoxQuery / Geo3dNearestQuery
 
 Three queries target 3D `Geo3d` fields backed by ECEF Cartesian coordinates
@@ -375,6 +417,36 @@ Geo3d queries require the field to be indexed (`indexed = true`, the
 default): they run entirely on the field's BKD tree and return no hits
 from segments that lack one — there is no stored-document fallback for
 3D queries.
+
+### Geo3dPolylineQuery
+
+Match documents with a point of a `Geo3d` field within a distance of the
+straight segments through a polyline's vertices, in order: a flight path, a
+tunnel or a cable (Issue #1596).
+
+```rust
+use laurus::lexical::query::geo3d::{Geo3dPolyline, Geo3dPolylineQuery};
+use laurus::util::ecef::wgs84_to_ecef;
+
+// Within 500 m of a flight path at 1,000 m
+let path = Geo3dPolyline::new(vec![
+    wgs84_to_ecef(35.0, 139.0, 1_000.0),
+    wgs84_to_ecef(35.4, 139.6, 1_000.0),
+])?;
+let query = Geo3dPolylineQuery::new("position", path, 500.0);
+```
+
+The distance is Euclidean in ECEF and the score `1 - distance / radius`,
+clamped to `[0, 1]`, by the closest point of a document, as
+`Geo3dDistanceQuery`'s; a single vertex finds what `Geo3dDistanceQuery`
+finds, with the same scores. An edge is a chord: between two points on the
+surface it runs below it, by about `L² / 8R` midway for an edge of length
+`L` (196 m for 100 km, about 20 km for 1,000 km), so a path that should
+follow the surface over long distances needs more vertices, or a `Geo` field
+and `GeoPolylineQuery`. `Geo3dPolyline::new` takes one vertex or more,
+repeated vertices included, and rejects a NaN or infinite coordinate. Like
+the other 3D queries it reads the field's BKD tree only; a cell is pruned
+when no segment meets it widened by the distance on every side.
 
 ### SpanQuery
 

@@ -203,7 +203,7 @@ created_at:{2024-01-01 TO 2025-01-01}
 
 ### 2D Geographic Queries (`geo_*`)
 
-Three function-style forms target `Geo` (2D latitude / longitude) fields. All
+Four function-style forms target `Geo` (2D latitude / longitude) fields. All
 arguments are signed floats; latitudes / longitudes are in degrees and the
 distance is in metres:
 
@@ -211,6 +211,7 @@ distance is in metres:
 location:geo_distance(lat, lon, distance_m)
 location:geo_bbox(min_lat, min_lon, max_lat, max_lon)
 location:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
+location:geo_polyline((lat, lon, lat, lon, ...), distance_m)
 ```
 
 | Form | Behaviour |
@@ -218,6 +219,7 @@ location:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
 | `geo_distance(lat, lon, distance_m)` | All docs whose stored `(lat, lon)` lies within `distance_m` metres of the given centre. |
 | `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | All docs whose stored `(lat, lon)` lies inside the latitude / longitude rectangle, edges included. With `min_lon > max_lon` the box crosses the antimeridian (±180°), as in GeoJSON; an edge on exactly ±180° matches points stored with either sign. |
 | `geo_polygon((lat, lon, ...), (lat, lon, ...), ...)` | All docs with a stored `(lat, lon)` inside the polygon (Issue #1596). The first ring is the exterior and the others are holes, each a list of latitude and longitude pairs, closed or not, with at least 3 distinct points. A point on an edge or vertex of the exterior matches, and one on a hole's edge or vertex does not, as in Lucene. An edge takes the shorter way between its two vertices, so an edge from 170 to -170 degrees crosses the antimeridian; an edge wider than 180 degrees needs a vertex in between, and a ring around a pole is rejected. Every hit scores the boost. |
+| `geo_polyline((lat, lon, ...), distance_m)` | All docs with a stored `(lat, lon)` within `distance_m` metres of the polyline through the vertices in order, one or more latitude and longitude pairs (Issue #1596). The distance is on the surface, as `geo_distance`'s: each edge is the shorter great-circle arc between its vertices, and a point past an end is measured to the end, so the ends and corners are round. Unlike a polygon's edges, which are straight in latitude and longitude, a polyline's edges follow great circles: an edge from `(10, 0)` to `(10, 170)` passes near 63.7 degrees north. One vertex reads as `geo_distance`. An edge between antipodal points (or within about 640 m of them) is rejected, since no single shortest arc joins them; an edge across the antimeridian needs nothing special. The score is `1 - d / distance_m`, `d` being the distance of the closest point. |
 
 Examples:
 
@@ -237,6 +239,9 @@ location:geo_polygon((35.0, 139.0, 35.0, 140.0, 36.0, 140.0, 36.0, 139.0),
 
 # Over the Pacific: the edges from 170 to -170 degrees cross the antimeridian
 location:geo_polygon((-20.0, 170.0, -20.0, -170.0, -10.0, -170.0, -10.0, 170.0))
+
+# Within 2 km of a route from Tokyo through Nagoya to Osaka
+location:geo_polyline((35.68, 139.76, 35.17, 136.91, 34.69, 135.50), 2000)
 ```
 
 > The query field must be declared as a `Geo` field in the schema. Latitudes
@@ -245,13 +250,14 @@ location:geo_polygon((-20.0, 170.0, -20.0, -170.0, -10.0, -170.0, -10.0, 170.0))
 
 ### 3D Geographic Queries (`geo3d_*`)
 
-Three function-style forms target `Geo3d` (3D ECEF Cartesian) fields. All
+Four function-style forms target `Geo3d` (3D ECEF Cartesian) fields. All
 arguments are signed floats in metres, except `k` (an unsigned integer):
 
 ```text
 position:geo3d_distance(x, y, z, distance_m)
 position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)
 position:geo3d_nearest(x, y, z, k)
+position:geo3d_polyline((x, y, z, x, y, z, ...), distance_m)
 ```
 
 | Form | Behaviour |
@@ -259,6 +265,7 @@ position:geo3d_nearest(x, y, z, k)
 | `geo3d_distance(x, y, z, distance_m)` | All docs whose stored point lies within `distance_m` metres of `(x, y, z)`. |
 | `geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` | All docs whose stored point lies inside the axis-aligned 3D box. |
 | `geo3d_nearest(x, y, z, k)` | The `k` nearest docs to `(x, y, z)` by Euclidean distance. |
+| `geo3d_polyline((x, y, z, ...), distance_m)` | All docs whose stored point lies within `distance_m` metres of the straight segments through the vertices `(x, y, z)` in order, one or more (Issue #1596). An edge is a chord: midway it runs below the surface by about `L² / 8R` for an edge of length `L`, 196 m for 100 km. One vertex reads as `geo3d_distance`. The score is `1 - d / distance_m`, `d` being the distance of the closest point. |
 
 Examples:
 
@@ -271,6 +278,9 @@ position:geo3d_bbox(-4000000, 3300000, 3650000, -3900000, 3400000, 3750000)
 
 # 10 nearest indexed points
 position:geo3d_nearest(-3955182, 3350553, 3700276, 10)
+
+# Within 500 m of a flight path (ECEF coordinates)
+position:geo3d_polyline((-3955182, 3350553, 3700276, -3940000, 3360000, 3710000), 500)
 ```
 
 > The query field must be declared as a `Geo3d` field in the schema. See
@@ -320,7 +330,7 @@ not_op         = @{ "NOT" ~ !keyword_tail }
 field_query    = { field ~ ":" ~ field_value }
 field_value    = { geo3d_query | geo_query | range_query | phrase_query
                  | fuzzy_term | wildcard_term | simple_term }
-geo3d_query    = { geo3d_distance | geo3d_bbox | geo3d_nearest }
+geo3d_query    = { geo3d_distance | geo3d_bbox | geo3d_nearest | geo3d_polyline }
 geo3d_distance = { ^"geo3d_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
 geo3d_bbox     = { ^"geo3d_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
@@ -328,13 +338,15 @@ geo3d_bbox     = { ^"geo3d_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ signed_float ~ "," ~ signed_float ~ ")" }
 geo3d_nearest  = { ^"geo3d_nearest" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ unsigned_int ~ ")" }
-geo_query      = { geo_distance | geo_bbox | geo_polygon }
+geo3d_polyline = { ^"geo3d_polyline" ~ "(" ~ geo_vertices ~ "," ~ signed_float ~ ")" }
+geo_query      = { geo_distance | geo_bbox | geo_polygon | geo_polyline }
 geo_distance   = { ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ ")" }
 geo_bbox       = { ^"geo_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
-geo_polygon    = { ^"geo_polygon" ~ "(" ~ geo_ring ~ ("," ~ geo_ring)* ~ ")" }
-geo_ring       = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
+geo_polygon    = { ^"geo_polygon" ~ "(" ~ geo_vertices ~ ("," ~ geo_vertices)* ~ ")" }
+geo_polyline   = { ^"geo_polyline" ~ "(" ~ geo_vertices ~ "," ~ signed_float ~ ")" }
+geo_vertices   = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
 phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
 phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity      = { "~" ~ number }

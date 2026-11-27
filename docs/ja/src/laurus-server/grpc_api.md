@@ -580,11 +580,12 @@ ERROR:
 
 ### 3D 地理クエリ
 
-3D ECEF の地理クエリは `SearchRequest.query` に渡す Lexical DSL 文字列で表現します。専用のメッセージ型はなく、コアライブラリで使用される DSL 形式がそのまま gRPC 経由でも動作します。3 種類の形式があります（構文の詳細は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-地理クエリgeo3d_) を参照）:
+3D ECEF の地理クエリは `SearchRequest.query` に渡す Lexical DSL 文字列で表現します。専用のメッセージ型はなく、コアライブラリで使用される DSL 形式がそのまま gRPC 経由でも動作します。4 種類の形式があります（構文の詳細は [Query DSL → 3D 地理クエリ](../concepts/query_dsl.md#3d-地理クエリgeo3d_) を参照）:
 
 - `position:geo3d_distance(x, y, z, distance_m)` — `(x, y, z)` を中心とした最大距離（メートル単位）の球
 - `position:geo3d_bbox(min_x, min_y, min_z, max_x, max_y, max_z)` — 3D 軸並行バウンディングボックス
 - `position:geo3d_nearest(x, y, z, k)` — `(x, y, z)` に最も近い k 個の近傍点
+- `position:geo3d_polyline((x, y, z, ...), distance_m)` — 頂点 `(x, y, z)` を順につないだ線分から `distance_m` メートル以内
 
 `position` はフィールド名で、スキーマで宣言した実際の `Geo3d` 型フィールドに置き換えてください。すべての数値引数は符号付きの `double` 値で、`k` は符号なし整数です。
 

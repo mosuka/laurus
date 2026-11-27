@@ -195,9 +195,10 @@ graph TD
 | `GeoDistanceQuery` | 円の緯度・経度の範囲と セル AABB：`Outside` か `Crosses` | 点が範囲に内包。そのあとクエリが haversine の半径以内の点を残す |
 | `GeoBoundingBoxQuery` | ボックスと セル AABB：`Outside` か `Crosses` | 点がボックスに内包 |
 | `GeoPolygonQuery` | 多角形と セル AABB：`Inside`・`Outside`・`Crosses` | 点が多角形に内包 |
+| `GeoPolylineQuery` | 距離だけ広げた辺ごとの緯度・経度の範囲と セル AABB：`Outside` か `Crosses` | 点が辺の範囲に内包し、大円の弧から距離以内 |
 
-距離とボックスのクエリは距離で点数を付けるので、座標を渡さずに doc id を
-報告する `Inside` を返さない。`GeoPolygonQuery` はどの一致も同じ点数なので、
+距離・ボックス・折れ線のクエリは距離で点数を付けるので、座標を渡さずに
+doc id を報告する `Inside` を返さない。`GeoPolygonQuery` はどの一致も同じ点数なので、
 多角形の中のセルの座標を必要としない。どの環の辺もセルに近づかず、セルの
 角が中にあれば `compare` は `Inside` を返し、リーダはそのセルの文書を
 `visit_inside` で集める。辺が通るセルは `Crosses` で、その点を 1 つずつ
@@ -205,7 +206,7 @@ graph TD
 
 ### 3D 地理クエリ
 
-3 つのビジタが [`laurus::lexical::query::geo3d`](geo3d.md) に存在し、
+4 つのビジタが [`laurus::lexical::query::geo3d`](geo3d.md) に存在し、
 `Geo3d` (3D ECEF) フィールドをターゲットにする：
 
 | クエリ | `compare` の判定領域 | `visit` の点ごとの判定 |
@@ -213,9 +214,10 @@ graph TD
 | `Geo3dDistanceQuery` | 球 `(centre, radius)` と AABB | ユークリッド距離 ≤ radius |
 | `Geo3dBoundingBoxQuery` | クエリ AABB と セル AABB | 点がクエリ AABB に内包 |
 | `Geo3dNearestQuery` (k-NN) | クエリ点を中心に拡大していく球 | 距離 ≤ 現在の k 番目最良値 |
+| `Geo3dPolylineQuery` | 各線分と、距離だけ広げたセル AABB | 線分までのユークリッド距離 ≤ 距離 |
 
-同じプリミティブで将来のあらゆる空間クエリ（`Geo3d` の点の多角形や
-2D `Geo` の大円距離クエリなど）を新しいビジタとして実装できる。
+同じプリミティブで将来のあらゆる空間クエリ（`Geo3d` の点の多角形など）を
+新しいビジタとして実装できる。
 
 ## リーダの内部実装
 

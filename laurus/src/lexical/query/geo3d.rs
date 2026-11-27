@@ -107,41 +107,49 @@ impl Geo3dDistanceQuery {
     /// Run the query against `reader` and return the matches sorted by
     /// distance ascending (closest first).
     pub fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<Geo3dMatch>> {
-        let mut matches: Vec<Geo3dMatch> = Vec::new();
         let Some(bkd) = reader.get_bkd_tree(&self.field)? else {
-            return Ok(matches);
+            return Ok(Vec::new());
         };
 
         let mut visitor = SphereVisitor::new(self.center, self.distance_m);
         bkd.intersect(&mut visitor)?;
+        Ok(scored_matches(visitor.hits, self.distance_m))
+    }
+}
 
-        let radius = self.distance_m;
-        for hit in visitor.hits {
+/// The matches of `hits` within `radius`: each scored `1 - distance /
+/// radius`, clamped to `[0, 1]` (`0` for a radius of 0 or less), the
+/// closest one per document only, sorted by distance ascending. Shared by
+/// [`Geo3dDistanceQuery`] and [`Geo3dPolylineQuery`].
+fn scored_matches(hits: Vec<SphereHit>, radius: f64) -> Vec<Geo3dMatch> {
+    let mut matches: Vec<Geo3dMatch> = hits
+        .into_iter()
+        .map(|hit| {
             let distance = hit.distance_sq.sqrt();
             let score = if radius <= 0.0 {
                 0.0
             } else {
                 (1.0 - distance / radius).clamp(0.0, 1.0) as f32
             };
-            matches.push(Geo3dMatch {
+            Geo3dMatch {
                 doc_id: hit.doc_id,
                 distance_m: distance,
                 score,
-            });
-        }
+            }
+        })
+        .collect();
 
-        // Multi-segment readers can produce duplicates; keep the closest.
-        matches.sort_by(|a, b| {
-            a.doc_id
-                .cmp(&b.doc_id)
-                .then_with(|| a.distance_m.total_cmp(&b.distance_m))
-        });
-        matches.dedup_by_key(|m| m.doc_id);
-        // Final order: distance ascending.
-        matches.sort_by(|a, b| a.distance_m.total_cmp(&b.distance_m));
-
-        Ok(matches)
-    }
+    // Multi-segment readers and multi-valued fields can produce duplicates;
+    // keep the closest.
+    matches.sort_by(|a, b| {
+        a.doc_id
+            .cmp(&b.doc_id)
+            .then_with(|| a.distance_m.total_cmp(&b.distance_m))
+    });
+    matches.dedup_by_key(|m| m.doc_id);
+    // Final order: distance ascending.
+    matches.sort_by(|a, b| a.distance_m.total_cmp(&b.distance_m));
+    matches
 }
 
 /// A document matched by a [`Geo3dDistanceQuery`], with its distance to
@@ -411,6 +419,364 @@ impl Query for Geo3dDistanceQuery {
         Some(format!(
             "geo3ddist|{:?}|{:?}|{:?}",
             self.field, self.center, self.distance_m
+        ))
+    }
+}
+
+/// How much farther than the query's distance a cell may be and still be
+/// visited, in metres: rounding in ECEF coordinates of millions of metres is
+/// about a nanometre, so no point at the distance is pruned.
+const CELL_SLACK_M: f64 = 1e-6;
+
+/// A polyline of ECEF points joined in order by straight segments, for
+/// [`Geo3dPolylineQuery`] (Issue #1596).
+///
+/// The distance from a point to the polyline is the Euclidean distance to
+/// its closest segment, as [`Geo3dDistanceQuery`]'s to its center. A segment
+/// is a chord: between two points on the surface it runs below it, by about
+/// `L² / 8R` midway for a segment of length `L` (196 m for 100 km, about
+/// 20 km for 1,000 km). A single vertex is a point, and repeated vertices
+/// are fine: a segment of length 0 is its point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Geo3dPolyline {
+    /// The vertices as given.
+    vertices: Vec<GeoEcefPoint>,
+}
+
+impl Geo3dPolyline {
+    /// Create a polyline through `vertices`, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError)
+    /// if there is no vertex, or a coordinate is NaN or infinite.
+    pub fn new(vertices: Vec<GeoEcefPoint>) -> Result<Self> {
+        if vertices.is_empty() {
+            return Err(crate::error::LaurusError::invalid_argument(
+                "a polyline needs at least one vertex".to_string(),
+            ));
+        }
+        for (i, vertex) in vertices.iter().enumerate() {
+            if !(vertex.x.is_finite() && vertex.y.is_finite() && vertex.z.is_finite()) {
+                return Err(crate::error::LaurusError::invalid_argument(format!(
+                    "vertex {i} of the polyline has a coordinate that is not finite: \
+                     ({}, {}, {})",
+                    vertex.x, vertex.y, vertex.z
+                )));
+            }
+        }
+        Ok(Geo3dPolyline { vertices })
+    }
+
+    /// The vertices, in order.
+    pub fn vertices(&self) -> &[GeoEcefPoint] {
+        &self.vertices
+    }
+
+    /// The Euclidean distance in metres from `point` to the polyline. For a
+    /// single vertex it is the distance [`Geo3dDistanceQuery`] measures.
+    pub fn distance_to(&self, point: &GeoEcefPoint) -> f64 {
+        self.distance_sq_to(&[point.x, point.y, point.z]).sqrt()
+    }
+
+    /// The squared distance from `point` to the polyline.
+    fn distance_sq_to(&self, point: &[f64]) -> f64 {
+        if let [vertex] = self.vertices.as_slice() {
+            return point_distance_sq(point, vertex);
+        }
+        self.vertices
+            .windows(2)
+            .map(|edge| segment_distance_sq(point, &edge[0], &edge[1]))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Whether a segment comes within `distance_m` of `cell`, by clipping
+    /// it to the cell widened by `distance_m` (and [`CELL_SLACK_M`]) on
+    /// every side. The widened box holds every point within the distance of
+    /// the cell, so this never misses one; it only gives up pruning near
+    /// the cell's corners, where the box reaches farther than the distance.
+    fn meets_cell(&self, cell: &AABB, distance_m: f64) -> bool {
+        let reach = distance_m + CELL_SLACK_M;
+        let (min, max) = (cell.min(), cell.max());
+        let low = [min[0] - reach, min[1] - reach, min[2] - reach];
+        let high = [max[0] + reach, max[1] + reach, max[2] + reach];
+        if let [vertex] = self.vertices.as_slice() {
+            return segment_meets_box(vertex, vertex, &low, &high);
+        }
+        self.vertices
+            .windows(2)
+            .any(|edge| segment_meets_box(&edge[0], &edge[1], &low, &high))
+    }
+}
+
+/// The squared distance from `point` to `vertex`, summed in the order of
+/// `SphereVisitor::visit`, so that a single vertex measures exactly what
+/// [`Geo3dDistanceQuery`] does.
+fn point_distance_sq(point: &[f64], vertex: &GeoEcefPoint) -> f64 {
+    let dx = point[0] - vertex.x;
+    let dy = point[1] - vertex.y;
+    let dz = point[2] - vertex.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+/// The squared distance from `point` to the segment from `a` to `b`.
+fn segment_distance_sq(point: &[f64], a: &GeoEcefPoint, b: &GeoEcefPoint) -> f64 {
+    let ab = [b.x - a.x, b.y - a.y, b.z - a.z];
+    let length_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    if length_sq == 0.0 {
+        return point_distance_sq(point, a);
+    }
+    let ap = [point[0] - a.x, point[1] - a.y, point[2] - a.z];
+    let t = ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / length_sq).clamp(0.0, 1.0);
+    let closest = GeoEcefPoint::new(a.x + t * ab[0], a.y + t * ab[1], a.z + t * ab[2]);
+    point_distance_sq(point, &closest)
+}
+
+/// Whether the segment from `a` to `b` meets the closed box from `low` to
+/// `high`, by clipping it to the box (Liang-Barsky); a segment of length 0
+/// meets it when its point is inside.
+fn segment_meets_box(a: &GeoEcefPoint, b: &GeoEcefPoint, low: &[f64; 3], high: &[f64; 3]) -> bool {
+    let (start, end) = ([a.x, a.y, a.z], [b.x, b.y, b.z]);
+    let (mut enter, mut leave) = (0.0_f64, 1.0_f64);
+    for dim in 0..3 {
+        let d = end[dim] - start[dim];
+        for (p, q) in [(-d, start[dim] - low[dim]), (d, high[dim] - start[dim])] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return false;
+                }
+            } else {
+                let t = q / p;
+                if p < 0.0 {
+                    if t > leave {
+                        return false;
+                    }
+                    enter = enter.max(t);
+                } else {
+                    if t < enter {
+                        return false;
+                    }
+                    leave = leave.min(t);
+                }
+            }
+        }
+    }
+    true
+}
+
+/// [`IntersectVisitor`] collecting the points within a distance of a
+/// [`Geo3dPolyline`], with their squared distances. The score needs every
+/// point's distance, so `compare` never returns [`CellRelation::Inside`],
+/// as [`SphereVisitor`] does not.
+struct Geo3dPolylineVisitor<'a> {
+    polyline: &'a Geo3dPolyline,
+    distance_m: f64,
+    radius_sq: f64,
+    hits: Vec<SphereHit>,
+    /// How many points were tested one by one, for the pruning test.
+    #[cfg(test)]
+    visited: usize,
+}
+
+impl<'a> Geo3dPolylineVisitor<'a> {
+    /// A visitor for the points within `radius` of `polyline`; a negative
+    /// radius is 0, as in [`SphereVisitor`].
+    fn new(polyline: &'a Geo3dPolyline, radius: f64) -> Self {
+        let radius_clamped = radius.max(0.0);
+        Geo3dPolylineVisitor {
+            polyline,
+            distance_m: radius_clamped,
+            radius_sq: radius_clamped * radius_clamped,
+            hits: Vec::new(),
+            #[cfg(test)]
+            visited: 0,
+        }
+    }
+}
+
+impl IntersectVisitor for Geo3dPolylineVisitor<'_> {
+    fn compare(&self, cell: &AABB) -> CellRelation {
+        debug_assert_eq!(cell.num_dims(), 3, "Geo3dPolylineVisitor expects a 3D BKD");
+        if self.polyline.meets_cell(cell, self.distance_m) {
+            // Never Inside: the score needs each point's distance.
+            CellRelation::Crosses
+        } else {
+            CellRelation::Outside
+        }
+    }
+
+    fn visit_inside(&mut self, _doc_id: u64) {
+        // Unreachable: `compare` never returns Inside, and a doc id alone
+        // has no distance to score by.
+    }
+
+    fn visit(&mut self, doc_id: u64, point: &[f64]) {
+        debug_assert_eq!(point.len(), 3, "Geo3dPolylineVisitor expects a 3D BKD");
+        #[cfg(test)]
+        {
+            self.visited += 1;
+        }
+        let distance_sq = self.polyline.distance_sq_to(point);
+        if distance_sq <= self.radius_sq {
+            self.hits.push(SphereHit {
+                doc_id,
+                distance_sq,
+            });
+        }
+    }
+}
+
+/// A query for the documents with a point of a `Geo3d` field within a
+/// distance of a [`Geo3dPolyline`] (Issue #1596): a flight path, a tunnel,
+/// a cable.
+///
+/// The distance is Euclidean in ECEF, as [`Geo3dDistanceQuery`]'s, and the
+/// score is the same: `1 - d / distance_m`, clamped to `[0, 1]`, `d` being
+/// the distance of the document's closest point to the polyline. A single
+/// vertex finds the documents, and gives the scores, that
+/// [`Geo3dDistanceQuery`] does. Like the other 3D queries, it reads the
+/// field's BKD only, so a field indexed with `indexed: false` matches
+/// nothing.
+///
+/// # Example
+///
+/// ```rust
+/// use laurus::lexical::query::{Geo3dPolyline, Geo3dPolylineQuery};
+/// use laurus::util::ecef::wgs84_to_ecef;
+///
+/// // Within 500 m of a flight path at 1,000 m.
+/// let path = Geo3dPolyline::new(vec![
+///     wgs84_to_ecef(35.0, 139.0, 1_000.0),
+///     wgs84_to_ecef(35.4, 139.6, 1_000.0),
+/// ])
+/// .unwrap();
+/// let query = Geo3dPolylineQuery::new("position", path, 500.0);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Geo3dPolylineQuery {
+    /// Field containing 3D ECEF coordinates.
+    field: String,
+    /// The polyline.
+    polyline: Geo3dPolyline,
+    /// The maximum distance from the polyline, in metres.
+    distance_m: f64,
+    /// Boost factor applied to the final score.
+    boost: f32,
+}
+
+impl Geo3dPolylineQuery {
+    /// Create a query for the points within `distance_m` metres of
+    /// `polyline`. A distance of 0 or less is reported empty by
+    /// [`is_empty`](Query::is_empty), as for [`Geo3dDistanceQuery`].
+    pub fn new<F: Into<String>>(field: F, polyline: Geo3dPolyline, distance_m: f64) -> Self {
+        Geo3dPolylineQuery {
+            field: field.into(),
+            polyline,
+            distance_m,
+            boost: 1.0,
+        }
+    }
+
+    /// Set the boost factor applied to every match's score.
+    pub fn with_boost(mut self, boost: f32) -> Self {
+        self.boost = boost;
+        self
+    }
+
+    /// Field name this query targets.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// The polyline.
+    pub fn polyline(&self) -> &Geo3dPolyline {
+        &self.polyline
+    }
+
+    /// The maximum distance from the polyline, in metres.
+    pub fn distance_m(&self) -> f64 {
+        self.distance_m
+    }
+
+    /// Run the query against `reader` and return the matches, each document
+    /// once with its closest point, sorted by distance ascending.
+    pub fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<Geo3dMatch>> {
+        let Some(bkd) = reader.get_bkd_tree(&self.field)? else {
+            return Ok(Vec::new());
+        };
+
+        let mut visitor = Geo3dPolylineVisitor::new(&self.polyline, self.distance_m);
+        bkd.intersect(&mut visitor)?;
+        Ok(scored_matches(visitor.hits, self.distance_m))
+    }
+}
+
+impl Query for Geo3dPolylineQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
+    fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
+        Ok(Box::new(Geo3dMatcher::new(self.find_matches(reader)?)))
+    }
+
+    fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
+        Ok(Box::new(Geo3dScorer::new(
+            self.find_matches(reader)?,
+            self.boost,
+        )))
+    }
+
+    fn matcher_scorer(
+        &self,
+        reader: &dyn LexicalIndexReader,
+    ) -> Result<(Box<dyn Matcher>, Box<dyn Scorer>)> {
+        // One traversal for both, as `Geo3dDistanceQuery` does (#996).
+        let matches = self.find_matches(reader)?;
+        Ok((
+            Box::new(Geo3dMatcher::new(matches.clone())),
+            Box::new(Geo3dScorer::new(matches, self.boost)),
+        ))
+    }
+
+    fn boost(&self) -> f32 {
+        self.boost
+    }
+
+    fn set_boost(&mut self, boost: f32) {
+        self.boost = boost;
+    }
+
+    fn clone_box(&self) -> Box<dyn Query> {
+        Box::new(self.clone())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Geo3dPolylineQuery(field: {}, vertices: {:?}, distance: {}m)",
+            self.field, self.polyline.vertices, self.distance_m
+        )
+    }
+
+    fn is_empty(&self, _reader: &dyn LexicalIndexReader) -> Result<bool> {
+        Ok(self.distance_m <= 0.0)
+    }
+
+    fn cost(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
+        // The same shape as `Geo3dDistanceQuery::cost`.
+        Ok(reader.doc_count().saturating_mul(2))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn cache_key(&self) -> Option<String> {
+        // Field, vertices and distance determine the matched set; the boost
+        // is score-only and excluded.
+        Some(format!(
+            "geo3dpolyline|{:?}|{:?}|{:?}",
+            self.field, self.polyline.vertices, self.distance_m
         ))
     }
 }
@@ -1466,6 +1832,190 @@ mod tests {
         assert_eq!(
             matches[0].doc_id, nearest,
             "the true nearest point is first"
+        );
+    }
+
+    /// Deterministic pseudo-random numbers in `[0, 1)` (xorshift64*).
+    fn uniform(state: &mut u64) -> f64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn ecef(x: f64, y: f64, z: f64) -> GeoEcefPoint {
+        GeoEcefPoint::new(x, y, z)
+    }
+
+    /// Issue #1596: distances to segments: beside one, past an end, to a
+    /// segment of length 0, and to a single vertex exactly as
+    /// `SphereVisitor` measures.
+    #[test]
+    fn a_geo3d_polyline_measures_distances() {
+        let line = Geo3dPolyline::new(vec![
+            ecef(0.0, 0.0, 0.0),
+            ecef(10.0, 0.0, 0.0),
+            ecef(10.0, 0.0, 0.0),
+            ecef(10.0, 10.0, 0.0),
+        ])
+        .unwrap();
+        let mut wrong = Vec::new();
+        for (point, expected) in [
+            (ecef(5.0, 3.0, 4.0), 5.0),
+            (ecef(-3.0, 0.0, 4.0), 5.0),
+            (ecef(13.0, 14.0, 0.0), 5.0),
+            (ecef(10.0, 5.0, 0.0), 0.0),
+            (ecef(7.0, 4.0, 0.0), 3.0),
+        ] {
+            let found = line.distance_to(&point);
+            if (found - expected).abs() > 1e-12 {
+                wrong.push(format!("{point:?}: {found}, expected {expected}"));
+            }
+        }
+        let center = ecef(-3_955_182.0, 3_350_553.0, 3_700_276.0);
+        let point = ecef(-3_955_100.5, 3_350_600.25, 3_700_200.125);
+        let single = Geo3dPolyline::new(vec![center]).unwrap();
+        let mut sphere = SphereVisitor::new(center, 1_000.0);
+        sphere.visit(1, &[point.x, point.y, point.z]);
+        let expected = sphere.hits[0].distance_sq;
+        if single.distance_sq_to(&[point.x, point.y, point.z]) != expected {
+            wrong.push("a single vertex measures otherwise than SphereVisitor".to_string());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1596: no cell holding a point within the distance of a
+    /// segment is pruned: points at the distance or less from a random point
+    /// of a random segment, in random directions, in cells of random sizes
+    /// around them.
+    #[test]
+    fn no_cell_near_a_segment_is_pruned() {
+        let mut state = 31_u64;
+        let random_point = |state: &mut u64, scale: f64| {
+            ecef(
+                scale * (2.0 * uniform(state) - 1.0),
+                scale * (2.0 * uniform(state) - 1.0),
+                scale * (2.0 * uniform(state) - 1.0),
+            )
+        };
+        let mut wrong = Vec::new();
+        for i in 0..2_000 {
+            let a = random_point(&mut state, 6_400_000.0);
+            let b = if i % 10 == 0 {
+                a
+            } else {
+                let step = random_point(&mut state, 50_000.0);
+                ecef(a.x + step.x, a.y + step.y, a.z + step.z)
+            };
+            let line = Geo3dPolyline::new(vec![a, b]).unwrap();
+            let distance_m = [0.0, 1.0, 500.0, 20_000.0][i % 4];
+            let t = uniform(&mut state);
+            let on_segment = [
+                a.x + t * (b.x - a.x),
+                a.y + t * (b.y - a.y),
+                a.z + t * (b.z - a.z),
+            ];
+            let direction = random_point(&mut state, 1.0);
+            let length = (direction.x.powi(2) + direction.y.powi(2) + direction.z.powi(2)).sqrt();
+            let walk = if i % 3 == 0 {
+                distance_m
+            } else {
+                distance_m * uniform(&mut state)
+            };
+            let point = [
+                on_segment[0] + walk * direction.x / length,
+                on_segment[1] + walk * direction.y / length,
+                on_segment[2] + walk * direction.z / length,
+            ];
+            let size = [0.0, 1.0, 1_000.0, 100_000.0][(i / 4) % 4];
+            let offset = [
+                size * uniform(&mut state),
+                size * uniform(&mut state),
+                size * uniform(&mut state),
+            ];
+            let low = [
+                point[0] - offset[0],
+                point[1] - offset[1],
+                point[2] - offset[2],
+            ];
+            let high = [low[0] + size, low[1] + size, low[2] + size];
+            if !line.meets_cell(&cell(low, high), distance_m) {
+                wrong.push(format!(
+                    "{a:?} to {b:?} within {distance_m} m: the cell {low:?} to {high:?} \
+                     holding {point:?} pruned"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} mistakes: {:#?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(20)]
+        );
+    }
+
+    /// Issue #1596: through a real BKD, a polyline finds exactly the points
+    /// within the distance, testing far fewer points one by one than there
+    /// are.
+    #[test]
+    fn a_geo3d_polyline_prunes_the_bkd() {
+        use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree, BKDWriter};
+        use crate::storage::Storage;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+        use crate::util::ecef::wgs84_to_ecef;
+
+        let n = 20_000_u64;
+        let mut state = 32_u64;
+        let points: Vec<GeoEcefPoint> = (0..n)
+            .map(|_| {
+                wgs84_to_ecef(
+                    -60.0 + 120.0 * uniform(&mut state),
+                    -180.0 + 360.0 * uniform(&mut state),
+                    3_000.0 * uniform(&mut state),
+                )
+            })
+            .collect();
+        let storage = std::sync::Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("geo3d.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 3).with_block_size(64);
+            let flat: Vec<f64> = points.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+            let doc_ids: Vec<u64> = (0..n).collect();
+            writer.write(&flat, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let tree = BKDReader::open(storage, "geo3d.bkd").unwrap();
+
+        let line = Geo3dPolyline::new(
+            [
+                (-20.0, -40.0),
+                (-10.0, -30.0),
+                (-15.0, -20.0),
+                (-5.0, -10.0),
+            ]
+            .iter()
+            .map(|&(lat, lon)| wgs84_to_ecef(lat, lon, 1_000.0))
+            .collect(),
+        )
+        .unwrap();
+        let distance_m = 100_000.0;
+        let mut visitor = Geo3dPolylineVisitor::new(&line, distance_m);
+        tree.intersect(&mut visitor).unwrap();
+        let visited = visitor.visited;
+        let mut found: Vec<u64> = visitor.hits.iter().map(|hit| hit.doc_id).collect();
+        found.sort_unstable();
+        let expected: Vec<u64> = (0..n)
+            .filter(|&id| line.distance_to(&points[id as usize]) <= distance_m)
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "the test needs points within the distance"
+        );
+        assert_eq!(found, expected);
+        assert!(
+            visited * 10 < n as usize,
+            "tested {visited} of {n} points one by one, for {} hits",
+            found.len()
         );
     }
 }
