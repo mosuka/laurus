@@ -46,7 +46,7 @@ use crate::lexical::core::field::NumericType;
 use crate::lexical::query::Query;
 use crate::lexical::query::boolean::{BooleanClause, BooleanQuery, Occur};
 use crate::lexical::query::fuzzy::FuzzyQuery;
-use crate::lexical::query::geo::{GeoBoundingBoxQuery, GeoDistanceQuery};
+use crate::lexical::query::geo::{GeoBoundingBoxQuery, GeoDistanceQuery, GeoPolygonQuery};
 use crate::lexical::query::geo3d::{Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dNearestQuery};
 use crate::lexical::query::graph_phrase::{
     GraphPhraseQuery, PhraseArc, complete_paths_with_origins,
@@ -574,11 +574,47 @@ impl LexicalQueryParser {
             match inner.as_rule() {
                 Rule::geo_distance => return self.parse_geo_distance(inner, field),
                 Rule::geo_bbox => return self.parse_geo_bbox(inner, field),
+                Rule::geo_polygon => return self.parse_geo_polygon(inner, field),
                 _ => {}
             }
         }
         Err(LaurusError::parse(
-            "Invalid 2D geo query (expected geo_distance / geo_bbox)".to_string(),
+            "Invalid 2D geo query (expected geo_distance / geo_bbox / geo_polygon)".to_string(),
+        ))
+    }
+
+    /// `field:geo_polygon((lat, lon, ...), (lat, lon, ...), ...)`: the first
+    /// ring is the exterior and the others are holes (Issue #1596).
+    fn parse_geo_polygon(
+        &self,
+        pair: pest::iterators::Pair<Rule>,
+        field: &str,
+    ) -> Result<Box<dyn Query>> {
+        let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+        for ring in pair.into_inner() {
+            if ring.as_rule() != Rule::geo_ring {
+                continue;
+            }
+            let numbers = collect_signed_floats(ring)?;
+            if numbers.len() % 2 != 0 {
+                return Err(LaurusError::parse(format!(
+                    "geo_polygon expects pairs of latitude and longitude, \
+                     and ring {} has {} numbers",
+                    rings.len(),
+                    numbers.len()
+                )));
+            }
+            rings.push(numbers.chunks(2).map(|pair| (pair[0], pair[1])).collect());
+        }
+        let Some((exterior, holes)) = rings.split_first() else {
+            return Err(LaurusError::parse(
+                "geo_polygon expects at least one ring".to_string(),
+            ));
+        };
+        let holes: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+        Ok(Box::new(
+            GeoPolygonQuery::within_polygon(field, exterior, &holes)
+                .map_err(|e| LaurusError::parse(format!("invalid geo_polygon arguments: {e}")))?,
         ))
     }
 

@@ -24,7 +24,9 @@ pub mod wildcard;
 pub use advanced_query::AdvancedQuery;
 pub use boolean::{BooleanQuery, BooleanQueryBuilder};
 pub use fuzzy::FuzzyQuery;
-pub use geo::{GeoBoundingBox, GeoBoundingBoxQuery, GeoDistanceQuery, GeoPoint};
+pub use geo::{
+    GeoBoundingBox, GeoBoundingBoxQuery, GeoDistanceQuery, GeoPoint, GeoPolygon, GeoPolygonQuery,
+};
 pub use geo3d::{
     Geo3dBoundingBoxQuery, Geo3dDistanceQuery, Geo3dMatch, Geo3dMatcher, Geo3dNearestQuery,
     Geo3dScorer,
@@ -661,6 +663,17 @@ mod leaf_field_tests {
             (
                 "GeoBoundingBoxQuery",
                 Box::new(GeoBoundingBoxQuery::new(field, bbox)),
+            ),
+            (
+                "GeoPolygonQuery",
+                Box::new(
+                    GeoPolygonQuery::within_polygon(
+                        field,
+                        &[(34.0, 138.0), (34.0, 140.0), (36.0, 140.0)],
+                        &[],
+                    )
+                    .unwrap(),
+                ),
             ),
             (
                 "Geo3dDistanceQuery",

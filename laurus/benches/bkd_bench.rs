@@ -3,7 +3,9 @@
 //! Covers `BKDReader::range_search` (the legacy axis-aligned API) and
 //! `BKDReader::intersect` (the visitor-driven primitive that 3D distance,
 //! k-NN, and other custom-shape queries will be built on) across 1D, 2D,
-//! and 3D datasets at 10k / 100k / 1M points.
+//! and 3D datasets at 10k / 100k / 1M points, and `GeoPolygonQuery`
+//! (Issue #1596) against `GeoBoundingBoxQuery` over the same extent, through
+//! a `LexicalStore` of 100k `Geo` points.
 //!
 //! # Running
 //!
@@ -18,6 +20,7 @@
 //! ```sh
 //! cargo bench --bench bkd_bench -- range_search/3d/100000
 //! cargo bench --bench bkd_bench -- intersect_counting
+//! cargo bench --bench bkd_bench -- geo_polygon_count
 //! ```
 //!
 //! Compile-only smoke check (skips the runtime, used by CI):
@@ -33,11 +36,15 @@
 mod common;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use laurus::lexical::core::field::{FieldOption, GeoOption};
 use laurus::lexical::index::structures::aabb::AABB;
 use laurus::lexical::index::structures::bkd_tree::{BKDReader, BKDTree, BKDWriter};
 use laurus::lexical::index::structures::visitor::{CellRelation, IntersectVisitor};
+use laurus::lexical::query::{GeoBoundingBoxQuery, GeoPoint, GeoPolygonQuery, Query};
+use laurus::lexical::{LexicalIndexConfig, LexicalSearchRequest, LexicalStore};
 use laurus::storage::Storage;
 use laurus::storage::memory::{MemoryStorage, MemoryStorageConfig};
+use laurus::{DataValue, Document};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -212,10 +219,89 @@ fn bench_build(c: &mut Criterion) {
     group.finish();
 }
 
+/// A `LexicalStore` of `n` random `Geo` points in latitudes `[30, 45)` and
+/// longitudes `[130, 145)`, in one segment with a BKD tree.
+fn build_geo_store(n: usize) -> LexicalStore {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+    let config = LexicalIndexConfig::builder()
+        .add_field("location", FieldOption::Geo(GeoOption::default()))
+        .build();
+    let store = LexicalStore::new(storage, config).unwrap();
+    let mut rng_state: u64 = DEFAULT_SEED;
+    for id in 0..n as u64 {
+        let lat = 30.0 + lcg_next(&mut rng_state) * 0.015;
+        let lon = 130.0 + lcg_next(&mut rng_state) * 0.015;
+        let doc = Document::builder()
+            .add_field("location", DataValue::Geo(GeoPoint::new(lat, lon)))
+            .build();
+        store.upsert_document(id, doc).unwrap();
+    }
+    store.commit().unwrap();
+    store
+}
+
+/// A regular polygon of `sides` vertices around `(lat, lon)`, `radius`
+/// degrees from it.
+fn regular_polygon(lat: f64, lon: f64, radius: f64, sides: usize) -> Vec<(f64, f64)> {
+    (0..sides)
+        .map(|i| {
+            let angle = std::f64::consts::TAU * i as f64 / sides as f64;
+            (lat + radius * angle.sin(), lon + radius * angle.cos())
+        })
+        .collect()
+}
+
+/// `GeoPolygonQuery` against `GeoBoundingBoxQuery` over the same extent,
+/// 35 to 40 degrees of latitude and 135 to 140 of longitude (about 11% of
+/// the points): the box, the square as a polygon, the square with a hole,
+/// and a 64-sided polygon inside the box. The polygon takes the cells inside
+/// it whole, and the box tests every point of the cells it reaches.
+fn bench_geo_polygon_count(c: &mut Criterion) {
+    let n = 100_000;
+    let store = build_geo_store(n);
+    let square = [(35.0, 135.0), (35.0, 140.0), (40.0, 140.0), (40.0, 135.0)];
+    let hole = [(36.0, 136.0), (36.0, 139.0), (39.0, 139.0), (39.0, 136.0)];
+    let circle = regular_polygon(37.5, 137.5, 2.5, 64);
+    let queries: Vec<(&str, Box<dyn Query>)> = vec![
+        (
+            "bbox",
+            Box::new(
+                GeoBoundingBoxQuery::within_bounding_box("location", 35.0, 135.0, 40.0, 140.0)
+                    .unwrap(),
+            ),
+        ),
+        (
+            "polygon_square",
+            Box::new(GeoPolygonQuery::within_polygon("location", &square, &[]).unwrap()),
+        ),
+        (
+            "polygon_square_with_a_hole",
+            Box::new(GeoPolygonQuery::within_polygon("location", &square, &[&hole]).unwrap()),
+        ),
+        (
+            "polygon_64_sides",
+            Box::new(GeoPolygonQuery::within_polygon("location", &circle, &[]).unwrap()),
+        ),
+    ];
+
+    let mut group = c.benchmark_group("geo_polygon_count");
+    group.throughput(Throughput::Elements(n as u64));
+    for (label, query) in &queries {
+        group.bench_function(BenchmarkId::from_parameter(format!("{label}/{n}")), |b| {
+            b.iter(|| {
+                let request = LexicalSearchRequest::new(query.clone_box());
+                black_box(store.count(black_box(request)).unwrap());
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_range_search,
     bench_intersect_counting,
-    bench_build
+    bench_build,
+    bench_geo_polygon_count
 );
 criterion_main!(benches);

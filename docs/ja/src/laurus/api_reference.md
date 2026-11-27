@@ -207,6 +207,7 @@ cargo doc --open
 | `DateTimeRangeQuery::between(field, start, end)` | 日時範囲（`new(...)` は `Option<DateTime<Utc>>` の境界、`from_literals(...)?` は DSL リテラルを受け取る） | [Lexical Search](../concepts/search.md) を参照 |
 | `GeoDistanceQuery::within_radius(...)` | 2D 地理半径 | [Lexical Search](../concepts/search.md) を参照 |
 | `GeoBoundingBoxQuery::within_bounding_box(...)` | 2D 地理バウンディングボックス | [Lexical Search](../concepts/search.md) を参照 |
+| `GeoPolygonQuery::within_polygon(...)` | 穴を持てる 2D 地理多角形 | [Lexical Search](../concepts/search.md) を参照 |
 | `Geo3dDistanceQuery::within_sphere(...)` | 3D ECEF 球 | [3D 地理検索](../concepts/geo3d.md) を参照 |
 | `Geo3dBoundingBoxQuery::within_box(...)` | 3D ECEF 軸並行バウンディングボックス | [3D 地理検索](../concepts/geo3d.md) を参照 |
 | `Geo3dNearestQuery::k_nearest(...)` | 3D ECEF k-NN | [3D 地理検索](../concepts/geo3d.md) を参照 |

@@ -209,6 +209,7 @@ The `weight` of each `QueryPayload` and `QueryVector` must be finite and at leas
 | `DateTimeRangeQuery::between(field, start, end)` | DateTime range (`new(...)` takes `Option<DateTime<Utc>>` bounds; `from_literals(...)?` takes DSL literals) | See [Lexical Search](../concepts/search.md) |
 | `GeoDistanceQuery::within_radius(...)` | 2D geo radius | See [Lexical Search](../concepts/search.md) |
 | `GeoBoundingBoxQuery::within_bounding_box(...)` | 2D geo bounding box | See [Lexical Search](../concepts/search.md) |
+| `GeoPolygonQuery::within_polygon(...)` | 2D geo polygon with holes | See [Lexical Search](../concepts/search.md) |
 | `Geo3dDistanceQuery::within_sphere(...)` | 3D ECEF sphere | See [3D Geographic Search](../concepts/geo3d.md) |
 | `Geo3dBoundingBoxQuery::within_box(...)` | 3D ECEF axis-aligned box | See [3D Geographic Search](../concepts/geo3d.md) |
 | `Geo3dNearestQuery::k_nearest(...)` | 3D ECEF k-NN | See [3D Geographic Search](../concepts/geo3d.md) |

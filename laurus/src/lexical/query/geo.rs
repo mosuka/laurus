@@ -13,8 +13,8 @@ use crate::error::Result;
 use crate::lexical::index::structures::aabb::AABB;
 use crate::lexical::index::structures::visitor::{CellRelation, IntersectVisitor};
 use crate::lexical::query::Query;
-use crate::lexical::query::matcher::Matcher;
-use crate::lexical::query::scorer::Scorer;
+use crate::lexical::query::matcher::{Matcher, PreComputedMatcher};
+use crate::lexical::query::scorer::{ConstantScorer, Scorer};
 use crate::lexical::reader::{LexicalIndexReader, scan_doc_ids};
 
 /// A 2D geographical bounding box, expressed as the south-west `min` corner
@@ -1080,6 +1080,558 @@ impl Query for GeoBoundingBoxQuery {
         // Field + bounding box determine the matched set; boost is score-only
         // and excluded.
         Some(format!("geobbox|{:?}|{:?}", self.field, self.bounding_box))
+    }
+}
+
+/// How near an edge a point is on it, in degrees (about 0.1 mm).
+const ON_EDGE_DEGREES: f64 = 1e-9;
+
+/// A polygon on the surface: an exterior ring of latitudes and longitudes,
+/// with holes, for [`GeoPolygonQuery`] (Issue #1596).
+///
+/// Its edges are straight lines in latitude and longitude, as Lucene's
+/// `Polygon`. It reads as Lucene's does on its boundary: a point on an edge
+/// or vertex of the exterior is inside, and a point on an edge or vertex of
+/// a hole is not, so a hole's boundary belongs to the hole.
+///
+/// An edge takes the shorter way between its two vertices: the way whose
+/// longitudes differ by 180 degrees or less. An edge from 170 to -170 is
+/// 20 degrees wide and crosses the antimeridian, so a polygon over the
+/// Pacific needs no splitting; an edge wider than 180 degrees is written
+/// with a vertex in between. A ring around a pole, whose edges add up to a
+/// whole turn of longitude, and an edge across exactly 180 degrees, which
+/// could go either way, are rejected.
+///
+/// A ring is closed if its last point is not its first. Self-intersection is
+/// not checked, as in Lucene; a polygon that crosses itself matches by the
+/// crossing number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeoPolygon {
+    /// The exterior ring as given, closed.
+    exterior: Vec<GeoPoint>,
+    /// The holes as given, closed.
+    holes: Vec<Vec<GeoPoint>>,
+    /// Every ring as `[lat, lon]`, the exterior first, with the longitudes
+    /// unwrapped: each edge's longitudes differ by at most 180 degrees, and
+    /// may go past ±180. The exterior starts within `[-180, 180)`, and each
+    /// hole lies with it.
+    rings: Vec<Vec<[f64; 2]>>,
+    /// The exterior's bounding box `[lat, lon]`, in unwrapped longitudes.
+    min: [f64; 2],
+    max: [f64; 2],
+}
+
+impl GeoPolygon {
+    /// Create a polygon from its exterior ring and holes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaurusError::InvalidArgument`](crate::error::LaurusError)
+    /// if a ring has fewer than 3 distinct points, a coordinate is not a
+    /// latitude in `[-90, 90]` or a longitude in `[-180, 180]`, an edge
+    /// spans exactly 180 degrees of longitude, or a ring goes around a pole.
+    pub fn new(exterior: Vec<GeoPoint>, holes: Vec<Vec<GeoPoint>>) -> Result<Self> {
+        let exterior = close_ring(exterior, "the exterior")?;
+        let holes = holes
+            .into_iter()
+            .enumerate()
+            .map(|(i, hole)| close_ring(hole, &format!("hole {i}")))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut outer = unwrap_ring(&exterior, "the exterior")?;
+        let (mut min, mut max) = ring_bounds(&outer);
+        // Start the exterior within [-180, 180).
+        let shift = 360.0 * ((min[1] + 180.0) / 360.0).floor();
+        shift_ring(&mut outer, -shift);
+        min[1] -= shift;
+        max[1] -= shift;
+
+        let mut rings = vec![outer];
+        let center = (min[1] + max[1]) / 2.0;
+        for (i, hole) in holes.iter().enumerate() {
+            let mut ring = unwrap_ring(hole, &format!("hole {i}"))?;
+            let (hole_min, hole_max) = ring_bounds(&ring);
+            // Lay the hole where the exterior is: the shift by 360 degrees
+            // that brings its center nearest the exterior's.
+            let shift = 360.0 * (((hole_min[1] + hole_max[1]) / 2.0 - center) / 360.0).round();
+            shift_ring(&mut ring, -shift);
+            rings.push(ring);
+        }
+
+        Ok(GeoPolygon {
+            exterior,
+            holes,
+            rings,
+            min,
+            max,
+        })
+    }
+
+    /// The exterior ring, closed.
+    pub fn exterior(&self) -> &[GeoPoint] {
+        &self.exterior
+    }
+
+    /// The holes, each closed.
+    pub fn holes(&self) -> &[Vec<GeoPoint>] {
+        &self.holes
+    }
+
+    /// Whether `point` is inside the polygon: inside or on the exterior,
+    /// and neither inside nor on a hole.
+    pub fn contains(&self, point: &GeoPoint) -> bool {
+        self.contains_lat_lon(point.lat, point.lon)
+    }
+
+    /// [`contains`](Self::contains) for a latitude and a longitude in
+    /// `[-180, 180]`, which is tried at every shift of 360 degrees that
+    /// reaches the polygon's unwrapped longitudes.
+    fn contains_lat_lon(&self, lat: f64, lon: f64) -> bool {
+        if lat < self.min[0] - ON_EDGE_DEGREES || lat > self.max[0] + ON_EDGE_DEGREES {
+            return false;
+        }
+        [-360.0, 0.0, 360.0].iter().any(|shift| {
+            let lon = lon + shift;
+            lon >= self.min[1] - ON_EDGE_DEGREES
+                && lon <= self.max[1] + ON_EDGE_DEGREES
+                && self.contains_unwrapped(lat, lon)
+        })
+    }
+
+    /// Whether the unwrapped `(lat, lon)` is inside the polygon.
+    fn contains_unwrapped(&self, lat: f64, lon: f64) -> bool {
+        ring_contains(&self.rings[0], lat, lon)
+            && !self.rings[1..]
+                .iter()
+                .any(|hole| ring_contains(hole, lat, lon))
+    }
+
+    /// How a cell of the BKD, the box from `min` to `max` (`[lat, lon]`,
+    /// longitudes within `[-180, 180]`), relates to the polygon: `Inside`
+    /// when every point of it is inside, `Outside` when none is, and
+    /// `Crosses` when an edge of a ring comes within [`ON_EDGE_DEGREES`] of
+    /// it. Tried at every shift of 360 degrees: one shift with the cell
+    /// inside is enough.
+    fn relate(&self, min: &[f64], max: &[f64]) -> CellRelation {
+        let mut crosses = false;
+        for shift in [-360.0, 0.0, 360.0] {
+            let cell = [min[0], min[1] + shift, max[0], max[1] + shift];
+            match self.relate_unwrapped(cell) {
+                CellRelation::Inside => return CellRelation::Inside,
+                CellRelation::Crosses => crosses = true,
+                CellRelation::Outside => {}
+            }
+        }
+        if crosses {
+            CellRelation::Crosses
+        } else {
+            CellRelation::Outside
+        }
+    }
+
+    /// [`relate`](Self::relate) for a box in unwrapped longitudes,
+    /// `[min_lat, min_lon, max_lat, max_lon]`.
+    fn relate_unwrapped(&self, cell: [f64; 4]) -> CellRelation {
+        // The box widened by the tolerance of an edge, so that no point
+        // closer than that to an edge is left to the corner below.
+        let near = [
+            cell[0] - ON_EDGE_DEGREES,
+            cell[1] - ON_EDGE_DEGREES,
+            cell[2] + ON_EDGE_DEGREES,
+            cell[3] + ON_EDGE_DEGREES,
+        ];
+        if near[2] < self.min[0]
+            || near[0] > self.max[0]
+            || near[3] < self.min[1]
+            || near[1] > self.max[1]
+        {
+            return CellRelation::Outside;
+        }
+        let meets = self
+            .rings
+            .iter()
+            .flat_map(|ring| ring.windows(2))
+            .any(|edge| segment_meets_box(edge[0], edge[1], near));
+        if meets {
+            return CellRelation::Crosses;
+        }
+        // No edge comes near the box, so every point of it is on the same
+        // side of every ring as its corner.
+        if self.contains_unwrapped(cell[0], cell[1]) {
+            CellRelation::Inside
+        } else {
+            CellRelation::Outside
+        }
+    }
+}
+
+/// Check the points of `ring` and close it: its last point is its first.
+fn close_ring(mut ring: Vec<GeoPoint>, name: &str) -> Result<Vec<GeoPoint>> {
+    for point in &ring {
+        if !(-90.0..=90.0).contains(&point.lat) {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "{name} of the polygon has the latitude {}, which is not within [-90, 90]",
+                point.lat
+            )));
+        }
+        if !(-180.0..=180.0).contains(&point.lon) {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "{name} of the polygon has the longitude {}, which is not within [-180, 180]",
+                point.lon
+            )));
+        }
+    }
+    if ring.first() != ring.last() {
+        ring.push(ring[0]);
+    }
+    let mut distinct: Vec<GeoPoint> = Vec::new();
+    for point in &ring[..ring.len().saturating_sub(1)] {
+        if !distinct.contains(point) {
+            distinct.push(*point);
+        }
+    }
+    if distinct.len() < 3 {
+        return Err(crate::error::LaurusError::invalid_argument(format!(
+            "{name} of the polygon needs at least 3 distinct points, and has {}",
+            distinct.len()
+        )));
+    }
+    Ok(ring)
+}
+
+/// `ring` (closed) as `[lat, lon]` with its longitudes unwrapped, so that
+/// each edge takes the shorter way.
+fn unwrap_ring(ring: &[GeoPoint], name: &str) -> Result<Vec<[f64; 2]>> {
+    let mut out = Vec::with_capacity(ring.len());
+    let mut lon = ring[0].lon;
+    out.push([ring[0].lat, lon]);
+    for edge in ring.windows(2) {
+        let mut delta = edge[1].lon - edge[0].lon;
+        if delta > 180.0 {
+            delta -= 360.0;
+        } else if delta < -180.0 {
+            delta += 360.0;
+        }
+        if delta.abs() == 180.0 {
+            return Err(crate::error::LaurusError::invalid_argument(format!(
+                "an edge of {name} of the polygon spans exactly 180 degrees of longitude, \
+                 which could go either way; add a point between its ends"
+            )));
+        }
+        lon += delta;
+        out.push([edge[1].lat, lon]);
+    }
+    if (lon - out[0][1]).abs() > ON_EDGE_DEGREES {
+        return Err(crate::error::LaurusError::invalid_argument(format!(
+            "{name} of the polygon goes around a pole, which a polygon cannot hold"
+        )));
+    }
+    // The closing point exactly on the first.
+    let first = out[0];
+    if let Some(last) = out.last_mut() {
+        *last = first;
+    }
+    Ok(out)
+}
+
+/// The bounding box of `ring`, `[lat, lon]`.
+fn ring_bounds(ring: &[[f64; 2]]) -> ([f64; 2], [f64; 2]) {
+    let mut min = [f64::INFINITY; 2];
+    let mut max = [f64::NEG_INFINITY; 2];
+    for point in ring {
+        for dim in 0..2 {
+            min[dim] = min[dim].min(point[dim]);
+            max[dim] = max[dim].max(point[dim]);
+        }
+    }
+    (min, max)
+}
+
+fn shift_ring(ring: &mut [[f64; 2]], lon: f64) {
+    for point in ring {
+        point[1] += lon;
+    }
+}
+
+/// Whether `(lat, lon)` is inside the closed `ring` or on it.
+fn ring_contains(ring: &[[f64; 2]], lat: f64, lon: f64) -> bool {
+    let mut inside = false;
+    for edge in ring.windows(2) {
+        let (a, b) = (edge[0], edge[1]);
+        if on_segment(a, b, lat, lon) {
+            return true;
+        }
+        // The crossing number, with a ray toward greater longitudes.
+        if (a[0] > lat) != (b[0] > lat) {
+            let crossing = a[1] + (lat - a[0]) * (b[1] - a[1]) / (b[0] - a[0]);
+            if lon < crossing {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Whether `(lat, lon)` is within [`ON_EDGE_DEGREES`] of the segment from
+/// `a` to `b`.
+fn on_segment(a: [f64; 2], b: [f64; 2], lat: f64, lon: f64) -> bool {
+    if lat < a[0].min(b[0]) - ON_EDGE_DEGREES
+        || lat > a[0].max(b[0]) + ON_EDGE_DEGREES
+        || lon < a[1].min(b[1]) - ON_EDGE_DEGREES
+        || lon > a[1].max(b[1]) + ON_EDGE_DEGREES
+    {
+        return false;
+    }
+    let (d_lat, d_lon) = (b[0] - a[0], b[1] - a[1]);
+    let length = d_lat.hypot(d_lon);
+    if length == 0.0 {
+        return true;
+    }
+    let cross = d_lon * (lat - a[0]) - d_lat * (lon - a[1]);
+    (cross / length).abs() <= ON_EDGE_DEGREES
+}
+
+/// Whether the segment from `a` to `b` (`[lat, lon]`) meets the closed box
+/// `[min_lat, min_lon, max_lat, max_lon]`, by clipping it to the box
+/// (Liang-Barsky).
+fn segment_meets_box(a: [f64; 2], b: [f64; 2], cell: [f64; 4]) -> bool {
+    let (d_lat, d_lon) = (b[0] - a[0], b[1] - a[1]);
+    let (mut enter, mut leave) = (0.0_f64, 1.0_f64);
+    for (p, q) in [
+        (-d_lat, a[0] - cell[0]),
+        (d_lat, cell[2] - a[0]),
+        (-d_lon, a[1] - cell[1]),
+        (d_lon, cell[3] - a[1]),
+    ] {
+        if p == 0.0 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q / p;
+            if p < 0.0 {
+                if t > leave {
+                    return false;
+                }
+                enter = enter.max(t);
+            } else {
+                if t < enter {
+                    return false;
+                }
+                leave = leave.min(t);
+            }
+        }
+    }
+    true
+}
+
+/// [`IntersectVisitor`] collecting the doc ids of the points inside a
+/// [`GeoPolygon`]. The polygon's score is constant, so a cell inside it is
+/// taken whole through `visit_inside`, without its coordinates.
+#[derive(Debug)]
+struct GeoPolygonVisitor<'a> {
+    polygon: &'a GeoPolygon,
+    hits: Vec<u64>,
+    /// How many points were tested one by one, for the pruning test.
+    #[cfg(test)]
+    visited: usize,
+}
+
+impl<'a> GeoPolygonVisitor<'a> {
+    fn new(polygon: &'a GeoPolygon) -> Self {
+        GeoPolygonVisitor {
+            polygon,
+            hits: Vec::new(),
+            #[cfg(test)]
+            visited: 0,
+        }
+    }
+}
+
+impl IntersectVisitor for GeoPolygonVisitor<'_> {
+    fn compare(&self, cell: &AABB) -> CellRelation {
+        debug_assert_eq!(cell.num_dims(), 2, "GeoPolygonVisitor expects a 2D BKD");
+        self.polygon.relate(cell.min(), cell.max())
+    }
+
+    fn visit_inside(&mut self, doc_id: u64) {
+        self.hits.push(doc_id);
+    }
+
+    fn visit(&mut self, doc_id: u64, point: &[f64]) {
+        #[cfg(test)]
+        {
+            self.visited += 1;
+        }
+        if self.polygon.contains_lat_lon(point[0], point[1]) {
+            self.hits.push(doc_id);
+        }
+    }
+}
+
+/// A query for the documents with a point of a `Geo` field inside a
+/// [`GeoPolygon`] (Issue #1596).
+///
+/// Every hit scores the boost (`1.0` unless set), as Lucene's polygon query
+/// does: a polygon has no natural center to score by. A multi-valued field
+/// matches when any of its points is inside.
+///
+/// # Example
+///
+/// ```rust
+/// use laurus::lexical::query::GeoPolygonQuery;
+///
+/// // A square with a square hole, latitude first.
+/// let query = GeoPolygonQuery::within_polygon(
+///     "location",
+///     &[(35.0, 139.0), (35.0, 140.0), (36.0, 140.0), (36.0, 139.0)],
+///     &[&[(35.4, 139.4), (35.4, 139.6), (35.6, 139.6), (35.6, 139.4)]],
+/// )
+/// .unwrap();
+/// ```
+#[derive(Debug, Clone)]
+pub struct GeoPolygonQuery {
+    /// Field containing geographical coordinates.
+    field: String,
+    /// The polygon.
+    polygon: GeoPolygon,
+    /// Boost factor for the query.
+    boost: f32,
+}
+
+impl GeoPolygonQuery {
+    /// Create a polygon query.
+    pub fn new<F: Into<String>>(field: F, polygon: GeoPolygon) -> Self {
+        GeoPolygonQuery {
+            field: field.into(),
+            polygon,
+            boost: 1.0,
+        }
+    }
+
+    /// Create a polygon query from `(lat, lon)` pairs: the exterior ring and
+    /// the holes, each closed or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`GeoPolygon::new`] returns.
+    pub fn within_polygon<F: Into<String>>(
+        field: F,
+        exterior: &[(f64, f64)],
+        holes: &[&[(f64, f64)]],
+    ) -> Result<Self> {
+        let ring = |points: &[(f64, f64)]| -> Vec<GeoPoint> {
+            points
+                .iter()
+                .map(|&(lat, lon)| GeoPoint { lat, lon })
+                .collect()
+        };
+        let polygon = GeoPolygon::new(
+            ring(exterior),
+            holes.iter().map(|hole| ring(hole)).collect(),
+        )?;
+        Ok(GeoPolygonQuery::new(field, polygon))
+    }
+
+    /// Set the boost factor.
+    pub fn with_boost(mut self, boost: f32) -> Self {
+        self.boost = boost;
+        self
+    }
+
+    /// Get the field name.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// Get the polygon.
+    pub fn polygon(&self) -> &GeoPolygon {
+        &self.polygon
+    }
+
+    /// The ids of the documents with a point inside the polygon, sorted and
+    /// once each.
+    pub fn find_doc_ids(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<u64>> {
+        let mut doc_ids = Vec::new();
+        if let Some(bkd_tree) = reader.get_bkd_tree(&self.field)? {
+            // One traversal, whichever side of the antimeridian a cell is
+            // on: `GeoPolygon::relate` tries every shift of 360 degrees.
+            let mut visitor = GeoPolygonVisitor::new(&self.polygon);
+            bkd_tree.intersect(&mut visitor)?;
+            doc_ids = visitor.hits;
+        } else {
+            // Without a BKD, the stored values of the documents present in
+            // this reader.
+            for doc_id in scan_doc_ids(reader)? {
+                if let Some(doc) = reader.document(doc_id)?
+                    && let Some(value) = doc.get_field(&self.field)
+                    && stored_geo_points(value).any(|point| self.polygon.contains(&point))
+                {
+                    doc_ids.push(doc_id);
+                }
+            }
+        }
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
+        Ok(doc_ids)
+    }
+}
+
+impl Query for GeoPolygonQuery {
+    fn field(&self) -> Option<&str> {
+        Some(&self.field)
+    }
+
+    fn matcher(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Matcher>> {
+        Ok(Box::new(PreComputedMatcher::new(
+            self.find_doc_ids(reader)?,
+        )))
+    }
+
+    fn scorer(&self, _reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
+        Ok(Box::new(ConstantScorer::with_boost(1.0, self.boost)))
+    }
+
+    fn boost(&self) -> f32 {
+        self.boost
+    }
+
+    fn set_boost(&mut self, boost: f32) {
+        self.boost = boost;
+    }
+
+    fn clone_box(&self) -> Box<dyn Query> {
+        Box::new(self.clone())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "GeoPolygonQuery(field: {}, exterior: {:?}, holes: {:?})",
+            self.field, self.polygon.exterior, self.polygon.holes
+        )
+    }
+
+    fn is_empty(&self, _reader: &dyn LexicalIndexReader) -> Result<bool> {
+        // A polygon the constructor accepts has a boundary, which it
+        // matches, so it is never empty.
+        Ok(false)
+    }
+
+    fn cost(&self, reader: &dyn LexicalIndexReader) -> Result<u64> {
+        Ok(reader.doc_count())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn cache_key(&self) -> Option<String> {
+        // Field and rings determine the matched set; the boost is
+        // score-only and excluded.
+        Some(format!(
+            "geopolygon|{:?}|{:?}|{:?}",
+            self.field, self.polygon.exterior, self.polygon.holes
+        ))
     }
 }
 
@@ -2283,5 +2835,226 @@ mod tests {
         let zero = GeoDistanceQuery::new("location", center, 0.0).cap_bounds();
         assert!(zero.contains(&center));
         assert!(!zero.contains(&GeoPoint::new(10.0, 20.001)));
+    }
+
+    fn square_with_a_hole() -> GeoPolygon {
+        let ring = |points: &[(f64, f64)]| -> Vec<GeoPoint> {
+            points
+                .iter()
+                .map(|&(lat, lon)| GeoPoint::new(lat, lon))
+                .collect()
+        };
+        GeoPolygon::new(
+            ring(&[(10.0, 10.0), (10.0, 30.0), (30.0, 30.0), (30.0, 10.0)]),
+            vec![ring(&[
+                (15.0, 15.0),
+                (15.0, 25.0),
+                (25.0, 25.0),
+                (25.0, 15.0),
+            ])],
+        )
+        .unwrap()
+    }
+
+    fn across_the_antimeridian() -> GeoPolygon {
+        GeoPolygonQuery::within_polygon(
+            "location",
+            &[
+                (-20.0, 170.0),
+                (-20.0, -170.0),
+                (-10.0, -170.0),
+                (-10.0, 170.0),
+            ],
+            &[],
+        )
+        .unwrap()
+        .polygon()
+        .clone()
+    }
+
+    /// Deterministic pseudo-random numbers in `[0, 1)` (xorshift64*).
+    fn uniform(state: &mut u64) -> f64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Issue #1596: a point on an exterior edge or vertex is inside, one on
+    /// a hole's edge or vertex is not, and a polygon across the antimeridian
+    /// holds both signs of ±180.
+    #[test]
+    fn a_polygon_contains_its_exterior_boundary_and_not_its_holes() {
+        let polygon = square_with_a_hole();
+        let mut wrong = Vec::new();
+        for (lat, lon, expected) in [
+            (10.0, 20.0, true),  // an exterior edge
+            (30.0, 30.0, true),  // an exterior vertex
+            (12.0, 12.0, true),  // inside
+            (15.0, 20.0, false), // a hole's edge
+            (25.0, 25.0, false), // a hole's vertex
+            (20.0, 20.0, false), // in the hole
+            (9.0, 20.0, false),  // outside
+            (20.0, 30.0 + 1e-6, false),
+        ] {
+            if polygon.contains(&GeoPoint::new(lat, lon)) != expected {
+                wrong.push(format!("({lat}, {lon}) should be {expected}"));
+            }
+        }
+        let polygon = across_the_antimeridian();
+        for (lat, lon, expected) in [
+            (-15.0, 175.0, true),
+            (-15.0, -175.0, true),
+            (-15.0, 180.0, true),
+            (-15.0, -180.0, true),
+            (-15.0, 0.0, false),
+            (-15.0, 165.0, false),
+        ] {
+            if polygon.contains(&GeoPoint::new(lat, lon)) != expected {
+                wrong.push(format!("across: ({lat}, {lon}) should be {expected}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1596: `relate` never says `Inside` of a cell with a point
+    /// outside, nor `Outside` of one with a point inside, on random cells.
+    #[test]
+    fn a_polygon_relates_cells_without_mistakes() {
+        let mut state = 7_u64;
+        let mut wrong = Vec::new();
+        let mut seen = [0_usize; 3];
+        for polygon in [square_with_a_hole(), across_the_antimeridian()] {
+            for _ in 0..2_000 {
+                let lat = -40.0 + 80.0 * uniform(&mut state);
+                let lon = -180.0 + 360.0 * uniform(&mut state);
+                let height = 15.0 * uniform(&mut state);
+                let width = 15.0 * uniform(&mut state);
+                let min = [lat, lon];
+                let max = [lat + height, (lon + width).min(180.0)];
+                let relation = polygon.relate(&min, &max);
+                seen[relation as usize] += 1;
+                if relation == CellRelation::Crosses {
+                    continue;
+                }
+                // A grid of points of the cell, its corners and edges too.
+                for i in 0..=8 {
+                    for j in 0..=8 {
+                        let p_lat = min[0] + (max[0] - min[0]) * f64::from(i) / 8.0;
+                        let p_lon = min[1] + (max[1] - min[1]) * f64::from(j) / 8.0;
+                        let inside = polygon.contains_lat_lon(p_lat, p_lon);
+                        if inside != (relation == CellRelation::Inside) {
+                            wrong.push(format!(
+                                "{relation:?} cell {min:?}..{max:?} has ({p_lat}, {p_lon}) \
+                                 inside: {inside}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|count| *count > 0),
+            "every relation should come up: {seen:?}"
+        );
+        assert!(
+            wrong.is_empty(),
+            "{} mistakes: {:#?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(10)]
+        );
+    }
+
+    /// Issue #1596: through a BKD of many points, a polygon tests far fewer
+    /// points one by one than the BKD holds, taking the cells inside it
+    /// whole, and finds what a linear scan finds.
+    #[test]
+    fn a_polygon_prunes_the_bkd() {
+        use crate::lexical::index::structures::bkd_tree::{BKDReader, BKDTree, BKDWriter};
+        use crate::storage::Storage;
+        use crate::storage::memory::{MemoryStorage, MemoryStorageConfig};
+
+        let n = 20_000_u64;
+        let mut state = 11_u64;
+        let points: Vec<[f64; 2]> = (0..n)
+            .map(|_| {
+                [
+                    -60.0 + 120.0 * uniform(&mut state),
+                    -180.0 + 360.0 * uniform(&mut state),
+                ]
+            })
+            .collect();
+        let storage = std::sync::Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        {
+            let output = storage.create_output("geo.bkd").unwrap();
+            let mut writer = BKDWriter::new(output, 2).with_block_size(64);
+            let flat: Vec<f64> = points.iter().flatten().copied().collect();
+            let doc_ids: Vec<u64> = (0..n).collect();
+            writer.write(&flat, &doc_ids).unwrap();
+            writer.finish().unwrap();
+        }
+        let tree = BKDReader::open(storage, "geo.bkd").unwrap();
+
+        // A large one, whose hits are mostly in cells inside it. It is 300
+        // degrees wide, so its long edges have a vertex in the middle: an
+        // edge takes the shorter way, and from -150 to 150 that is the 60
+        // degrees across the antimeridian.
+        let large = GeoPolygonQuery::within_polygon(
+            "location",
+            &[
+                (-50.0, -150.0),
+                (-50.0, 0.0),
+                (-50.0, 150.0),
+                (50.0, 150.0),
+                (50.0, 0.0),
+                (50.0, -150.0),
+            ],
+            &[&[(-10.0, -10.0), (-10.0, 10.0), (10.0, 10.0), (10.0, -10.0)]],
+        )
+        .unwrap()
+        .polygon()
+        .clone();
+
+        let mut wrong = Vec::new();
+        for (name, polygon, is_large) in [
+            ("square with a hole", square_with_a_hole(), false),
+            ("across the antimeridian", across_the_antimeridian(), false),
+            ("large with a hole", large, true),
+        ] {
+            let mut visitor = GeoPolygonVisitor::new(&polygon);
+            tree.intersect(&mut visitor).unwrap();
+            let visited = visitor.visited;
+            let mut found = visitor.hits;
+            found.sort_unstable();
+            let expected: Vec<u64> = (0..n)
+                .filter(|&id| {
+                    let [lat, lon] = points[id as usize];
+                    polygon.contains_lat_lon(lat, lon)
+                })
+                .collect();
+            if found != expected {
+                wrong.push(format!(
+                    "{name}: found {} ids, expected {}",
+                    found.len(),
+                    expected.len()
+                ));
+            }
+            // Only the points of the cells across an edge are tested one
+            // by one: a tenth of the points at most for the small polygons,
+            // and fewer than half of the hits for the large one, whose
+            // other hits come from cells taken whole.
+            let pruned = if is_large {
+                visited * 2 < found.len()
+            } else {
+                visited * 10 < n as usize
+            };
+            if !pruned {
+                wrong.push(format!(
+                    "{name}: tested {visited} of {n} points one by one, for {} hits",
+                    found.len()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

@@ -189,18 +189,20 @@ created_at:{2024-01-01 TO 2025-01-01}
 
 ### 2D 地理クエリ（`geo_*`)
 
-2 種類の関数形式を `Geo`（2D 緯度 / 経度）フィールドに対して使えます。
+3 種類の関数形式を `Geo`（2D 緯度 / 経度）フィールドに対して使えます。
 緯度・経度は度単位、距離はメートル単位の符号付き浮動小数点数：
 
 ```text
 location:geo_distance(lat, lon, distance_m)
 location:geo_bbox(min_lat, min_lon, max_lat, max_lon)
+location:geo_polygon((lat, lon, lat, lon, ...), (lat, lon, ...), ...)
 ```
 
 | 形式 | 動作 |
 | :--- | :--- |
 | `geo_distance(lat, lon, distance_m)` | 中心 `(lat, lon)` から `distance_m` メートル以内の格納済み座標を返す |
 | `geo_bbox(min_lat, min_lon, max_lat, max_lon)` | 緯度・経度の矩形（端を含む）に含まれる格納済み座標を返す。`min_lon > max_lon` のときはボックスが日付変更線（±180°）をまたぐ（GeoJSON と同じ）。端がちょうど ±180° のときは、どちらの符号で保存された点にもマッチする |
+| `geo_polygon((lat, lon, ...), (lat, lon, ...), ...)` | 多角形の中の格納済み座標を返す（Issue #1596）。最初の環が外周、続く環が穴で、それぞれ緯度と経度の組の並び（閉じていてもいなくてもよく、異なる点が 3 つ以上）。Lucene と同じく、外周の辺と頂点の上の点はマッチし、穴の辺と頂点の上の点はマッチしない。辺は 2 つの頂点の間の近いほうを通るので、170 度から -170 度への辺は日付変更線をまたぐ。180 度より広い辺には間に頂点を置く必要があり、極を囲む環は拒否する。点数はどの一致も boost の値 |
 
 例：
 
@@ -213,6 +215,13 @@ location:geo_bbox(35.0, 139.0, 36.0, 140.0)
 
 # 日付変更線をまたぐボックス: 東経 175 度から西経 175 度まで
 location:geo_bbox(-20.0, 175.0, -15.0, -175.0)
+
+# 正方形の穴のある正方形
+location:geo_polygon((35.0, 139.0, 35.0, 140.0, 36.0, 140.0, 36.0, 139.0),
+                     (35.4, 139.4, 35.4, 139.6, 35.6, 139.6, 35.6, 139.4))
+
+# 太平洋の上: 170 度から -170 度への辺が日付変更線をまたぐ
+location:geo_polygon((-20.0, 170.0, -20.0, -170.0, -10.0, -170.0, -10.0, 170.0))
 ```
 
 > クエリ対象フィールドはスキーマで `Geo` フィールドとして宣言されている必要が
@@ -303,11 +312,13 @@ geo3d_bbox     = { ^"geo3d_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ signed_float ~ "," ~ signed_float ~ ")" }
 geo3d_nearest  = { ^"geo3d_nearest" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ unsigned_int ~ ")" }
-geo_query      = { geo_distance | geo_bbox }
+geo_query      = { geo_distance | geo_bbox | geo_polygon }
 geo_distance   = { ^"geo_distance" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ ")" }
 geo_bbox       = { ^"geo_bbox" ~ "(" ~ signed_float ~ "," ~ signed_float
                  ~ "," ~ signed_float ~ "," ~ signed_float ~ ")" }
+geo_polygon    = { ^"geo_polygon" ~ "(" ~ geo_ring ~ ("," ~ geo_ring)* ~ ")" }
+geo_ring       = { "(" ~ signed_float ~ ("," ~ signed_float)* ~ ")" }
 phrase_query   = { "\"" ~ phrase_content ~ "\"" ~ proximity? ~ boost? }
 phrase_content = @{ ("\\" ~ ANY | !"\"" ~ ANY)* }
 proximity      = { "~" ~ number }
