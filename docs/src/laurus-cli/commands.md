@@ -550,6 +550,7 @@ Execute a search query using the [Query DSL](../concepts/query_dsl.md).
 laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
               [--rescore-field <FIELD> (--rescore-text <TEXT> | --rescore-vectors <JSON>) [--rescore-window <N>]]
               [--group-by <FIELD> [--group-size <N>]]
+              [--track-total-hits <N|true|false>]
 ```
 
 The query string is analyzed with each field's own configured analyzer —
@@ -573,6 +574,7 @@ field is always queryable even though it does not appear in the schema.
 | `--rescore-window <N>` | No | `100` | How many top results to rescore (at most 10,000) |
 | `--group-by <FIELD>` | No | (none) | Group the results by this field's value (Issue #1297): `_id`, or a single-valued, stored `Text`, `Integer`, `Float`, `Boolean` or `DateTime` field. `--limit` and `--offset` then count groups |
 | `--group-size <N>` | No | `1` | How many results each group keeps, the shown one included (at most 100). Needs `--group-by` |
+| `--track-total-hits <N\|true\|false>` | No | `false` | Count the matching documents and show the count (Issue #1472): an integer `N` counts exactly up to `N` matches, `true` every match, `false` none. Not available in the [REPL](repl.md); see [Total hits](#total-hits) |
 
 A rescored result's score is its late-interaction (MaxSim) score; see
 [Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore).
@@ -658,40 +660,49 @@ A `Highlights` column appears only when `--highlight` was passed:
 
 **JSON output example:**
 
+The JSON output is an object whose `"results"` holds the results, as the
+[HTTP gateway](../laurus-server/http_gateway.md#search) and the
+[MCP server](../laurus-mcp/tools.md#search) return a search; it was a bare
+array of results before Issue #1472.
+
 ```bash
 laurus --format json search "body:rust" --limit 5
 ```
 
 ```json
-[
-  {
-    "id": "doc1",
-    "score": 0.8532,
-    "fields": {
-      "title": "Introduction to Rust",
-      "body": "Rust is a systems programming language."
+{
+  "results": [
+    {
+      "id": "doc1",
+      "score": 0.8532,
+      "fields": {
+        "title": "Introduction to Rust",
+        "body": "Rust is a systems programming language."
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 With `--highlight body`, each matching result also gains a `"highlights"`
 key (present only when at least one field actually highlighted):
 
 ```json
-[
-  {
-    "id": "doc1",
-    "score": 0.8532,
-    "fields": {
-      "title": "Introduction to Rust",
-      "body": "Rust is a systems programming language."
-    },
-    "highlights": {
-      "body": ["<mark>Rust</mark> is a systems programming language."]
+{
+  "results": [
+    {
+      "id": "doc1",
+      "score": 0.8532,
+      "fields": {
+        "title": "Introduction to Rust",
+        "body": "Rust is a systems programming language."
+      },
+      "highlights": {
+        "body": ["<mark>Rust</mark> is a systems programming language."]
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 See [Highlighting](../laurus/highlighting.md) for the full semantics —
@@ -707,34 +718,94 @@ laurus --format json search "body:rust" --group-by _id --group-size 2
 ```
 
 ```json
-[
-  {
-    "fields": {
-      "body": "Rust ownership rules for Rust programs"
+{
+  "results": [
+    {
+      "fields": {
+        "body": "Rust ownership rules for Rust programs"
+      },
+      "group_key": "manual",
+      "id": "manual",
+      "inner_hits": [
+        {
+          "fields": {
+            "body": "Borrowing in Rust"
+          },
+          "group_key": "manual",
+          "id": "manual",
+          "score": 0.012359549291431904
+        }
+      ],
+      "score": 0.012571428902447224
     },
-    "group_key": "manual",
-    "id": "manual",
-    "inner_hits": [
-      {
-        "fields": {
-          "body": "Borrowing in Rust"
-        },
-        "group_key": "manual",
-        "id": "manual",
-        "score": 0.012359549291431904
-      }
-    ],
-    "score": 0.012571428902447224
-  },
-  {
-    "fields": {
-      "body": "Why Rust has no garbage collector"
-    },
-    "group_key": "faq",
-    "id": "faq",
-    "score": 0.010891089215874672
+    {
+      "fields": {
+        "body": "Why Rust has no garbage collector"
+      },
+      "group_key": "faq",
+      "id": "faq",
+      "score": 0.010891089215874672
+    }
+  ]
+}
+```
+
+### Total hits
+
+`--track-total-hits` counts the matching documents beyond the page
+(Issue #1472), with the values of the HTTP gateway's
+[`track_total_hits`](../laurus-server/http_gateway.md#search-with-a-total-hit-count).
+Over the four chunks of the grouping example above, three of which contain
+"rust", the table is followed by the total:
+
+```bash
+laurus search "body:rust" --limit 1 --track-total-hits true
+```
+
+```text
+╭────────┬────────┬──────────────────────────────────────────────╮
+│ ID     │ Score  │ Fields                                       │
+├────────┼────────┼──────────────────────────────────────────────┤
+│ manual │ 0.0126 │ body: Rust ownership rules for Rust programs │
+╰────────┴────────┴──────────────────────────────────────────────╯
+Total hits: 3
+```
+
+With `--track-total-hits 2`, the count stops at the threshold and the last
+line is `Total hits: at least 2`. In JSON, the object gains `"total_hits"`,
+whose `"relation"` is `"eq"` for an exact count and `"gte"` for a lower
+bound:
+
+```bash
+laurus --format json search "body:rust" --limit 1 --track-total-hits 2
+```
+
+```json
+{
+  "results": [
+    {
+      "fields": {
+        "body": "Rust ownership rules for Rust programs"
+      },
+      "id": "manual",
+      "score": 0.012571428902447224
+    }
+  ],
+  "total_hits": {
+    "relation": "gte",
+    "value": 2
   }
-]
+}
+```
+
+Without the flag, or with `false`, nothing is counted and no total is shown.
+Counting has a cost, so ask for no more than you need; what the total counts
+for a vector, hybrid or grouped search is described in
+[Total hits](../laurus/engine.md#total-hits). A value other than an integer,
+`true` or `false` is rejected:
+
+```text
+error: invalid value 'yes' for '--track-total-hits <N|true|false>': expected an integer from 0 to 18446744073709551615, true or false
 ```
 
 ---

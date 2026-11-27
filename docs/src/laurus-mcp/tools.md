@@ -418,6 +418,7 @@ Search documents using the laurus unified query DSL. Supports lexical search, ve
 | `highlight` | string | No | Highlighted fragments per field, as JSON (see [Highlight example](#highlight-example) and [Value types](#value-types)) |
 | `rescore` | string | No | Late-interaction rescore of the top results, as JSON (see [Rescore example](#rescore-example)) |
 | `group_by` | string | No | Group the results by a field's value, as JSON; `limit` and `offset` then count groups (see [Group by example](#group-by-example)) |
+| `track_total_hits` | integer or boolean | No | Count the matching documents and return the count as `total_hits`: an integer `n` counts exactly up to `n` matches, `true` every match, and `false` (the default) none. A value, not a JSON string (see [Total hits example](#total-hits-example)) |
 
 ### Query DSL examples
 
@@ -586,10 +587,38 @@ The field may also be a single-valued, stored `Text`, `Integer`, `Float`,
 `Boolean` or `DateTime` field. A malformed `group_by` is a tool error. See
 [Result Grouping](../concepts/search/result_grouping.md).
 
+### Total hits example
+
+`track_total_hits` counts the matching documents beyond the page
+(Issue #1472), with the values of the HTTP gateway's
+[`track_total_hits`](../laurus-server/http_gateway.md#search-with-a-total-hit-count):
+an integer `n` counts exactly up to `n` matches, `true` every match, and
+`false`, as without it, none. Unlike `fusion` or `group_by`, it is a JSON
+value, not a string. The result then gains `"total_hits"`, whose
+`"relation"` is `"eq"` for an exact count and `"gte"` for a lower bound.
+With the four chunks of the [group by example](#group-by-example), three of
+which contain "rust", `{"query": "body:rust", "limit": 1, "track_total_hits": 2}`
+returns:
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"gte","value":2}}
+```
+
+With `true`, the total is `{"relation":"eq","value":3}`. Counting has a cost,
+so ask for no more than you need; what the total counts for a vector, hybrid
+or grouped search is described in
+[Total hits](../laurus/engine.md#total-hits). A value other than an integer
+or a boolean, such as `"1000"`, is a tool error:
+
+```text
+track_total_hits must be true, false or an integer between 0 and 18446744073709551615
+```
+
 ### Result
 
 Each result gains a `"highlights"` object when `highlight` was requested
-and at least one field actually highlighted:
+and at least one field actually highlighted, and the object gains
+`"total_hits"` when `track_total_hits` asked for it:
 
 ```json
 {
@@ -614,9 +643,9 @@ and at least one field actually highlighted:
 ## search_batch
 
 Execute multiple independent searches in a single round trip. All queries
-run in parallel on the server; the same `limit`, `offset`, `highlight` and
-`group_by` apply to every query. Useful for agents issuing several
-sub-queries per turn.
+run in parallel on the server; the same `limit`, `offset`, `highlight`,
+`group_by` and `track_total_hits` apply to every query. Useful for agents
+issuing several sub-queries per turn.
 
 ### Parameters
 
@@ -627,11 +656,21 @@ sub-queries per turn.
 | `offset` | integer | No | Results to skip per query for pagination (default: 0) |
 | `highlight` | string | No | Highlighted fragments per field, as JSON — same format and [value types](#value-types) as `search`'s `highlight`, applied identically to every query |
 | `group_by` | string | No | Group each query's results by a field's value, as JSON — same format as `search`'s `group_by`, applied identically to every query |
+| `track_total_hits` | integer or boolean | No | Count each query's matching documents — same values as `search`'s `track_total_hits`, applied identically to every query |
 
 ### Result
 
 The `batch` array preserves input order: `batch[i]` is the result set for
-`queries[i]`.
+`queries[i]`. With `track_total_hits`, each entry has its own
+`"total_hits"`; for `["body:rust", "body:garbage"]` over the chunks of the
+[group by example](#group-by-example), with `"limit": 1` and
+`"track_total_hits": true`:
+
+```json
+{"batch":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"eq","value":3}},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}],"total_hits":{"relation":"eq","value":1}}]}
+```
+
+Without it:
 
 ```json
 {

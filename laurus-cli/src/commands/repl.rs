@@ -307,12 +307,13 @@ async fn handle_search(engine: &Engine, query_str: &str, format: OutputFormat) -
         .limit(REPL_SEARCH_LIMIT)
         .build();
 
-    let results = engine
+    // Printed as the one-shot `laurus search` prints it: JSON is
+    // `{"results": [...]}` (Issue #1472). The REPL asks for no total.
+    let response = engine
         .search(request)
         .await
-        .context("Failed to execute search")?
-        .results;
-    output::print_search_results(&results, format);
+        .context("Failed to execute search")?;
+    output::print_search_response(&response, format);
     Ok(())
 }
 

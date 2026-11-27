@@ -4,7 +4,8 @@
 //! message, mapping the `query` field to
 //! [`SearchQuery::Dsl`](laurus::SearchQuery::Dsl) so the engine
 //! can parse unified query DSL (including vector clauses) internally.
-//! [`result_to_proto`] converts engine results back to proto.
+//! [`response_to_proto`] and [`result_to_proto`] convert the engine's
+//! response and results back to proto.
 
 use std::collections::HashMap;
 
@@ -12,7 +13,8 @@ use laurus::vector::Vector;
 use laurus::vector::store::request::FieldSelector;
 use laurus::{
     FusionAlgorithm, GroupBy, HighlightConfig, QueryVector, RescoreOptions, SearchRequestBuilder,
-    SearchResult, SortField, SortOrder, VectorScoreMode, VectorSearchQuery,
+    SearchResult, SortField, SortOrder, TotalHits, TotalHitsRelation, TrackTotalHits,
+    VectorScoreMode, VectorSearchQuery,
 };
 
 use crate::convert::document;
@@ -166,7 +168,85 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
         builder = builder.group_by(group_by_from_proto(group_by));
     }
 
+    // The total hit count (Issue #1472). The engine rejects `up_to: 0`.
+    if let Some(track_total_hits) = &proto.track_total_hits {
+        builder = builder.track_total_hits(track_total_hits_from_proto(track_total_hits));
+    }
+
     Ok(builder.build())
+}
+
+/// Build the engine's [`TrackTotalHits`] from the proto message (Issue
+/// #1472): `up_to` is [`TrackTotalHits::UpTo`] and `exact: true`
+/// [`TrackTotalHits::Exact`]. `exact: false` and a message without `mode`
+/// count nothing, as an unset `track_total_hits` does, and as an unset
+/// `algorithm` in a set `fusion` is ignored.
+fn track_total_hits_from_proto(proto: &v1::TrackTotalHits) -> TrackTotalHits {
+    use v1::track_total_hits::Mode;
+
+    match proto.mode {
+        Some(Mode::UpTo(threshold)) => TrackTotalHits::UpTo(threshold),
+        Some(Mode::Exact(true)) => TrackTotalHits::Exact,
+        Some(Mode::Exact(false)) | None => TrackTotalHits::Disabled,
+    }
+}
+
+/// Parse the JSON form of `track_total_hits`, shared by the HTTP gateway's
+/// `POST /v1/search` and the MCP search tools (Issue #1472). As in
+/// Elasticsearch, the value is
+///
+/// - an integer `n`: count exactly up to `n` matches (`up_to`). 0 is passed
+///   on, and the engine rejects it as for gRPC;
+/// - `true`: count every match (`exact`);
+/// - `false` or `null`: count nothing, as an absent key does.
+///
+/// # Errors
+///
+/// Returns an error naming the key for any other value (`1.5`, `-1`,
+/// `"1000"`, an object), instead of reading it as absent.
+pub fn track_total_hits_from_json(
+    json: &serde_json::Value,
+) -> Result<Option<v1::TrackTotalHits>, String> {
+    use serde_json::Value;
+    use v1::track_total_hits::Mode;
+
+    let mode = match json {
+        Value::Null | Value::Bool(false) => return Ok(None),
+        Value::Bool(true) => Mode::Exact(true),
+        _ => Mode::UpTo(json.as_u64().ok_or_else(|| {
+            format!(
+                "track_total_hits must be true, false or an integer between 0 and {}",
+                u64::MAX
+            )
+        })?),
+    };
+    Ok(Some(v1::TrackTotalHits { mode: Some(mode) }))
+}
+
+/// Convert the engine's total hit count to proto (Issue #1472).
+pub fn total_hits_to_proto(total: &TotalHits) -> v1::TotalHits {
+    let relation = match total.relation {
+        TotalHitsRelation::Exact => v1::TotalHitsRelation::Exact,
+        TotalHitsRelation::AtLeast => v1::TotalHitsRelation::AtLeast,
+    };
+    v1::TotalHits {
+        value: total.value,
+        relation: relation as i32,
+    }
+}
+
+/// The JSON of a total hit count, shared by the HTTP gateway and the MCP
+/// search tools (Issue #1472): `{"value": 12, "relation": "eq"}`. The
+/// relation is written as Elasticsearch writes it, `"eq"` for an exact
+/// count and `"gte"` for a lower bound. A relation the server does not send
+/// (unspecified, or a value this build does not know) is read as `"gte"`,
+/// which claims no more than `value`.
+pub fn total_hits_to_json(total: &v1::TotalHits) -> serde_json::Value {
+    let relation = match v1::TotalHitsRelation::try_from(total.relation) {
+        Ok(v1::TotalHitsRelation::Exact) => "eq",
+        _ => "gte",
+    };
+    serde_json::json!({ "value": total.value, "relation": relation })
 }
 
 /// Build a [`GroupBy`] from proto `GroupByParams`: an unset `group_size`
@@ -686,6 +766,15 @@ fn highlight_config_from_proto(
     }
 
     Ok(config)
+}
+
+/// Convert the engine's response into a proto `SearchResponse`: its results,
+/// and its total hit count when the request asked for one (Issue #1472).
+pub fn response_to_proto(response: &laurus::SearchResponse) -> v1::SearchResponse {
+    v1::SearchResponse {
+        results: response.results.iter().map(result_to_proto).collect(),
+        total_hits: response.total_hits.as_ref().map(total_hits_to_proto),
+    }
 }
 
 /// Convert a laurus SearchResult into a proto SearchResult, its group's
@@ -1453,5 +1542,131 @@ mod tests {
                 .iter()
                 .all(|h| h.group_key == proto.group_key)
         );
+    }
+
+    fn track(mode: Option<v1::track_total_hits::Mode>) -> Option<v1::TrackTotalHits> {
+        Some(v1::TrackTotalHits { mode })
+    }
+
+    /// Issue #1472: `track_total_hits` reaches the engine's request: `up_to`
+    /// as `UpTo`, `exact: true` as `Exact`; `exact: false`, a message
+    /// without `mode` and an unset field count nothing.
+    #[test]
+    fn from_proto_sets_track_total_hits() {
+        use v1::track_total_hits::Mode;
+
+        let converted = |track_total_hits: Option<v1::TrackTotalHits>| {
+            from_proto(&v1::SearchRequest {
+                track_total_hits,
+                ..base_request(None)
+            })
+            .unwrap()
+            .track_total_hits
+        };
+        assert_eq!(
+            converted(track(Some(Mode::UpTo(1000)))),
+            TrackTotalHits::UpTo(1000)
+        );
+        assert_eq!(
+            converted(track(Some(Mode::Exact(true)))),
+            TrackTotalHits::Exact
+        );
+        assert_eq!(
+            converted(track(Some(Mode::Exact(false)))),
+            TrackTotalHits::Disabled
+        );
+        assert_eq!(converted(track(None)), TrackTotalHits::Disabled);
+        assert_eq!(converted(None), TrackTotalHits::Disabled);
+        // 0 is passed on for the engine to reject, as other ranges are.
+        assert_eq!(
+            converted(track(Some(Mode::UpTo(0)))),
+            TrackTotalHits::UpTo(0)
+        );
+    }
+
+    /// Issue #1472: the JSON `track_total_hits` takes an integer, `true` or
+    /// `false`, as Elasticsearch does, and rejects other values naming the
+    /// key instead of reading them as absent.
+    #[test]
+    fn track_total_hits_from_json_reads_the_gateway_values() {
+        use serde_json::json;
+        use v1::track_total_hits::Mode;
+
+        let mode = |json: serde_json::Value| {
+            track_total_hits_from_json(&json).map(|t| t.and_then(|t| t.mode))
+        };
+        assert_eq!(mode(json!(1000)), Ok(Some(Mode::UpTo(1000))));
+        assert_eq!(mode(json!(0)), Ok(Some(Mode::UpTo(0))));
+        assert_eq!(mode(json!(u64::MAX)), Ok(Some(Mode::UpTo(u64::MAX))));
+        assert_eq!(mode(json!(true)), Ok(Some(Mode::Exact(true))));
+        assert_eq!(mode(json!(false)), Ok(None));
+        assert_eq!(mode(serde_json::Value::Null), Ok(None));
+
+        let expected = format!(
+            "track_total_hits must be true, false or an integer between 0 and {}",
+            u64::MAX
+        );
+        for wrong in [
+            json!(1.5),
+            json!(1000.0),
+            json!(-1),
+            json!("1000"),
+            json!("true"),
+            json!({"up_to": 10}),
+            json!([10]),
+        ] {
+            assert_eq!(mode(wrong.clone()), Err(expected.clone()), "{wrong}");
+        }
+    }
+
+    /// Issue #1472: the engine's total and its relation reach the proto
+    /// response, and only when the search counted.
+    #[test]
+    fn response_to_proto_carries_the_total() {
+        let response = |total_hits: Option<TotalHits>| {
+            response_to_proto(&laurus::SearchResponse {
+                results: Vec::new(),
+                total_hits,
+            })
+            .total_hits
+        };
+        assert_eq!(response(None), None);
+        assert_eq!(
+            response(Some(TotalHits::exact(12))),
+            Some(v1::TotalHits {
+                value: 12,
+                relation: v1::TotalHitsRelation::Exact as i32,
+            })
+        );
+        assert_eq!(
+            response(Some(TotalHits::at_least(1000))),
+            Some(v1::TotalHits {
+                value: 1000,
+                relation: v1::TotalHitsRelation::AtLeast as i32,
+            })
+        );
+    }
+
+    /// Issue #1472: a total's JSON names its relation as Elasticsearch
+    /// does, and reads a relation the server does not send as a lower
+    /// bound.
+    #[test]
+    fn total_hits_to_json_writes_eq_and_gte() {
+        use serde_json::json;
+
+        let json = |relation: i32| total_hits_to_json(&v1::TotalHits { value: 7, relation });
+        assert_eq!(
+            json(v1::TotalHitsRelation::Exact as i32),
+            json!({"value": 7, "relation": "eq"})
+        );
+        assert_eq!(
+            json(v1::TotalHitsRelation::AtLeast as i32),
+            json!({"value": 7, "relation": "gte"})
+        );
+        assert_eq!(
+            json(v1::TotalHitsRelation::Unspecified as i32),
+            json!({"value": 7, "relation": "gte"})
+        );
+        assert_eq!(json(99), json!({"value": 7, "relation": "gte"}));
     }
 }

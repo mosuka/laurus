@@ -390,6 +390,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `highlight` | string | いいえ | フィールドごとのハイライト済みフラグメント（JSON、[ハイライトの例](#ハイライトの例)と[値の型](#値の型)を参照） |
 | `rescore` | string | いいえ | 上位の結果の late interaction による再採点（JSON、[再採点の例](#再採点の例)を参照） |
 | `group_by` | string | いいえ | 結果のフィールド値によるグループ化（JSON）。指定すると `limit` と `offset` はグループの数を数える（[グループ化の例](#グループ化の例)を参照） |
+| `track_total_hits` | integer または boolean | いいえ | 一致する文書を数え、その数を `total_hits` で返す。整数 `n` は `n` 件まで正確に数え、`true` はすべての一致を数え、`false`（既定）は数えない。JSON の文字列ではなく値で渡す（[総ヒット数の例](#総ヒット数の例)を参照） |
 
 ### クエリ DSL の例
 
@@ -519,9 +520,23 @@ HTTP ゲートウェイと違い、`highlight` はフィールドを 1 つ以上
 
 フィールドには、単一値で保存された `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールドも使えます。不正な `group_by` はツールのエラーになります。[検索結果のグループ化](../concepts/search/result_grouping.md)を参照してください。
 
+### 総ヒット数の例
+
+`track_total_hits` を指定すると、ページの外まで一致する文書を数えます（Issue #1472）。値は HTTP ゲートウェイの [`track_total_hits`](../laurus-server/http_gateway.md#総ヒット数付き検索) と同じで、整数 `n` は `n` 件まで正確に数え、`true` はすべての一致を数え、`false`（指定しないときも同じ）は数えません。`fusion` や `group_by` と違い、文字列ではなく JSON の値で渡します。結果には `"total_hits"` が付き、その `"relation"` は、正確な件数なら `"eq"`、下限なら `"gte"` です。[グループ化の例](#グループ化の例)の 4 つの chunk（そのうち 3 つが "rust" を含む）に対して `{"query": "body:rust", "limit": 1, "track_total_hits": 2}` を実行すると、次のようになります。
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"gte","value":2}}
+```
+
+`true` では、総数は `{"relation":"eq","value":3}` になります。数えることにはコストがあるので、必要な数までにとどめてください。ベクトル検索・ハイブリッド検索・グループ化した検索で何を数えるかは、[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。整数・真偽値以外の値（`"1000"` など）はツールのエラーになります。
+
+```text
+track_total_hits must be true, false or an integer between 0 and 18446744073709551615
+```
+
 ### 結果
 
-`highlight` を要求し、少なくとも1つのフィールドが実際にハイライトされた場合、各結果に `"highlights"` オブジェクトが追加されます。
+`highlight` を要求し、少なくとも1つのフィールドが実際にハイライトされた場合、各結果に `"highlights"` オブジェクトが追加されます。`track_total_hits` で総数を求めた場合は、オブジェクトに `"total_hits"` が追加されます。
 
 ```json
 {
@@ -546,8 +561,8 @@ HTTP ゲートウェイと違い、`highlight` はフィールドを 1 つ以上
 ## search_batch
 
 独立した複数の検索を 1 回のラウンドトリップで実行します。すべてのクエリは
-サーバー上で並列に実行され、`limit`・`offset`・`highlight`・`group_by` は
-すべてのクエリに共通で適用されます。エージェントが 1 ターンで複数の
+サーバー上で並列に実行され、`limit`・`offset`・`highlight`・`group_by`・
+`track_total_hits` はすべてのクエリに共通で適用されます。エージェントが 1 ターンで複数の
 サブクエリを発行する場合に有用です。
 
 ### パラメータ
@@ -559,10 +574,17 @@ HTTP ゲートウェイと違い、`highlight` はフィールドを 1 つ以上
 | `offset` | 整数 | いいえ | クエリごとのページネーションオフセット（デフォルト: 0） |
 | `highlight` | 文字列 | いいえ | フィールドごとのハイライト済みフラグメント（JSON）。`search` の `highlight` と同じ形式と[値の型](#値の型)で、バッチ内のすべてのクエリに同一に適用される |
 | `group_by` | 文字列 | いいえ | 各クエリの結果のフィールド値によるグループ化（JSON）。`search` の `group_by` と同じ形式で、バッチ内のすべてのクエリに同一に適用される |
+| `track_total_hits` | 整数または真偽値 | いいえ | 各クエリの一致する文書を数える。`search` の `track_total_hits` と同じ値で、バッチ内のすべてのクエリに同一に適用される |
 
 ### 結果
 
-`batch` 配列は入力順を保持します。`batch[i]` は `queries[i]` の結果セットです。
+`batch` 配列は入力順を保持します。`batch[i]` は `queries[i]` の結果セットです。`track_total_hits` を指定すると、各要素がそれぞれの `"total_hits"` を持ちます。[グループ化の例](#グループ化の例)の chunk に対して、`["body:rust", "body:garbage"]` を `"limit": 1`・`"track_total_hits": true` で実行すると、次のようになります。
+
+```json
+{"batch":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"eq","value":3}},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}],"total_hits":{"relation":"eq","value":1}}]}
+```
+
+指定しないときは次のとおりです。
 
 ```json
 {

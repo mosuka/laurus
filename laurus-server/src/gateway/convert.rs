@@ -1443,6 +1443,7 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
             "highlight",
             "rescore",
             "group_by",
+            "track_total_hits",
         ],
     )?;
     let query = json_optional_str(json, "query")?.unwrap_or("").to_string();
@@ -1518,6 +1519,15 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         .map(crate::convert::search::group_by_params_from_json)
         .transpose()?;
 
+    // An integer, `true` or `false`, as in Elasticsearch; another value is
+    // rejected (400) rather than read as absent: see
+    // `track_total_hits_from_json` (Issue #1472).
+    let track_total_hits = json
+        .get("track_total_hits")
+        .map(crate::convert::search::track_total_hits_from_json)
+        .transpose()?
+        .flatten();
+
     Ok(v1::SearchRequest {
         query,
         query_vectors,
@@ -1530,6 +1540,7 @@ pub fn json_to_proto_search_request(json: &Value) -> Result<v1::SearchRequest, S
         highlight,
         rescore,
         group_by,
+        track_total_hits,
     })
 }
 
@@ -1788,16 +1799,22 @@ pub fn proto_search_result_to_json(result: &v1::SearchResult) -> Value {
 /// and of each entry of `POST /v1/search/batch`: `{"results": [...]}`, each
 /// result converted by [`proto_search_result_to_json`].
 ///
-/// The body carries no total: `total_hits` held only the number of returned
-/// results and was removed (Issue #1455).
+/// `"total_hits"`, `{"value": 12, "relation": "eq"}`, is added only when the
+/// request asked for a total with `track_total_hits` (Issue #1472), so a
+/// request without one gets the body it got before. The `total_hits` that
+/// #1455 removed held only the number of returned results.
 pub fn proto_search_response_to_json(response: &v1::SearchResponse) -> Value {
-    json!({
+    let mut body = json!({
         "results": response
             .results
             .iter()
             .map(proto_search_result_to_json)
             .collect::<Vec<_>>(),
-    })
+    });
+    if let Some(total_hits) = &response.total_hits {
+        body["total_hits"] = crate::convert::search::total_hits_to_json(total_hits);
+    }
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -2902,11 +2919,12 @@ mod tests {
         assert!(ungrouped.get("inner_hits").is_none(), "{ungrouped}");
     }
 
-    /// Issue #1455: the search body is `{"results": [...]}` and nothing
-    /// else. `total_hits` held only the number of returned results, so no
-    /// total comes back under any key.
+    /// Issues #1455 and #1472: without a total, the search body is
+    /// `{"results": [...]}` and nothing else. The `total_hits` #1455
+    /// removed held only the number of returned results; no count comes
+    /// back under any key unless the request asked for one.
     #[test]
-    fn test_proto_search_response_to_json_has_only_results() {
+    fn test_proto_search_response_to_json_has_only_results_without_a_total() {
         let hit = |id: &str| v1::SearchResult {
             id: id.to_string(),
             score: 0.5,
@@ -2914,6 +2932,7 @@ mod tests {
         };
         let response = v1::SearchResponse {
             results: vec![hit("a"), hit("b")],
+            total_hits: None,
         };
 
         assert_eq!(
@@ -2924,6 +2943,30 @@ mod tests {
                     proto_search_result_to_json(&hit("b")),
                 ]
             })
+        );
+    }
+
+    /// Issue #1472: a total the request asked for is added as
+    /// `"total_hits"`, its relation written as Elasticsearch writes it.
+    #[test]
+    fn test_proto_search_response_to_json_adds_the_total_asked_for() {
+        let body = |relation: v1::TotalHitsRelation| {
+            proto_search_response_to_json(&v1::SearchResponse {
+                results: Vec::new(),
+                total_hits: Some(v1::TotalHits {
+                    value: 1000,
+                    relation: relation as i32,
+                }),
+            })
+        };
+
+        assert_eq!(
+            body(v1::TotalHitsRelation::Exact),
+            json!({"results": [], "total_hits": {"value": 1000, "relation": "eq"}})
+        );
+        assert_eq!(
+            body(v1::TotalHitsRelation::AtLeast),
+            json!({"results": [], "total_hits": {"value": 1000, "relation": "gte"}})
         );
     }
 

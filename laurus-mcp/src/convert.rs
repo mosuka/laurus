@@ -264,20 +264,38 @@ pub fn search_result_to_json(result: &v1::SearchResult) -> Value {
     obj
 }
 
+/// Read the `track_total_hits` parameter of the `search` and `search_batch`
+/// tools (Issue #1472): the same JSON value as the HTTP gateway's
+/// `track_total_hits`, an integer, `true` or `false`, not a string. `false`
+/// asks for no total, as an absent parameter does.
+///
+/// # Errors
+///
+/// Returns the gateway's message, naming the parameter, for any other
+/// value; the server rejects an `up_to` of 0.
+pub fn json_to_track_total_hits(value: &Value) -> Result<Option<v1::TrackTotalHits>, String> {
+    laurus_server::convert::search::track_total_hits_from_json(value)
+}
+
 /// Convert a proto [`v1::SearchResponse`] to the JSON the `search` tool
 /// returns, and `search_batch` returns per query: `{"results": [...]}`, each
 /// result converted by [`search_result_to_json`].
 ///
-/// There is no `"total"`: it held only the number of returned results, as
-/// the server's `total_hits` did, and was removed (Issue #1455).
+/// `"total_hits"`, `{"value": 12, "relation": "eq"}`, is added only when the
+/// request asked for a total (Issue #1472), as the HTTP gateway adds it. The
+/// `"total"` #1455 removed held only the number of returned results.
 pub fn search_response_to_json(response: &v1::SearchResponse) -> Value {
-    json!({
+    let mut output = json!({
         "results": response
             .results
             .iter()
             .map(search_result_to_json)
             .collect::<Vec<_>>(),
-    })
+    });
+    if let Some(total_hits) = &response.total_hits {
+        output["total_hits"] = laurus_server::convert::search::total_hits_to_json(total_hits);
+    }
+    output
 }
 
 #[cfg(test)]
@@ -747,11 +765,12 @@ mod tests {
         assert!(ungrouped.get("inner_hits").is_none(), "{ungrouped}");
     }
 
-    /// Issue #1455: a search's JSON is `{"results": [...]}` and nothing
-    /// else. `"total"` held only the number of returned results, so no total
-    /// comes back under any key.
+    /// Issues #1455 and #1472: without a total, a search's JSON is
+    /// `{"results": [...]}` and nothing else. The `"total"` #1455 removed
+    /// held only the number of returned results; no count comes back under
+    /// any key unless the request asked for one.
     #[test]
-    fn test_search_response_to_json_has_only_results() {
+    fn test_search_response_to_json_has_only_results_without_a_total() {
         let hit = |id: &str| v1::SearchResult {
             id: id.to_string(),
             score: 0.5,
@@ -759,6 +778,7 @@ mod tests {
         };
         let response = v1::SearchResponse {
             results: vec![hit("a"), hit("b")],
+            total_hits: None,
         };
 
         assert_eq!(
@@ -770,6 +790,40 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// Issue #1472: a total the request asked for is added as
+    /// `"total_hits"`, in the HTTP gateway's shape.
+    #[test]
+    fn test_search_response_to_json_adds_the_total_asked_for() {
+        let output = search_response_to_json(&v1::SearchResponse {
+            results: Vec::new(),
+            total_hits: Some(v1::TotalHits {
+                value: 1000,
+                relation: v1::TotalHitsRelation::AtLeast as i32,
+            }),
+        });
+        assert_eq!(
+            output,
+            json!({"results": [], "total_hits": {"value": 1000, "relation": "gte"}})
+        );
+    }
+
+    /// Issue #1472: `track_total_hits` takes the gateway's values, not a
+    /// string.
+    #[test]
+    fn test_json_to_track_total_hits() {
+        use v1::track_total_hits::Mode;
+
+        let mode = |value: Value| json_to_track_total_hits(&value).map(|t| t.and_then(|t| t.mode));
+        assert_eq!(mode(json!(1000)), Ok(Some(Mode::UpTo(1000))));
+        assert_eq!(mode(json!(true)), Ok(Some(Mode::Exact(true))));
+        assert_eq!(mode(json!(false)), Ok(None));
+        assert_eq!(mode(Value::Null), Ok(None));
+        for wrong in [json!("1000"), json!(1.5), json!(-1), json!({"up_to": 5})] {
+            let error = mode(wrong.clone()).expect_err(&format!("{wrong} was accepted"));
+            assert!(error.contains("track_total_hits"), "{wrong}: {error}");
+        }
     }
 
     #[test]

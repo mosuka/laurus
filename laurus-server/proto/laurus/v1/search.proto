@@ -8,7 +8,10 @@ service SearchService {
   // Execute a search and return all results at once.
   rpc Search(SearchRequest) returns (SearchResponse);
 
-  // Execute a search and stream results one by one.
+  // Execute a search and stream results one by one. The stream has no
+  // message for a total, so a request that asks for one (`up_to`, or
+  // `exact: true`, in `track_total_hits`) is rejected with INVALID_ARGUMENT
+  // (Issue #1472); use `Search` for a total.
   rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
   // Execute multiple independent searches in a single round trip.
@@ -83,6 +86,46 @@ message SearchRequest {
   // hit with the group's next best hits in `inner_hits`. Unset returns
   // ungrouped hits.
   optional GroupByParams group_by = 11;
+
+  // Count the matching documents up to a threshold and return the count in
+  // `SearchResponse.total_hits` (Issue #1472). Unset counts nothing and
+  // returns no total, which costs nothing. What the total counts for each
+  // kind of search is the engine's `total_hits`: a lexical search counts
+  // exactly up to the threshold, a vector or hybrid search gives a lower
+  // bound, and a grouped search counts documents, not groups.
+  optional TrackTotalHits track_total_hits = 12;
+}
+
+// How far a search counts its matches (Issue #1472). A message without
+// `mode` counts nothing, as an unset `track_total_hits` does.
+message TrackTotalHits {
+  oneof mode {
+    // Count exactly up to this many matches; from it on, the total is a
+    // lower bound of `up_to`. 0 is rejected with INVALID_ARGUMENT.
+    uint64 up_to = 1;
+
+    // `true` counts every match, exactly. `false` counts nothing.
+    bool exact = 2;
+  }
+}
+
+// The number of documents that match a search, or a lower bound of it.
+message TotalHits {
+  uint64 value = 1;
+
+  // Whether `value` is the exact count or a lower bound.
+  TotalHitsRelation relation = 2;
+}
+
+enum TotalHitsRelation {
+  TOTAL_HITS_RELATION_UNSPECIFIED = 0;
+
+  // `value` is the number of matching documents.
+  TOTAL_HITS_RELATION_EXACT = 1;
+
+  // At least `value` documents match: the count stopped at the threshold,
+  // or the search (vector or hybrid) has no exact set of matches.
+  TOTAL_HITS_RELATION_AT_LEAST = 2;
 }
 
 // Fold the ranked hits (after fusion and rescore) that share `field`'s
@@ -300,11 +343,15 @@ message Highlights {
 message SearchResponse {
   repeated SearchResult results = 1;
 
-  // Field 2 was `total_hits`. It was documented as the number of matches
-  // before limit/offset but held the number of returned results, so it was
-  // removed (Issue #1455). The response carries no total.
+  // Field 2 was a `uint64 total_hits`. It was documented as the number of
+  // matches before limit/offset but held the number of returned results, so
+  // it was removed (Issue #1455). Its number stays reserved; the name is
+  // used again by field 3, which holds the count field 2 promised.
   reserved 2;
-  reserved "total_hits";
+
+  // The number of matching documents, counted as `track_total_hits` asked
+  // (Issue #1472). Unset when the request asked for no total.
+  optional TotalHits total_hits = 3;
 }
 
 message SearchResult {

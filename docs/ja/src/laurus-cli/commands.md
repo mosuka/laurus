@@ -533,6 +533,7 @@ laurus train pq-codebook --field embedding --from-index --sample-size 5000 --upd
 laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
               [--rescore-field <FIELD> (--rescore-text <TEXT> | --rescore-vectors <JSON>) [--rescore-window <N>]]
               [--group-by <FIELD> [--group-size <N>]]
+              [--track-total-hits <N|true|false>]
 ```
 
 クエリ文字列は、各フィールドに設定されたアナライザー自身で解析されます。例えば `schema.toml` で日本語（Lindera）アナライザーを設定したフィールドは、インデックス時と同じ方法でクエリ時にも解析されます。スキーマに宣言されていないフィールドを参照すると、そのフィールド名を含むエラーで拒否されます（typo の検出に役立ちます）。予約済みの `_id` フィールドはスキーマに現れませんが、常に検索可能です。
@@ -551,6 +552,7 @@ laurus search <QUERY> [--limit <N>] [--offset <N>] [--highlight <FIELD>]...
 | `--rescore-window <N>` | いいえ | `100` | 再採点する上位の件数（最大 10,000） |
 | `--group-by <FIELD>` | いいえ | （なし） | 結果をこのフィールドの値でグループ化する（Issue #1297）。`_id`、または単一値で保存された `Text`・`Integer`・`Float`・`Boolean`・`DateTime` のフィールド。指定すると `--limit` と `--offset` はグループの数を数える |
 | `--group-size <N>` | いいえ | `1` | 1 グループに残す結果の数。表示される結果を含む（最大 100）。`--group-by` が必要 |
+| `--track-total-hits <N\|true\|false>` | いいえ | `false` | 一致する文書を数え、その数を表示する（Issue #1472）。整数 `N` は `N` 件まで正確に数え、`true` はすべての一致を数え、`false` は数えない。[REPL](repl.md) では使用不可。[総ヒット数](#総ヒット数)を参照 |
 
 再採点した結果のスコアは late interaction（MaxSim）のスコアです。[late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照してください。例えば `body_colbert` に `candle_colbert` のエンベッダーがある場合:
 
@@ -630,39 +632,45 @@ laurus search "body:rust" --highlight title --highlight body
 
 **JSON 出力の例:**
 
+JSON の出力は、[HTTP ゲートウェイ](../laurus-server/http_gateway.md#検索)や [MCP サーバー](../laurus-mcp/tools.md#search)の検索の応答と同じく、`"results"` に結果を持つオブジェクトです。Issue #1472 より前は、結果の配列をそのまま出していました。
+
 ```bash
 laurus --format json search "body:rust" --limit 5
 ```
 
 ```json
-[
-  {
-    "id": "doc1",
-    "score": 0.8532,
-    "fields": {
-      "title": "Introduction to Rust",
-      "body": "Rust is a systems programming language."
+{
+  "results": [
+    {
+      "id": "doc1",
+      "score": 0.8532,
+      "fields": {
+        "title": "Introduction to Rust",
+        "body": "Rust is a systems programming language."
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 `--highlight body` を指定すると、マッチした結果には `"highlights"` キーが追加されます（少なくとも1つのフィールドが実際にハイライトされた場合のみ）。
 
 ```json
-[
-  {
-    "id": "doc1",
-    "score": 0.8532,
-    "fields": {
-      "title": "Introduction to Rust",
-      "body": "Rust is a systems programming language."
-    },
-    "highlights": {
-      "body": ["<mark>Rust</mark> is a systems programming language."]
+{
+  "results": [
+    {
+      "id": "doc1",
+      "score": 0.8532,
+      "fields": {
+        "title": "Introduction to Rust",
+        "body": "Rust is a systems programming language."
+      },
+      "highlights": {
+        "body": ["<mark>Rust</mark> is a systems programming language."]
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 完全な意味論（フィールド選択、フィールドごとのアナライザー、`filter_query` がハイライトされない理由など）は[ハイライト](../laurus/highlighting.md)を参照してください。
@@ -674,34 +682,83 @@ laurus --format json search "body:rust" --group-by _id --group-size 2
 ```
 
 ```json
-[
-  {
-    "fields": {
-      "body": "Rust ownership rules for Rust programs"
+{
+  "results": [
+    {
+      "fields": {
+        "body": "Rust ownership rules for Rust programs"
+      },
+      "group_key": "manual",
+      "id": "manual",
+      "inner_hits": [
+        {
+          "fields": {
+            "body": "Borrowing in Rust"
+          },
+          "group_key": "manual",
+          "id": "manual",
+          "score": 0.012359549291431904
+        }
+      ],
+      "score": 0.012571428902447224
     },
-    "group_key": "manual",
-    "id": "manual",
-    "inner_hits": [
-      {
-        "fields": {
-          "body": "Borrowing in Rust"
-        },
-        "group_key": "manual",
-        "id": "manual",
-        "score": 0.012359549291431904
-      }
-    ],
-    "score": 0.012571428902447224
-  },
-  {
-    "fields": {
-      "body": "Why Rust has no garbage collector"
-    },
-    "group_key": "faq",
-    "id": "faq",
-    "score": 0.010891089215874672
+    {
+      "fields": {
+        "body": "Why Rust has no garbage collector"
+      },
+      "group_key": "faq",
+      "id": "faq",
+      "score": 0.010891089215874672
+    }
+  ]
+}
+```
+
+### 総ヒット数
+
+`--track-total-hits` を指定すると、ページの外まで一致する文書を数えます（Issue #1472）。値は HTTP ゲートウェイの [`track_total_hits`](../laurus-server/http_gateway.md#総ヒット数付き検索) と同じです。上のグループ化の例の 4 つの chunk（そのうち 3 つが "rust" を含む）に対して実行すると、表の後に総数が出ます。
+
+```bash
+laurus search "body:rust" --limit 1 --track-total-hits true
+```
+
+```text
+╭────────┬────────┬──────────────────────────────────────────────╮
+│ ID     │ Score  │ Fields                                       │
+├────────┼────────┼──────────────────────────────────────────────┤
+│ manual │ 0.0126 │ body: Rust ownership rules for Rust programs │
+╰────────┴────────┴──────────────────────────────────────────────╯
+Total hits: 3
+```
+
+`--track-total-hits 2` では、数えるのが上限で止まり、最後の行は `Total hits: at least 2` になります。JSON では、オブジェクトに `"total_hits"` が付き、その `"relation"` は、正確な件数なら `"eq"`、下限なら `"gte"` です。
+
+```bash
+laurus --format json search "body:rust" --limit 1 --track-total-hits 2
+```
+
+```json
+{
+  "results": [
+    {
+      "fields": {
+        "body": "Rust ownership rules for Rust programs"
+      },
+      "id": "manual",
+      "score": 0.012571428902447224
+    }
+  ],
+  "total_hits": {
+    "relation": "gte",
+    "value": 2
   }
-]
+}
+```
+
+フラグを指定しないときと `false` のときは数えず、総数も出ません。数えることにはコストがあるので、必要な数までにとどめてください。ベクトル検索・ハイブリッド検索・グループ化した検索で何を数えるかは、[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。整数・`true`・`false` 以外の値は拒否されます。
+
+```text
+error: invalid value 'yes' for '--track-total-hits <N|true|false>': expected an integer from 0 to 18446744073709551615, true or false
 ```
 
 ---

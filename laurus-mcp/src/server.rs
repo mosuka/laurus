@@ -22,7 +22,7 @@ use laurus_server::proto::laurus::v1::{
     AddDocumentRequest, AddDocumentsRequest, AddFieldRequest, CommitRequest, CreateIndexRequest,
     DeleteDocumentsRequest, DeleteFieldRequest, DocumentEntry, FieldChangeKind,
     GetDocumentsRequest, GetIndexRequest, GetSchemaRequest, PutDocumentRequest,
-    PutDocumentsRequest, SearchBatchRequest, SearchRequest, UpdateFieldRequest,
+    PutDocumentsRequest, SearchBatchRequest, SearchRequest, TrackTotalHits, UpdateFieldRequest,
     document_service_client::DocumentServiceClient, index_service_client::IndexServiceClient,
     search_service_client::SearchServiceClient,
 };
@@ -230,6 +230,26 @@ struct SearchParams {
     /// - `{"field": "_id"}` — each document once, by its best chunk
     /// - `{"field": "parent", "group_size": 3}`
     group_by: Option<String>,
+
+    /// Count the matching documents and return the count as `total_hits`,
+    /// `{"value": 12, "relation": "eq"}` (Issue #1472). The same value as
+    /// the HTTP gateway's `track_total_hits`, not a JSON string: an integer
+    /// `n` counts exactly up to `n` matches (`"relation": "gte"` from `n`
+    /// on), `true` counts every match, and `false`, the default, counts
+    /// nothing. A vector or hybrid search's total is a lower bound, and a
+    /// grouped search counts documents, not groups.
+    #[schemars(schema_with = "track_total_hits_schema")]
+    track_total_hits: Option<Value>,
+}
+
+/// The input schema of the search tools' `track_total_hits` (Issue #1472):
+/// a non-negative integer or a boolean, which
+/// [`convert::json_to_track_total_hits`] reads.
+fn track_total_hits_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "boolean", "null"],
+        "minimum": 0,
+    })
 }
 
 /// Parameters for the `search_batch` tool.
@@ -256,6 +276,13 @@ struct SearchBatchParams {
     /// same format as the `search` tool's `group_by` parameter. Applied
     /// identically to every query in the batch (Issue #1297).
     group_by: Option<String>,
+
+    /// Count each query's matching documents — the same value as the
+    /// `search` tool's `track_total_hits` parameter (Issue #1472). Applied
+    /// identically to every query in the batch; each entry of `batch` then
+    /// has its own `total_hits`.
+    #[schemars(schema_with = "track_total_hits_schema")]
+    track_total_hits: Option<Value>,
 }
 
 /// Parameters for the `add_field` tool.
@@ -958,7 +985,7 @@ impl LaurusMcpServer {
 
     /// Search documents using the laurus unified query DSL.
     #[tool(
-        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators in capitals (AND, OR, NOT; lowercase and/or/not are terms), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: field:\"text\" on a vector field of the schema for semantic similarity (content:\"cute kitten\", content:\"cute kitten\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Returns JSON with the array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped)."
+        description = "Search documents using the laurus unified query DSL. Supports three modes: (1) Lexical search: term queries (title:hello), boolean operators in capitals (AND, OR, NOT; lowercase and/or/not are terms), phrase queries (\"exact phrase\"), fuzzy queries (roam~2), range queries (field:[from TO to]). (2) Vector search: field:\"text\" on a vector field of the schema for semantic similarity (content:\"cute kitten\", content:\"cute kitten\"^0.8). (3) Hybrid search: mix both in one query (title:hello content:\"cute kitten\"). Optionally rescores the top results with late interaction over a MultiVector field (rescore parameter; query text needs a candle_colbert embedder on the field), and groups the results by a field's value (group_by parameter, e.g. _id to return each chunked document once). Counts the matching documents when asked (track_total_hits parameter: an integer threshold, true for an exact count; none by default). Returns JSON with the array of results (id, score, fields, highlights when requested via the highlight parameter, group_key and inner_hits when grouped), and total_hits ({value, relation: eq or gte}) when track_total_hits asked for it."
     )]
     async fn search(
         &self,
@@ -990,7 +1017,7 @@ impl LaurusMcpServer {
     }
 
     #[tool(
-        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset, highlight and group_by settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the results (id, score, fields, highlights when requested, group_key and inner_hits when grouped) for queries[i], in input order. Useful for agents issuing several sub-queries per turn."
+        description = "Execute multiple independent searches in a single round trip. Takes an array of query strings (each in the laurus unified query DSL, same syntax as the search tool) and runs them in parallel on the server. The same limit, offset, highlight, group_by and track_total_hits and group_by settings apply to every query. Returns JSON with a `batch` array; batch[i] holds the results (id, score, fields, highlights when requested, group_key and inner_hits when grouped) for queries[i], with its total_hits when asked for, in input order. Useful for agents issuing several sub-queries per turn."
     )]
     async fn search_batch(
         &self,
@@ -1089,6 +1116,8 @@ fn search_request(params: SearchParams) -> Result<SearchRequest, String> {
         params.group_by.as_ref(),
         convert::json_to_group_by_params,
     )?;
+    // Issue #1472.
+    let track_total_hits = track_total_hits_param(params.track_total_hits.as_ref())?;
     Ok(SearchRequest {
         query: params.query,
         limit: params.limit.unwrap_or(10),
@@ -1098,17 +1127,27 @@ fn search_request(params: SearchParams) -> Result<SearchRequest, String> {
         highlight,
         rescore,
         group_by,
+        track_total_hits,
         ..Default::default()
     })
 }
 
+/// Read the search tools' optional `track_total_hits` parameter (Issue
+/// #1472); the error is the tool error message.
+fn track_total_hits_param(value: Option<&Value>) -> Result<Option<TrackTotalHits>, String> {
+    Ok(value
+        .map(convert::json_to_track_total_hits)
+        .transpose()?
+        .flatten())
+}
+
 /// Build the `search_batch` tool's gRPC request from its parameters: one
-/// request per query, sharing the limit, offset, highlight (Issue #1134)
-/// and grouping (Issue #1297).
+/// request per query, sharing the limit, offset, highlight (Issue #1134),
+/// grouping (Issue #1297) and total hit count (Issue #1472).
 ///
 /// # Errors
 ///
-/// Returns the tool error message of the first malformed JSON parameter.
+/// Returns the tool error message of the first malformed parameter.
 fn search_batch_request(params: SearchBatchParams) -> Result<SearchBatchRequest, String> {
     let highlight = parse_json_param(
         "highlight",
@@ -1120,6 +1159,7 @@ fn search_batch_request(params: SearchBatchParams) -> Result<SearchBatchRequest,
         params.group_by.as_ref(),
         convert::json_to_group_by_params,
     )?;
+    let track_total_hits = track_total_hits_param(params.track_total_hits.as_ref())?;
     let limit = params.limit.unwrap_or(10);
     let offset = params.offset.unwrap_or(0);
     let queries = params
@@ -1131,6 +1171,7 @@ fn search_batch_request(params: SearchBatchParams) -> Result<SearchBatchRequest,
             offset,
             highlight: highlight.clone(),
             group_by: group_by.clone(),
+            track_total_hits,
             ..Default::default()
         })
         .collect();
@@ -1200,7 +1241,7 @@ pub async fn run(endpoint: Option<&str>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use laurus_server::proto::laurus::v1::GroupByParams;
+    use laurus_server::proto::laurus::v1::{GroupByParams, track_total_hits};
     use serde::de::DeserializeOwned;
 
     use super::*;
@@ -1359,6 +1400,7 @@ mod tests {
             highlight: None,
             rescore: None,
             group_by: group_by.map(str::to_string),
+            track_total_hits: None,
         }
     }
 
@@ -1429,6 +1471,7 @@ mod tests {
             offset: None,
             highlight: Some(r#"{"fields": ["body"], "max_fragments": 4294967297}"#.to_string()),
             group_by: None,
+            track_total_hits: None,
         })
         .map(|_| ())
         .unwrap_err();
@@ -1512,6 +1555,7 @@ mod tests {
                 offset: None,
                 highlight: highlight.map(str::to_string),
                 group_by: None,
+                track_total_hits: None,
             }))
         };
 
@@ -1543,6 +1587,7 @@ mod tests {
             offset: None,
             highlight: None,
             group_by: Some(r#"{"field": "_id"}"#.to_string()),
+            track_total_hits: None,
         })
         .unwrap();
         assert_eq!(request.queries.len(), 2);
@@ -1550,5 +1595,123 @@ mod tests {
             assert_eq!(query.group_by, by_id(None));
             assert_eq!(query.limit, 5);
         }
+    }
+
+    fn track(mode: track_total_hits::Mode) -> Option<TrackTotalHits> {
+        Some(TrackTotalHits { mode: Some(mode) })
+    }
+
+    /// Issue #1472: the `search` tool's `track_total_hits` reaches the gRPC
+    /// request as the HTTP gateway reads it: an integer is `up_to`, `true`
+    /// is `exact`, `false` and an absent parameter ask for no total.
+    #[test]
+    fn search_request_carries_track_total_hits() {
+        let request = |value: Option<Value>| {
+            search_request(SearchParams {
+                track_total_hits: value,
+                ..search_params(None)
+            })
+            .map(|request| request.track_total_hits)
+        };
+        assert_eq!(
+            request(Some(json!(1000))),
+            Ok(track(track_total_hits::Mode::UpTo(1000)))
+        );
+        assert_eq!(
+            request(Some(json!(true))),
+            Ok(track(track_total_hits::Mode::Exact(true)))
+        );
+        assert_eq!(request(Some(json!(false))), Ok(None));
+        assert_eq!(request(None), Ok(None));
+
+        let err = request(Some(json!("1000"))).unwrap_err();
+        assert!(err.starts_with("track_total_hits must be"), "{err}");
+    }
+
+    /// Issue #1472: `search_batch` asks every query for the total.
+    #[test]
+    fn search_batch_request_counts_every_query() {
+        let request = search_batch_request(SearchBatchParams {
+            queries: vec!["title:rust".to_string(), "title:go".to_string()],
+            limit: None,
+            offset: None,
+            highlight: None,
+            group_by: None,
+            track_total_hits: Some(json!(50)),
+        })
+        .unwrap();
+        assert_eq!(request.queries.len(), 2);
+        for query in &request.queries {
+            assert_eq!(
+                query.track_total_hits,
+                track(track_total_hits::Mode::UpTo(50))
+            );
+        }
+    }
+
+    /// Issue #1472: both search tools declare `track_total_hits` as an
+    /// integer or a boolean, so a client does not send it as a JSON string
+    /// as it sends `fusion`.
+    #[test]
+    fn the_search_tools_declare_track_total_hits_as_an_integer_or_a_boolean() {
+        let tools = LaurusMcpServer::tool_router().list_all();
+        for name in ["search", "search_batch"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("no {name} tool"));
+            let schema = &tool.input_schema["properties"]["track_total_hits"];
+            assert_eq!(
+                schema["type"],
+                json!(["integer", "boolean", "null"]),
+                "{name}: {schema}"
+            );
+            assert_eq!(schema["minimum"], json!(0), "{name}: {schema}");
+            assert!(
+                schema["description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("Issue #1472")),
+                "{name}: {schema}"
+            );
+        }
+    }
+
+    /// Issue #1472: a `track_total_hits` that is not an integer or a
+    /// boolean is a tool error naming it, read through rmcp as a client
+    /// sends it, before the server is asked.
+    #[tokio::test]
+    async fn search_with_a_string_track_total_hits_is_a_tool_error_through_rmcp() {
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let server = LaurusMcpServer::new(Some(channel));
+        let server_task = tokio::spawn(async move {
+            let running = server.serve(server_io).await?;
+            running.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = ().serve(client_io).await.expect("the client connects");
+
+        let arguments = json!({"query": "title:rust", "track_total_hits": "1000"});
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .expect("the call returns a result");
+
+        let result = serde_json::to_value(result).unwrap();
+        assert_eq!(result["isError"], json!(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.starts_with("track_total_hits must be true, false or an integer"),
+            "{result}"
+        );
+
+        client.cancel().await.expect("the client cancels");
+        server_task
+            .await
+            .expect("the server task")
+            .expect("the server");
     }
 }

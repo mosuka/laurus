@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use laurus::TrackTotalHits;
 
 use crate::output::OutputFormat;
 
@@ -456,11 +457,40 @@ pub struct SearchCommand {
     /// 1, at most 100).
     #[arg(long, value_name = "N", requires = "group_by")]
     pub group_size: Option<usize>,
+
+    /// Count the matching documents and show the count (Issue #1472), with
+    /// the values of the HTTP gateway's `track_total_hits`: an integer N
+    /// counts exactly up to N matches ("at least N" from N on), `true`
+    /// counts every match, and `false`, as without the flag, counts
+    /// nothing. A vector or hybrid search's total is a lower bound, and a
+    /// grouped search counts documents, not groups.
+    #[arg(long, value_name = "N|true|false", value_parser = parse_track_total_hits)]
+    pub track_total_hits: Option<TrackTotalHits>,
+}
+
+/// Parse `--track-total-hits` (Issue #1472) as the HTTP gateway reads
+/// `track_total_hits`: an integer is [`TrackTotalHits::UpTo`] (the engine
+/// rejects 0), `true` is [`TrackTotalHits::Exact`], and `false` counts
+/// nothing.
+///
+/// # Errors
+///
+/// Returns a message for clap when `value` is none of those.
+fn parse_track_total_hits(value: &str) -> Result<TrackTotalHits, String> {
+    match value {
+        "true" => Ok(TrackTotalHits::Exact),
+        "false" => Ok(TrackTotalHits::Disabled),
+        _ => value
+            .parse::<u64>()
+            .map(TrackTotalHits::UpTo)
+            .map_err(|_| format!("expected an integer from 0 to {}, true or false", u64::MAX)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use laurus::TrackTotalHits;
 
     use super::{Cli, Command};
 
@@ -506,5 +536,34 @@ mod tests {
             (Some("parent".to_string()), Some(3))
         );
         assert!(search_group_by(&["--group-size", "3"]).is_err());
+    }
+
+    fn search_track_total_hits(args: &[&str]) -> Result<Option<TrackTotalHits>, clap::Error> {
+        let cli = Cli::try_parse_from(["laurus", "search", "title:rust"].iter().chain(args))?;
+        match cli.command {
+            Command::Search(search) => Ok(search.track_total_hits),
+            _ => unreachable!("parsed a search command"),
+        }
+    }
+
+    /// Issue #1472: `search --track-total-hits` takes the HTTP gateway's
+    /// values, an integer, `true` or `false`, and nothing else.
+    #[test]
+    fn search_parses_track_total_hits() {
+        // `=` keeps clap from reading `-1` as a flag.
+        let parse = |value: &str| {
+            search_track_total_hits(&[format!("--track-total-hits={value}").as_str()])
+        };
+        assert_eq!(search_track_total_hits(&[]).unwrap(), None);
+        assert_eq!(parse("1000").unwrap(), Some(TrackTotalHits::UpTo(1000)));
+        assert_eq!(parse("true").unwrap(), Some(TrackTotalHits::Exact));
+        assert_eq!(parse("false").unwrap(), Some(TrackTotalHits::Disabled));
+        for wrong in ["-1", "1.5", "yes", ""] {
+            let error = parse(wrong).expect_err(wrong).to_string();
+            assert!(
+                error.contains("expected an integer from 0 to"),
+                "{wrong}: {error}"
+            );
+        }
     }
 }

@@ -488,6 +488,40 @@ curl -X POST http://localhost:8080/v1/search \
 
 エンジンが拒否する値も同じです（[gRPC の `GroupByParams`](grpc_api.md#groupbyparams) と[検索結果のグループ化](../concepts/search/result_grouping.md)を参照）。
 
+#### 総ヒット数付き検索
+
+`track_total_hits` を指定すると、ページの外まで一致する文書を数えます（Issue #1472）。Elasticsearch と同じく、値は整数 `n`（`n` 件まで正確に数える）、`true`（すべての一致を数える）、`false`（数えない）のどれかです。省略と `null` は `false` と同じです。レスポンスには `"total_hits"` が付き、その `"relation"` は、正確な件数なら `"eq"`、下限なら `"gte"` です。[グループ化付き検索](#グループ化付き検索)の 4 つの chunk（そのうち 3 つが "rust" を含む）に対して実行すると、次のようになります。
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "body:rust", "limit": 1, "track_total_hits": true}'
+```
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"eq","value":3}}
+```
+
+`"track_total_hits": 2` では、数えるのが上限で止まり、総数は下限になります。
+
+```json
+{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"gte","value":2}}
+```
+
+`track_total_hits` を指定しない検索と `false` の検索は数えず、`"total_hits"` のない本文を返します。数えることにはコストがあるので、必要な数までにとどめてください。数えた件数が上限に届くまで、検索は block-max の打ち切りが読み飛ばす文書を読み飛ばせません。ベクトル検索・ハイブリッド検索・グループ化した検索で何を数えるかは、[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。
+
+整数・`true`・`false`・`null` 以外の値（`"1000"`、`1.5`、`-1` など）は、総数なしで検索するのではなく、`400 Bad Request` で拒否されます。
+
+```json
+{"error":{"code":400,"message":"track_total_hits must be true, false or an integer between 0 and 18446744073709551615"}}
+```
+
+`0` はエンジンが拒否します。
+
+```json
+{"error":{"code":400,"message":"Invalid argument: track_total_hits must count at least 1 match, got UpTo(0)"}}
+```
+
 ### ストリーミング検索（SSE）
 
 `/v1/search/stream` エンドポイントは Server-Sent Events（SSE）として結果を返します。各結果は個別のイベントとして送信されます。
@@ -514,6 +548,12 @@ data: {"fields":{"body":"Rust ownership rules for Rust programs"},"group_key":"m
 data: {"fields":{"body":"Why Rust has no garbage collector"},"group_key":"faq","id":"faq","score":0.010891089215874672}
 ```
 
+ストリームには総数を送るイベントがないため、`track_total_hits` で総数を求めるリクエスト（整数か `true`）は、イベントを送る前に `400 Bad Request` で拒否されます（Issue #1472）。総数は [`POST /v1/search`](#検索) で求めてください。
+
+```json
+{"error":{"code":400,"message":"a streamed search returns no total hit count; send track_total_hits to a search that is not streamed"}}
+```
+
 ### バッチ検索
 
 `POST /v1/search/batch` は、独立した複数の検索を 1 回のリクエストで実行します（Issue #714）。`queries` は配列で、各要素は [`POST /v1/search`](#検索) の本文と同じものを受け付けます。サーバーはそれらを並列に実行し、レスポンスはクエリごとの `{"results": [...]}` を `queries` の順に持ちます。
@@ -528,6 +568,12 @@ curl -X POST http://localhost:8080/v1/search/batch \
 
 ```json
 {"results":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.7456220984458923}]},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}]}]}
+```
+
+各クエリはそれぞれの [`track_total_hits`](#総ヒット数付き検索) を持ち、総数を求めたクエリの要素にだけ `"total_hits"` が付きます（Issue #1472）。`{"queries": [{"query": "body:rust", "limit": 1, "track_total_hits": true}, {"query": "body:garbage", "limit": 1}]}` では次のようになります。
+
+```json
+{"results":[{"results":[{"fields":{"body":"Rust ownership rules for Rust programs"},"id":"manual","score":0.012571428902447224}],"total_hits":{"relation":"eq","value":3}},{"results":[{"fields":{"body":"Why Rust has no garbage collector"},"id":"faq","score":0.9227996468544006}]}]}
 ```
 
 `queries` が空なら `{"results":[]}` を返します。`queries` のない本文は `400 Bad Request`（``missing `queries` field``）で拒否され、配列でない `queries` も同じく拒否されます（`` `queries` must be an array``）。サーバーはどのクエリを実行するよりも先に全クエリを読み、不正なクエリや、`offset + limit` が `max_result_window` を超えるクエリがあれば、その位置で始まるメッセージの `400 Bad Request` で拒否します。
