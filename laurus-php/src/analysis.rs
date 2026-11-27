@@ -1,12 +1,7 @@
 //! PHP wrappers for the Laurus analysis pipeline.
 //!
-//! `SynonymGraphFilter::__construct`'s `keepOriginal` parameter is camelCase
-//! (not Rust-idiomatic snake_case) because `#[php_impl]` exposes a
-//! parameter's literal Rust identifier as its PHP named-argument name, and
-//! the rest of this binding's public surface is camelCase (Issue #1384). The
-//! lint is allowed for the whole module because the macro binds each
-//! argument by that identifier in code it generates outside the `impl`
-//! block, where a function-level `#[allow]` does not reach.
+//! Multi-word parameters are camelCase (`$keepOriginal`), as everywhere in
+//! this binding; see "Parameter names" in the crate docs.
 #![allow(non_snake_case)]
 
 use std::cell::RefCell;

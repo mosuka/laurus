@@ -459,7 +459,7 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
-        // (name, stored, indexed, multi_valued)
+        // (name, stored, indexed, multiValued)
         $schema->addIntegerField("tags", true, true, $multiValued);
         return new Laurus\Index(null, $schema);
     }
@@ -525,7 +525,7 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
-        // (name, stored, indexed, multi_valued)
+        // (name, stored, indexed, multiValued)
         $schema->addGeoField("spots", true, true, $multiValued);
         return new Laurus\Index(null, $schema);
     }
@@ -581,7 +581,7 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
-        // (name, stored, indexed, multi_valued)
+        // (name, stored, indexed, multiValued)
         $schema->addDatetimeField("seen_at", true, true, $multiValued);
         return new Laurus\Index(null, $schema);
     }
@@ -644,7 +644,7 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
-        // (name, stored, indexed, multi_valued)
+        // (name, stored, indexed, multiValued)
         $schema->addBooleanField("flags", true, true, $multiValued);
         return new Laurus\Index(null, $schema);
     }
@@ -701,7 +701,7 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
-        // (name, stored, indexed, term_vectors, doc_values, analyzer, multi_valued, position_increment_gap)
+        // (name, stored, indexed, termVectors, docValues, analyzer, multiValued, positionIncrementGap)
         if ($gap === null) {
             $schema->addTextField("notes", true, true, true, true, null, $multiValued);
         } else {
@@ -780,7 +780,7 @@ class LaurusTest extends TestCase
     {
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
-        // (name, stored, multi_valued)
+        // (name, stored, multiValued)
         $schema->addBytesField("blobs", true, $multiValued);
         return new Laurus\Index(null, $schema);
     }
@@ -1123,8 +1123,8 @@ class LaurusTest extends TestCase
         $idx = $this->createGeo3dIndex();
         $q = Laurus\Geo3dNearestQuery::kNearest(
             "position", -3955182.0, 3350553.0, 3700276.0, 2,
-            10000.0,        // initial_radius_m
-            10000000.0,     // max_radius_m
+            10000.0,        // initialRadiusM
+            10000000.0,     // maxRadiusM
         );
         $results = $idx->search($q, 2);
         $ids = array_map(fn($r) => $r->getId(), $results);
@@ -2007,9 +2007,9 @@ class LaurusTest extends TestCase
             "highlight: max_fragments" => fn(int $v) => $highlight("max_fragments", $v),
             "highlight: fragment_size" => fn(int $v) => $highlight("fragment_size", $v),
             "highlight: max_analyzed_chars" => fn(int $v) => $highlight("max_analyzed_chars", $v),
-            "WalSyncPolicy::group: max_records" => fn(int $v) => Laurus\WalSyncPolicy::group($v),
-            "WalSyncPolicy::group: max_bytes" => fn(int $v) => Laurus\WalSyncPolicy::group(null, $v),
-            "WalSyncPolicy::group: max_interval_ms" =>
+            "WalSyncPolicy::group: maxRecords" => fn(int $v) => Laurus\WalSyncPolicy::group($v),
+            "WalSyncPolicy::group: maxBytes" => fn(int $v) => Laurus\WalSyncPolicy::group(null, $v),
+            "WalSyncPolicy::group: maxIntervalMs" =>
                 fn(int $v) => Laurus\WalSyncPolicy::group(null, null, $v),
         ];
         $wrong = [];
@@ -2047,15 +2047,15 @@ class LaurusTest extends TestCase
         $calls = [
             "Schema::addHnswField: dimension" => fn(int $v) => $hnsw($v),
             "Schema::addHnswField: m" => fn(int $v) => $hnsw(8, null, $v),
-            "Schema::addHnswField: ef_construction" => fn(int $v) => $hnsw(8, null, 16, $v),
-            "Schema::addHnswField: default_ef_search" => fn(int $v) => $hnsw(8, null, 16, 200, $v),
-            "Schema::addHnswField: subvector_count" =>
+            "Schema::addHnswField: efConstruction" => fn(int $v) => $hnsw(8, null, 16, $v),
+            "Schema::addHnswField: defaultEfSearch" => fn(int $v) => $hnsw(8, null, 16, 200, $v),
+            "Schema::addHnswField: subvectorCount" =>
                 fn(int $v) => $hnsw(8, null, 16, 200, null, null, "product_quantization", $v),
             "Schema::addFlatField: dimension" =>
                 fn(int $v) => (new Laurus\Schema())->addFlatField("v", $v),
             "Schema::addIvfField: dimension" => fn(int $v) => $ivf($v),
-            "Schema::addIvfField: n_clusters" => fn(int $v) => $ivf(8, null, $v),
-            "Schema::addIvfField: n_probe" => fn(int $v) => $ivf(8, null, 100, $v),
+            "Schema::addIvfField: nClusters" => fn(int $v) => $ivf(8, null, $v),
+            "Schema::addIvfField: nProbe" => fn(int $v) => $ivf(8, null, 100, $v),
         ];
         $wrong = [];
         foreach ($calls as $param => $call) {
@@ -2322,7 +2322,7 @@ class LaurusTest extends TestCase
 
     public function testWalSyncPolicyDefaultsOmittedConstruct(): void
     {
-        // Omitting wal_sync_policy entirely keeps the existing behavior
+        // Omitting walSyncPolicy entirely keeps the existing behavior
         // (per-record durability), preserving backward compatibility.
         $schema = new Laurus\Schema();
         $schema->addTextField("title");
@@ -3311,6 +3311,84 @@ class LaurusTest extends TestCase
                 $this->assertStringContainsString("group_by", $e->getMessage());
             }
         }
+    }
+
+    // ── Parameter names (Issue #1694) ────────────────────────────────────
+
+    /**
+     * Every parameter of the extension is named in camelCase, as the methods
+     * of PHP's own classes name theirs (`SplFixedArray::fromArray($preserveKeys)`),
+     * so that a named argument is spelled one way across the binding
+     * (Issue #1694).
+     */
+    public function testEveryParameterNameIsCamelCase(): void
+    {
+        $ext = new \ReflectionExtension("laurus-php");
+        $functions = [];
+        foreach ($ext->getClasses() as $class) {
+            foreach ($class->getMethods() as $method) {
+                if ($method->getDeclaringClass()->getName() === $class->getName()) {
+                    $functions[$class->getName() . "::" . $method->getName()] = $method;
+                }
+            }
+        }
+        foreach ($ext->getFunctions() as $name => $function) {
+            $functions[$name] = $function;
+        }
+        $checked = 0;
+        $wrong = [];
+        foreach ($functions as $where => $function) {
+            foreach ($function->getParameters() as $p) {
+                $checked++;
+                if (preg_match('/^[a-z][a-zA-Z0-9]*$/', $p->getName()) !== 1) {
+                    $wrong[] = "$where(\$" . $p->getName() . ")";
+                }
+            }
+        }
+        $this->assertGreaterThan(100, $checked, "too few parameters found in the extension");
+        $this->assertSame([], $wrong, implode("\n", $wrong));
+    }
+
+    /**
+     * The renamed parameters are taken by name, and their old snake_case
+     * names are not, since PHP has no alias for a parameter name. The
+     * strings that name a parameter use the new names (Issue #1694).
+     */
+    public function testRenamedParametersAreTakenByName(): void
+    {
+        $schema = new Laurus\Schema();
+        $schema->addHnswField("v", 8, efConstruction: 123, defaultEfSearch: 45);
+        $schema->addIvfField("i", 8, nClusters: 12, nProbe: 3);
+        $schema->addTextField("t", multiValued: true, positionIncrementGap: 7);
+        $toml = $schema->toToml();
+        foreach ([
+            "ef_construction = 123",
+            "default_ef_search = 45",
+            "n_clusters = 12",
+            "n_probe = 3",
+            "multi_valued = true",
+            "position_increment_gap = 7",
+        ] as $line) {
+            $this->assertStringContainsString($line, $toml);
+        }
+
+        $this->assertSame(
+            "WalSyncPolicy.group(maxRecords=7, maxBytes=4096, maxIntervalMs=5)",
+            (string) Laurus\WalSyncPolicy::group(maxRecords: 7, maxBytes: 4096, maxIntervalMs: 5)
+        );
+        $this->assertSame(
+            "GeoDistanceQuery.withinRadius(field='loc', lat=35.5, lon=139.25, distanceM=1000)",
+            (string) Laurus\GeoDistanceQuery::withinRadius("loc", 35.5, 139.25, distanceM: 1000.0)
+        );
+
+        $caught = null;
+        try {
+            (new Laurus\Schema())->addHnswField("v", 8, ef_construction: 123);
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+        $this->assertInstanceOf(\Error::class, $caught);
+        $this->assertSame('Unknown named parameter $ef_construction', $caught->getMessage());
     }
 
     // ── API reference (Issue #1613) ──────────────────────────────────────

@@ -1,11 +1,13 @@
 # API リファレンス
 
+引数名は、PHP 本体のクラスのメソッドと同じく camelCase（`$efConstruction`、`$groupBy`）で、どれも名前付き引数として渡せます（`$schema->addHnswField("embedding", 384, efConstruction: 200)`）。
+
 ## Index
 
 Laurus 検索エンジンをラップするメインクラスです。
 
 ```php
-new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $wal_sync_policy = null, ?CommitPolicy $commit_policy = null)
+new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $walSyncPolicy = null, ?CommitPolicy $commitPolicy = null)
 ```
 
 ### コンストラクタ
@@ -14,8 +16,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | :--- | :--- | :--- | :--- |
 | `$path` | `string\|null` | `null` | 永続ストレージのディレクトリパス。`null` の場合はインメモリインデックスを作成します。指定した場合、そのディレクトリは `laurus-cli create index`/`--index-dir` と同じ `<path>/schema.toml` + `<path>/store/` というレイアウトに従うため、ここで作成したインデックスは CLI からも開けます（逆も同様）。詳細は下記を参照。 |
 | `$schema` | `Schema\|null` | `null` | スキーマ定義。新規にファイルベース（またはインメモリ）インデックスを*作成*する場合のみ意味を持ちます。既存のファイルベースインデックスを再オープンする場合は省略（`null`）する必要があり、永続化済みのスキーマが代わりに読み込まれます。新規インデックスで省略した場合は空のスキーマが使用されます。 |
-| `$wal_sync_policy` | `WalSyncPolicy\|null` | `null` | 先行書き込みログ（WAL）の耐久性ポリシー。`null` の場合はデフォルトのレコードごと fsync を維持します。[WAL 同期ポリシーと耐久性](#wal-同期ポリシーと耐久性) を参照。 |
-| `$commit_policy` | `CommitPolicy\|null` | `null` | 自動コミットポリシー。`null` の場合はデフォルトの manual ポリシー（呼び出し側がすべての `commit()` を駆動）を維持します。[コミットポリシーと自動コミット](#コミットポリシーと自動コミット) を参照。 |
+| `$walSyncPolicy` | `WalSyncPolicy\|null` | `null` | 先行書き込みログ（WAL）の耐久性ポリシー。`null` の場合はデフォルトのレコードごと fsync を維持します。[WAL 同期ポリシーと耐久性](#wal-同期ポリシーと耐久性) を参照。 |
+| `$commitPolicy` | `CommitPolicy\|null` | `null` | 自動コミットポリシー。`null` の場合はデフォルトの manual ポリシー（呼び出し側がすべての `commit()` を駆動）を維持します。[コミットポリシーと自動コミット](#コミットポリシーと自動コミット) を参照。 |
 
 **ファイルベースインデックスの作成 vs 再オープン**（`$path` を指定した場合）: `<path>/schema.toml` がまだ存在しない場合、この呼び出しは新規インデックスを**作成**し、`$schema`（省略時は空のスキーマ）をそこに永続化します。`<path>/schema.toml` が既に存在する場合、この呼び出しは既存インデックスを**再オープン**します -- `$schema` は省略しなければならず、指定すると `ValueError` が投げられます（どちらのスキーマを優先すべきか曖昧になるため）。`$path` がこの規約導入以前のレイアウト（`schema.toml` が無く、セグメントファイルが `$path` 直下にある）のインデックスを含んでいる場合も `ValueError` になります。`$path` に `store/` があり `schema.toml` がない場合も `ValueError` になります（Issue #1560）。`store/` に以前のインデックスのドキュメントが残っている可能性があるため、何も書き込まず何も削除しません。そのインデックスを開くには `schema.toml` を戻し、新しいインデックスを作るには `store/` を削除してください。このチェックより前の版は、そのような `store/` を新しいインデックスのストレージとして開き、そのドキュメントを返していました。同じ時に、ほかの呼び出し（同じプロセスでも、別のプロセスでも）が `$path` のインデックスを作成または open している場合は、待たずにすぐ `Exception` が投げられます。その呼び出しが終わってからやり直してください（Issue #1665）。
 
@@ -73,7 +75,7 @@ $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems pro
 #### WalSyncPolicy
 
 `Laurus\WalSyncPolicy` は WAL のフラッシュ方法を記述するイミュータブルな
-値オブジェクトです。`Index` コンストラクタの `$wal_sync_policy` 引数に渡します。
+値オブジェクトです。`Index` コンストラクタの `$walSyncPolicy` 引数に渡します。
 
 ```php
 // デフォルト: 書き込みごとに耐久（各レコードを個別に fsync）。
@@ -81,16 +83,16 @@ $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems pro
 
 // Group commit: fsync をまとめてコストを償却。
 \Laurus\WalSyncPolicy::group(
-    ?int $max_records = null,      // このレコード数でフラッシュ（デフォルト 1024）
-    ?int $max_bytes = null,        // このバイト数でフラッシュ（デフォルト 1 MiB）
-    ?int $max_interval_ms = null,  // このミリ秒ごとに定期的にもフラッシュ
+    ?int $maxRecords = null,      // このレコード数でフラッシュ（デフォルト 1024）
+    ?int $maxBytes = null,        // このバイト数でフラッシュ（デフォルト 1 MiB）
+    ?int $maxIntervalMs = null,  // このミリ秒ごとに定期的にもフラッシュ
 ): WalSyncPolicy
 ```
 
 | コンストラクタ | 説明 |
 | :--- | :--- |
 | `WalSyncPolicy::perRecord()` | デフォルト。すべてのレコードは書き込みが返る前に `fsync` されます。書き込みごとに完全に耐久的です。 |
-| `WalSyncPolicy::group($max_records = null, $max_bytes = null, $max_interval_ms = null)` | `fsync` をまとめます。すべての引数が `null` の場合はデフォルト（`max_records = 1024`、`max_bytes = 1 MiB`、タイマーなし）を使用します。WAL は `$max_records` **または** `$max_bytes` のいずれかが蓄積したとき、および毎回の `commit()` 時にフラッシュされます。`$max_interval_ms` を指定すると、定期タイマーでもフラッシュします。`0` はタイマーを動かさず、append ごとに sync します。負の引数は `\ValueError` になります（Issue #1609）。 |
+| `WalSyncPolicy::group($maxRecords = null, $maxBytes = null, $maxIntervalMs = null)` | `fsync` をまとめます。すべての引数が `null` の場合はデフォルト（`maxRecords = 1024`、`maxBytes = 1 MiB`、タイマーなし）を使用します。WAL は `$maxRecords` **または** `$maxBytes` のいずれかが蓄積したとき、および毎回の `commit()` 時にフラッシュされます。`$maxIntervalMs` を指定すると、定期タイマーでもフラッシュします。`0` はタイマーを動かさず、append ごとに sync します。負の引数は `\ValueError` になります（Issue #1609）。 |
 
 Group commit は SQLite の `synchronous = NORMAL` に相当します。クラッシュ時に
 失われるのは最後の未同期バッチのレコードまでで、インデックスが破損する
@@ -125,7 +127,7 @@ Laurus が自動でコミットすることはなく、呼び出し側がすべ�
 #### CommitPolicy
 
 `Laurus\CommitPolicy` はエンジンがいつコミットするかを記述するイミュータブルな
-値オブジェクトです。`Index` コンストラクタの `$commit_policy` 引数に渡します。
+値オブジェクトです。`Index` コンストラクタの `$commitPolicy` 引数に渡します。
 
 ```php
 // デフォルト: 自動コミットなし — 呼び出し側がすべての commit() を駆動。
@@ -179,24 +181,24 @@ new \Laurus\Schema()
 
 | メソッド | 説明 |
 | :--- | :--- |
-| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $term_vectors = true, bool $doc_values = true, ?string $analyzer = null, bool $multi_valued = false, int $position_increment_gap = 100): void` | 全文フィールド（転置インデックス、BM25）。`$doc_values` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$multi_valued = true` で文字列のシーケンシャル配列を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `$position_increment_gap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`）、または `addAnalyzer` で登録済みの任意のカスタム名（Japanese/Lindera アナライザーなど）を指定できます。 |
-| `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 64 ビット整数フィールド。`$multi_valued = true` で整数配列を受け付け（範囲クエリは "any match"）。`$doc_values` は上記を参照。 |
-| `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 64 ビット浮動小数点フィールド。`$multi_valued = true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`$doc_values` は上記を参照。 |
-| `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | ブールフィールド。`$multi_valued = true` で `bool` のシーケンシャル配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `bool` の配列として読み戻されます）。`$doc_values` は上記を参照。 |
-| `addBytesField(string $name, bool $stored = true, bool $multi_valued = false): void` | 生バイトフィールド。`$doc_values` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`$multi_valued = true` を渡すと base64 文字列のシーケンシャル配列を受け付け（Issue #1176）、単一の base64 文字列と同じ方法で要素ごとにデコードされます。`Bytes` はそもそもインデックスされないため、他の `$multi_valued` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値はスカラーフィールドと同様、バイナリ文字列の配列として読み戻されます。 |
-| `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 地理座標フィールド（緯度/経度）。`$multi_valued = true` で `["lat" => .., "lon" => ..]` 配列の配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`$doc_values` は上記を参照。 |
-| `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`$multi_valued = true` で `["x" => .., "y" => .., "z" => ..]` 配列の配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`$doc_values` は上記を参照。 |
-| `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $multi_valued = false, bool $doc_values = true): void` | UTC 日時フィールド。`$multi_valued = true` で RFC 3339 文字列のシーケンシャル配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`$doc_values` は上記を参照。 |
-| `addHnswField(string $name, int $dimension, ?string $distance = null, int $m = 16, int $ef_construction = 200, ?int $default_ef_search = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvector_count = null, ?string $rerank_storage = null, ?string $pq_codebook_path = null, float $base_weight = 1.0): void` | HNSW 近似最近傍ベクトルフィールド。`$base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。整数の引数が負なら `\ValueError` を投げます（Issue #1493）。 |
-| `addFlatField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, float $base_weight = 1.0, ?string $quantizer = null): void` | Flat（総当たり）ベクトルフィールド。`$dimension` が負なら `\ValueError` を投げます（Issue #1493）。 |
-| `addIvfField(string $name, int $dimension, ?string $distance = null, int $n_clusters = 100, int $n_probe = 1, ?string $embedder = null, float $base_weight = 1.0, ?string $quantizer = null): void` | IVF 近似最近傍ベクトルフィールド。整数の引数が負なら `\ValueError` を投げます（Issue #1493）。 |
-| `addMultiVectorField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, ?string $storage = null, ?int $pool_factor = null): void` | 文書ごとに可変本数のトークンベクトルを保持する MultiVector フィールド。[late interaction による再採点](#lateinteractionrescore)が読み取ります（Issue #1351）。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。`$dimension` は各トークンベクトルの長さで、正の値でなければなりません。`$distance` は `"cosine"`（デフォルト）または `"dot_product"` です。どちらもフィールドの追加時にチェックされます（`\ValueError`）。`$storage` はトークンベクトルのディスク上の要素種別を指定します（Issue #1346）— `"f32"`（デフォルト、正確）、`"f16"`（2倍小さい）、`"int8"`（約4倍小さい）、`"binary"`（32倍小さい、要素あたり 1 bit。`"cosine"` が必要）のいずれかで、こちらもフィールドの追加時にチェックされます（`\ValueError`）。`$pool_factor` は、インデックス時に似たトークンベクトルを平均して、各文書のトークンベクトルを約 `1 / $pool_factor` に減らします（デフォルト `1` はすべて保存、1 未満は `\ValueError`）。[Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) を参照。`$embedder` にはトークン単位のエンベダー（`"candle_colbert"` のもの）の名前を指定し、フィールドのテキスト値と再採点のクエリテキストを埋め込みます。このフィールドはベクトル検索の対象にならず、トークンベクトルは保存されません。`getDocuments` や検索結果には含まれません。 |
+| `addTextField(string $name, bool $stored = true, bool $indexed = true, bool $termVectors = true, bool $docValues = true, ?string $analyzer = null, bool $multiValued = false, int $positionIncrementGap = 100): void` | 全文フィールド（転置インデックス、BM25）。`$docValues` は値を DocValues（ソート・ファセット・集計が読み取る列指向ストア）にもコピーするかどうかを制御します（Issue #1047）。`$stored` も `true` の場合のみ有効です。`$multiValued = true` で文字列のシーケンシャル配列を受け付けます（Issue #1175）: term クエリはいずれかの要素がタームを含めばマッチし、フレーズクエリは slop が `$positionIncrementGap`（デフォルト 100。`0` にすると要素を連結したものとして付番）に達しない限り 2 つの要素をまたぎません。値は文字列の配列として読み戻されます。`$analyzer` にはパラメータ不要の組込名（`"standard"` / `"english"` / `"keyword"` / `"simple"` / `"noop"`）、または `addAnalyzer` で登録済みの任意のカスタム名（Japanese/Lindera アナライザーなど）を指定できます。 |
+| `addIntegerField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット整数フィールド。`$multiValued = true` で整数配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
+| `addFloatField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 64 ビット浮動小数点フィールド。`$multiValued = true` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`$docValues` は上記を参照。 |
+| `addBooleanField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | ブールフィールド。`$multiValued = true` で `bool` のシーケンシャル配列を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `bool` の配列として読み戻されます）。`$docValues` は上記を参照。 |
+| `addBytesField(string $name, bool $stored = true, bool $multiValued = false): void` | 生バイトフィールド。`$docValues` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`$multiValued = true` を渡すと base64 文字列のシーケンシャル配列を受け付け（Issue #1176）、単一の base64 文字列と同じ方法で要素ごとにデコードされます。`Bytes` はそもそもインデックスされないため、他の `$multiValued` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値はスカラーフィールドと同様、バイナリ文字列の配列として読み戻されます。 |
+| `addGeoField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 地理座標フィールド（緯度/経度）。`$multiValued = true` で `["lat" => .., "lon" => ..]` 配列の配列を受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ）。`$docValues` は上記を参照。 |
+| `addGeo3dField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`$multiValued = true` で `["x" => .., "y" => .., "z" => ..]` 配列の配列を受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`$docValues` は上記を参照。 |
+| `addDatetimeField(string $name, bool $stored = true, bool $indexed = true, bool $multiValued = false, bool $docValues = true): void` | UTC 日時フィールド。`$multiValued = true` で RFC 3339 文字列のシーケンシャル配列を受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC に正規化した RFC 3339 文字列の配列として読み戻されます）。`$docValues` は上記を参照。 |
+| `addHnswField(string $name, int $dimension, ?string $distance = null, int $m = 16, int $efConstruction = 200, ?int $defaultEfSearch = null, ?string $embedder = null, ?string $quantizer = null, ?int $subvectorCount = null, ?string $rerankStorage = null, ?string $pqCodebookPath = null, float $baseWeight = 1.0): void` | HNSW 近似最近傍ベクトルフィールド。`$baseWeight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。整数の引数が負なら `\ValueError` を投げます（Issue #1493）。 |
+| `addFlatField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, float $baseWeight = 1.0, ?string $quantizer = null): void` | Flat（総当たり）ベクトルフィールド。`$dimension` が負なら `\ValueError` を投げます（Issue #1493）。 |
+| `addIvfField(string $name, int $dimension, ?string $distance = null, int $nClusters = 100, int $nProbe = 1, ?string $embedder = null, float $baseWeight = 1.0, ?string $quantizer = null): void` | IVF 近似最近傍ベクトルフィールド。整数の引数が負なら `\ValueError` を投げます（Issue #1493）。 |
+| `addMultiVectorField(string $name, int $dimension, ?string $distance = null, ?string $embedder = null, ?string $storage = null, ?int $poolFactor = null): void` | 文書ごとに可変本数のトークンベクトルを保持する MultiVector フィールド。[late interaction による再採点](#lateinteractionrescore)が読み取ります（Issue #1351）。[MultiVector フィールド](../concepts/schema_and_fields.md#multivector-フィールド)を参照。`$dimension` は各トークンベクトルの長さで、正の値でなければなりません。`$distance` は `"cosine"`（デフォルト）または `"dot_product"` です。どちらもフィールドの追加時にチェックされます（`\ValueError`）。`$storage` はトークンベクトルのディスク上の要素種別を指定します（Issue #1346）— `"f32"`（デフォルト、正確）、`"f16"`（2倍小さい）、`"int8"`（約4倍小さい）、`"binary"`（32倍小さい、要素あたり 1 bit。`"cosine"` が必要）のいずれかで、こちらもフィールドの追加時にチェックされます（`\ValueError`）。`$poolFactor` は、インデックス時に似たトークンベクトルを平均して、各文書のトークンベクトルを約 `1 / $poolFactor` に減らします（デフォルト `1` はすべて保存、1 未満は `\ValueError`）。[Token pooling](../concepts/indexing/vector_indexing.md#token-pooling) を参照。`$embedder` にはトークン単位のエンベダー（`"candle_colbert"` のもの）の名前を指定し、フィールドのテキスト値と再採点のクエリテキストを埋め込みます。このフィールドはベクトル検索の対象にならず、トークンベクトルは保存されません。`getDocuments` や検索結果には含まれません。 |
 
 **ベクトル量子化とリランクストレージ**（HNSW フィールド。`quantizer` は Flat・IVF フィールドでも指定可）:
 
-- `quantizer` — `"scalar_8bit"`（デフォルト、4 倍圧縮）、`"float16"`（IEEE 754 半精度、2 倍圧縮、学習不要。Issue #623）、または高圧縮率の `"product_quantization"`。Product quantization では `subvector_count`（`dimension` を割り切れる値）が必須です。`addFlatField` と `addIvfField` は `$quantizer` を最後の引数に取り、`"scalar_8bit"` と `"float16"` を受け付けます。`"product_quantization"` は HNSW 専用で、これらのメソッドでは `\Exception` を投げます。
-- `rerank_storage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
-- `pq_codebook_path` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`$quantizer = "product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
+- `quantizer` — `"scalar_8bit"`（デフォルト、4 倍圧縮）、`"float16"`（IEEE 754 半精度、2 倍圧縮、学習不要。Issue #623）、または高圧縮率の `"product_quantization"`。Product quantization では `subvectorCount`（`dimension` を割り切れる値）が必須です。`addFlatField` と `addIvfField` は `$quantizer` を最後の引数に取り、`"scalar_8bit"` と `"float16"` を受け付けます。`"product_quantization"` は HNSW 専用で、これらのメソッドでは `\Exception` を投げます。
+- `rerankStorage` — `"f32"` を指定すると完全精度の `*.hnsw.f32` サイドカーを書き出し、厳密な Stage-2 リランクを有効化します。省略すると int8 のみのセグメントを維持します。
+- `pqCodebookPath` — 共有 PQ codebook のストレージ相対ファイル名（Issue #631）。`laurus train pq-codebook` CLI コマンドで一度だけ学習します。`$quantizer = "product_quantization"` との組み合わせでのみ意味を持ち、以後の commit は segment ごとの k-means 再学習の代わりに学習済み codebook で encode します。省略すると segment ごとの学習を維持します。
 
 上記のどの `add*Field` メソッドも、`name` が `_`（`_id` を除く）で始まる場合は `\ValueError` を投げ、フィールドを追加しない。`fromToml` / `fromTomlFile` で読み込んだスキーマはそのようなフィールドを引き続き受け付けるため、永続化済みのスキーマも読み込めるが、そこから新しい `Index` を作成すると `\ValueError` になる。詳細は[フィールド命名規則](../laurus-cli/schema_format.md#フィールド命名規則)を参照。
 
@@ -207,9 +209,9 @@ new \Laurus\Schema()
 | メソッド | 説明 |
 | :--- | :--- |
 | `addEmbedder(string $name, array $config): void` | 名前付きエンベダー定義を登録します。`$config` は `"type"` キーを持つ連想配列で（下記参照）、スキーマ TOML 形式と同じ規則でデコードされます。型が無い・未知の型である・必須キーが無い場合は `\Exception`（`invalid embedder config: ...`）を投げます。 |
-| `addAnalyzer(string $name, array $tokenizer, ?array $char_filters = null, ?array $token_filters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$char_filters`/`$token_filters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。組み込みアナライザー用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `\ValueError` になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
+| `addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null): void` | カスタムアナライザー定義を登録します。`$tokenizer` は必須、`$charFilters`/`$tokenFilters` は連想配列の配列で省略可能です。各要素はスキーマ TOML/JSON 形式と同じ `{"type": "...", ...}` の形を使います（下記参照）。組み込みアナライザー用に予約された名前（`standard`、`keyword`、`english`、`simple`、`noop`）は `\ValueError` になり、その名前を定義したスキーマ（`fromToml` で読み込んだものなど）から新しい `Index` を作る場合も同じです。正規表現の構文誤りなどの意味的な妥当性は、このメソッド呼び出し時ではなく、スキーマから `Index` を構築する際にチェックされます。 |
 | `analyzerNames(): array` | `addAnalyzer` で登録済み、または TOML から読み込んだカスタムアナライザー名の一覧を返します。 |
-| `Schema::fromToml(string $toml_str): Schema` | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。TOML がスキーマとして正しくない場合は `ValueError` を投げます。 |
+| `Schema::fromToml(string $tomlStr): Schema` | `laurus-cli create index --schema` と同じ形式の TOML 文字列からスキーマを読み込みます。TOML がスキーマとして正しくない場合は `ValueError` を投げます。 |
 | `Schema::fromTomlFile(string $path): Schema` | TOML ファイルからスキーマを読み込みます。ファイルを読めない場合はパスで始まるメッセージの `Exception` を、内容がスキーマとして正しくない場合は `ValueError` を投げます。 |
 | `toToml(): string` | このスキーマを `laurus-cli` と同じ形式の TOML 文字列にシリアライズします。テーブルはキーの昇順で出力されるため、往復させたスキーマはテキストではなく内容で比較してください。 |
 | `toTomlFile(string $path): void` | このスキーマを TOML ファイルに書き込みます。既存のファイルは上書きします。書き込めない場合はパスで始まるメッセージの `Exception` を投げます。 |
@@ -249,9 +251,9 @@ $schema->addMultiVectorField("body_colbert", 128, null, "colbert");
 
 ### アナライザーコンポーネント
 
-`addAnalyzer(string $name, array $tokenizer, ?array $char_filters = null, ?array $token_filters = null)`
+`addAnalyzer(string $name, array $tokenizer, ?array $charFilters = null, ?array $tokenFilters = null)`
 および `[analyzers.<name>]` TOML セクションで使用します。`$tokenizer` は単一の
-連想配列、`$char_filters`/`$token_filters` は連想配列の配列で、配列の順序で
+連想配列、`$charFilters`/`$tokenFilters` は連想配列の配列で、配列の順序で
 適用されます。
 
 各コンポーネントの説明を含む正規のリファレンスは [スキーマフォーマットリファレンス → アナライザ](../laurus-cli/schema_format.md#アナライザ) を参照してください。
@@ -267,7 +269,7 @@ $schema->addMultiVectorField("body_colbert", 128, null, "colbert");
 | `"lindera"` | `"mode"`, `"dict"` | `"user_dict"` |
 | `"whole"` | -- | -- |
 
-**Char filter**（`$char_filters`、トークン化前の生テキストに適用）:
+**Char filter**（`$charFilters`、トークン化前の生テキストに適用）:
 
 | `"type"` | 必須キー | 任意キー |
 | :--- | :--- | :--- |
@@ -276,7 +278,7 @@ $schema->addMultiVectorField("body_colbert", 128, null, "colbert");
 | `"mapping"` | `"mapping"`（文字列置換の連想配列） | -- |
 | `"japanese_iteration_mark"` | -- | `"kanji"`（デフォルト `true`）、`"kana"`（デフォルト `true`） |
 
-**Token filter**（`$token_filters`、トークン化後のトークン列に適用）:
+**Token filter**（`$tokenFilters`、トークン化後のトークン列に適用）:
 
 | `"type"` | 必須キー | 任意キー |
 | :--- | :--- | :--- |
@@ -354,10 +356,10 @@ new \Laurus\WildcardQuery(string $field, string $pattern)
 ### NumericRangeQuery
 
 ```php
-new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $numeric_type = null)
+new \Laurus\NumericRangeQuery(string $field, mixed $min, mixed $max, ?string $numericType = null)
 ```
 
-`[$min, $max]` の範囲内の数値を検索します。開いた境界には `null` を指定します。`$numeric_type` には `"integer"` または `"float"` を設定します。既定値の `null` は `"integer"` です。どちらの型でも、境界には `int` と `float` のどちらも渡せ、整数の範囲は `float` を切り捨てます。境界は数として比べるので、`$max` の `INF` は `null` と同じ文書に一致します。`NAN` の境界はどの値にも一致しないので、検索が `ValueError` をスローします。それ以外の型の境界（文字列、配列、`bool` など）は、クエリを作る時点で `TypeError` をスローします。
+`[$min, $max]` の範囲内の数値を検索します。開いた境界には `null` を指定します。`$numericType` には `"integer"` または `"float"` を設定します。既定値の `null` は `"integer"` です。どちらの型でも、境界には `int` と `float` のどちらも渡せ、整数の範囲は `float` を切り捨てます。境界は数として比べるので、`$max` の `INF` は `null` と同じ文書に一致します。`NAN` の境界はどの値にも一致しないので、検索が `ValueError` をスローします。それ以外の型の境界（文字列、配列、`bool` など）は、クエリを作る時点で `TypeError` をスローします。
 
 ### DateTimeRangeQuery
 
@@ -371,11 +373,11 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 
 ```php
 \Laurus\GeoDistanceQuery::withinRadius(
-    string $field, float $lat, float $lon, float $distance_m,
+    string $field, float $lat, float $lon, float $distanceM,
 ): GeoDistanceQuery
 ```
 
-地理的距離検索（半径指定）。指定した地点から `$distance_m` メートル以内の
+地理的距離検索（半径指定）。指定した地点から `$distanceM` メートル以内の
 `(lat, lon)` 座標を持つドキュメントを返します。
 
 ### GeoBoundingBoxQuery
@@ -383,16 +385,16 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 ```php
 \Laurus\GeoBoundingBoxQuery::withinBoundingBox(
     string $field,
-    float $min_lat, float $min_lon,
-    float $max_lat, float $max_lon,
+    float $minLat, float $minLon,
+    float $maxLat, float $maxLon,
 ): GeoBoundingBoxQuery
 ```
 
-地理的範囲（バウンディングボックス）検索。軸並行 `[$min_lat, $max_lat] ×
-[$min_lon, $max_lon]` 内の `(lat, lon)` 座標を持つドキュメントを返します。
+地理的範囲（バウンディングボックス）検索。軸並行 `[$minLat, $maxLat] ×
+[$minLon, $maxLon]` 内の `(lat, lon)` 座標を持つドキュメントを返します。
 
-`$min_lon > $max_lon` のときは、ボックスが日付変更線（±180°）をまたぎます。`$min_lon` から東へ、
-±180° を通って `$max_lon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
+`$minLon > $maxLon` のときは、ボックスが日付変更線（±180°）をまたぎます。`$minLon` から東へ、
+±180° を通って `$maxLon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
 ±180° のときは、もう一方の符号で保存された点にもマッチします。
 
 ### Geo3dDistanceQuery
@@ -401,11 +403,11 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 \Laurus\Geo3dDistanceQuery::withinSphere(
     string $field,
     float $x, float $y, float $z,
-    float $distance_m,
+    float $distanceM,
 ): Geo3dDistanceQuery
 ```
 
-3D ECEF 座標フィールドへの球距離検索。中心 `(x, y, z)` から `$distance_m` メートル以内
+3D ECEF 座標フィールドへの球距離検索。中心 `(x, y, z)` から `$distanceM` メートル以内
 の座標を持つドキュメントを返します。ECEF の理論については
 [Geo3d の概念](../concepts/geo3d.md) を参照。
 
@@ -414,8 +416,8 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 ```php
 \Laurus\Geo3dBoundingBoxQuery::withinBox(
     string $field,
-    float $min_x, float $min_y, float $min_z,
-    float $max_x, float $max_y, float $max_z,
+    float $minX, float $minY, float $minZ,
+    float $maxX, float $maxY, float $maxZ,
 ): Geo3dBoundingBoxQuery
 ```
 
@@ -428,12 +430,12 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
     string $field,
     float $x, float $y, float $z,
     int $k,
-    ?float $initial_radius_m = null,
-    ?float $max_radius_m = null,
+    ?float $initialRadiusM = null,
+    ?float $maxRadiusM = null,
 ): Geo3dNearestQuery
 ```
 
-3D ECEF 座標フィールドへの k 最近傍検索。`$initial_radius_m` / `$max_radius_m`
+3D ECEF 座標フィールドへの k 最近傍検索。`$initialRadiusM` / `$maxRadiusM`
 （オプション）で反復拡張サーチの探索コーンを調整できます。`$k` は 0 以上
 4294967295 以下でなければならず、それ以外では `kNearest` が `\ValueError` を
 投げます（Issue #1590）。
@@ -595,7 +597,7 @@ new \Laurus\GroupBy(string $field, ?int $groupSize = null)
 
 | パラメータ | 型 | デフォルト | 説明 |
 | :--- | :--- | :--- | :--- |
-| `$field` | `string` | -- | `_id`（`addDocument` で登録した chunk は元の文書の `_id` を共有します）、または単一値で、stored で、`doc_values` が有効（いずれも既定値）なテキスト・整数・浮動小数点数・真偽値・日時のフィールド。 |
+| `$field` | `string` | -- | `_id`（`addDocument` で登録した chunk は元の文書の `_id` を共有します）、または単一値で、stored で、`docValues` が有効（いずれも既定値）なテキスト・整数・浮動小数点数・真偽値・日時のフィールド。 |
 | `$groupSize` | `int\|null` | `null`（1） | 各グループに残す hit の数。返す結果自身を含み、`1..=100`。 |
 
 ### メソッド
@@ -611,7 +613,7 @@ new \Laurus\GroupBy(string $field, ?int $groupSize = null)
 このとき、返る各 `SearchResult` はグループの最上位の hit です。`getGroupKey()` はグループが共有する値で、`getInnerHits()` にはグループの残りの hit が順位順に最大 `$groupSize - 1` 件入ります。`$limit` と `$offset` はグループの数を数えます。グループ化は、融合と再採点の後の最終的な順位に対して行い、lexical・vector・ハイブリッドのどの検索でも同じように動きます。並び順、候補の数、グループの hit が `$groupSize` 件に満たないことがある理由は、[検索結果のグループ化](../concepts/search/result_grouping.md) を参照してください。
 
 - `Index->search()`、`Index->searchBatch()`、`SearchRequest` は、`$groupBy` にそれ以外の値を渡すと `\TypeError`（`groupBy must be a Laurus\GroupBy`）を投げます。
-- それ以外の値は検索時、検索を始める前にエンジンがチェックし、`group_by: ...` を含むメッセージの `\ValueError` を投げます。フィールドが存在しない、対象外の型、複数値、stored でない、または `doc_values` がない場合、`$groupSize` が `1..=100` の範囲外の場合（負の値は 0 として報告されます）、`$offset + $limit` が 10,000 を超える場合です。
+- それ以外の値は検索時、検索を始める前にエンジンがチェックし、`group_by: ...` を含むメッセージの `\ValueError` を投げます。フィールドが存在しない、対象外の型、複数値、stored でない、または `docValues` がない場合、`$groupSize` が `1..=100` の範囲外の場合（負の値は 0 として報告されます）、`$offset + $limit` が 10,000 を超える場合です。
 
 ### 例
 
@@ -750,10 +752,10 @@ PHP の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `array`（数値、シーケンシャル） | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドでは配列を `f32` にキャスト |
 | `array`（`"lat"`, `"lon"`） | `Geo` | 2 つの `float` 値 |
 | `array`（`"x"`, `"y"`, `"z"`） | `GeoEcef` | 3 つの `float` 値（メートル単位、3D ECEF 直交座標） |
-| `array`（`["lat" => .., "lon" => ..]` 配列の配列） | `GeoArray` | シーケンシャル配列。フィールドに `$multi_valued = true` が必要 |
-| `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multi_valued = true` が必要 |
+| `array`（`["lat" => .., "lon" => ..]` 配列の配列） | `GeoArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
+| `array`（`["x" => .., "y" => .., "z" => ..]` 配列の配列） | `GeoEcefArray` | シーケンシャル配列。フィールドに `$multiValued = true` が必要 |
 | `array`（数値リストのリスト、シーケンシャル。例: `[[0.1, 0.2], [0.3, 0.4]]`） | `VectorArray` | MultiVector フィールドのトークンベクトル（Issue #1351）。内側の配列はキー付きの地理座標ではなくリストなので、両者が衝突することはない。整数は拡張される。`bool` や `string` の要素は `\TypeError`（"token vector N must hold only numbers"）。ベクトルの本数と次元はフィールドに対してチェックされる（`\ValueError`）。保存されないため、`getDocuments` や検索結果には含まれない |
 | `string`（ISO 8601） | `DateTime` | ISO 8601 形式からパース |
-| `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 全要素が ISO 8601 としてパースできる場合のみ選ばれる。フィールドに `$multi_valued = true` が必要 |
-| `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multi_valued = true` が必要。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列が要素ごとにデコードされる（Issue #1176） |
-| `array`（`bool`、シーケンシャル） | `BoolArray` | 全要素が `bool` であること。`[true, 1]` のような混在配列はエラー（"numeric array elements must be numeric"）。フィールドに `$multi_valued = true` が必要 |
+| `array`（ISO 8601 文字列、シーケンシャル） | `DateTimeArray` | 全要素が ISO 8601 としてパースできる場合のみ選ばれる。フィールドに `$multiValued = true` が必要 |
+| `array`（`string`、シーケンシャル。すべてが ISO 8601 ではない） | `TextArray` | 多値テキストフィールド（Issue #1175）。文字列の配列として読み戻される。フィールドに `$multiValued = true` が必要。宣言済みの多値 `Bytes` フィールドでは、同じ base64 文字列の配列が要素ごとにデコードされる（Issue #1176） |
+| `array`（`bool`、シーケンシャル） | `BoolArray` | 全要素が `bool` であること。`[true, 1]` のような混在配列はエラー（"numeric array elements must be numeric"）。フィールドに `$multiValued = true` が必要 |
