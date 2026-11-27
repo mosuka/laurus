@@ -21,6 +21,9 @@
 //!   `[2024-01-01 TO 2024-12-31]` or `[2024-01-01T00:00:00Z TO *]` (#1179)
 //! - Wildcards: `te?t`, `test*`, with the characters of a term, `a-b*` and
 //!   `te\*t*` too, read as in Lucene's `WildcardQuery` (#1745)
+//! - Escapes: a backslash before a special character makes it part of a
+//!   term, `a\:b`, and is dropped before the analysis, of a fuzzy term too
+//!   (#1754)
 //! - Boosting: `jakarta^4`; a group's boost multiplies the boosts inside
 //!   it, so `(jakarta^2 apache)^3` boosts `jakarta` by 6 (#1568)
 //! - Grouping: `(title:hello OR body:world)`
@@ -963,8 +966,9 @@ impl LexicalQueryParser {
 
         for inner_pair in pair.into_inner() {
             match inner_pair.as_rule() {
+                // Without the backslashes of its escapes (Issue #1754).
                 Rule::term => {
-                    term = inner_pair.as_str().to_string();
+                    term = discard_escapes(inner_pair.as_str());
                 }
                 Rule::fuzziness => {
                     for fuzz_pair in inner_pair.into_inner() {
@@ -1041,8 +1045,9 @@ impl LexicalQueryParser {
 
         for inner_pair in pair.into_inner() {
             match inner_pair.as_rule() {
+                // Without the backslashes of its escapes (Issue #1754).
                 Rule::term => {
-                    term = inner_pair.as_str().to_string();
+                    term = discard_escapes(inner_pair.as_str());
                 }
                 Rule::boost => {
                     boost = self.parse_boost(inner_pair)?;
@@ -1145,6 +1150,25 @@ impl LexicalQueryParser {
         };
         Ok(token_stream.collect())
     }
+}
+
+/// `term` without the backslash of each escape, as Lucene's
+/// `discardEscapeChar`: `a\:b` is `a:b`, and `a\\b` is `a\b` (Issue #1754).
+///
+/// The grammar takes a backslash in a term only before a special character
+/// (`escaped_char`), so each backslash escapes the character after it. A
+/// plain and a fuzzy term are read through this before the analyzer sees
+/// them; a wildcard keeps its escapes, which `WildcardQuery` reads.
+fn discard_escapes(term: &str) -> String {
+    let mut unescaped = String::with_capacity(term.len());
+    let mut chars = term.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => unescaped.extend(chars.next()),
+            c => unescaped.push(c),
+        }
+    }
+    unescaped
 }
 
 /// A term with no field in a query string, as the grammar reads it, and
@@ -2102,6 +2126,50 @@ mod tests {
             match query.as_any().downcast_ref::<WildcardQuery>() {
                 Some(wildcard) if (wildcard.field(), wildcard.pattern()) == (field, pattern) => {}
                 _ => wrong.push(format!("{dsl}: {query:?}")),
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Issue #1754: a plain and a fuzzy term drop the backslash of each
+    /// escape before the analyzer reads them, as Lucene's
+    /// `discardEscapeChar` does; a term without one is read as written.
+    #[test]
+    fn a_term_drops_the_backslash_of_an_escape() {
+        use crate::analysis::analyzer::keyword::KeywordAnalyzer;
+        let parser =
+            LexicalQueryParser::new(Arc::new(KeywordAnalyzer::new())).with_default_field("title");
+        let mut wrong = Vec::new();
+        for (dsl, expected) in [
+            (r"title:a\:b", "a:b"),
+            (r"a\:b", "a:b"),
+            (r"title:te\*t", "te*t"),
+            (r"title:\(x\)", "(x)"),
+            (r"title:a\\b", r"a\b"),
+            (r"title:a\\\:b", r"a\:b"),
+            (r#"title:\+\-\!\{\}\[\]\^\"\~\?\/"#, r#"+-!{}[]^"~?/"#),
+            ("title:a-b", "a-b"),
+            ("title:it's", "it's"),
+        ] {
+            match parser.parse(dsl) {
+                Ok(query) => match query.as_any().downcast_ref::<TermQuery>() {
+                    Some(term) if term.term() == expected => {}
+                    _ => wrong.push(format!("{dsl}: {query:?}")),
+                },
+                Err(e) => wrong.push(format!("{dsl}: {e}")),
+            }
+        }
+        for (dsl, expected) in [
+            (r"title:a\:b~1", "a:b"),
+            (r"title:te\*t~", "te*t"),
+            ("title:abc~1", "abc"),
+        ] {
+            match parser.parse(dsl) {
+                Ok(query) => match query.as_any().downcast_ref::<FuzzyQuery>() {
+                    Some(fuzzy) if fuzzy.term() == expected => {}
+                    _ => wrong.push(format!("{dsl}: {query:?}")),
+                },
+                Err(e) => wrong.push(format!("{dsl}: {e}")),
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");

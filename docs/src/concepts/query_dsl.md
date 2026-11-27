@@ -51,6 +51,8 @@ the resulting tokens are combined with `OR` (matching Lucene's `match`
 query), not required to appear as an exact phrase. Use a quoted
 [Phrase Query](#phrase-query) when exact adjacency is required.
 
+A backslash before a special character of the DSL (`+ - ! ( ) { } [ ] ^ " ~ * ? : \ /`) makes it part of the term: `title:a\:b` searches the term `a:b`, and `title:a\\b` the term `a\b`. The backslash is dropped before the field's analyzer reads the term, as in Lucene's query parser, and so it is in a [fuzzy term](#fuzzy-query) (`title:a\:b~1`). Until Issue #1754 it was kept, so on a field whose analyzer keeps a value whole, such as `keyword`, `title:a\:b` searched `a\:b`.
+
 ### Boolean Operators
 
 Combine clauses with `AND` and `OR`, written in capitals:
