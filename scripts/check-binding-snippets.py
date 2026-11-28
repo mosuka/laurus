@@ -22,11 +22,23 @@ analyzer 名を 5 番目（`docValues`）に渡したまま残っていた（Iss
   `setFilterQuery` / `setLexicalTermQuery`、数値を直接渡す `setRrfFusion(k)` /
   `setWeightedSumFusion(a, b)`（現行は `RRF` / `WeightedSum` オブジェクト）、
   `new SearchRequest(limit)`（現行は `new SearchRequest({ limit })`）
+* `.search(` の 2 番目の引数がオブジェクトリテラル `{ ... }` である（どの
+  バインディングも件数を数（Node.js / WASM / PHP）かキーワード引数
+  （Python / Ruby）で取る。Issue #1770）
+* Node.js / WASM のファイル（`laurus-nodejs/`・`laurus-wasm/` と、それぞれの
+  docs のページ）で、`.search(` の 1 番目の引数が `new <Name>Query(...)` である
+  （この 2 つの `search` は DSL 文字列だけを取る。Node.js では問いを
+  `SearchRequest` に入れて `searchWithRequest` に渡す。Issue #1770）
+* Node.js / WASM のファイルで `.must(` / `.mustNot(` / `.should(` を呼んでいる
+  （Node.js の `BooleanQuery` は問いの型ごとのメソッド `mustTerm` / `mustNotTerm` /
+  `shouldTerm` などだけを持ち、WASM には `BooleanQuery` が無い。Issue #1770）
 
 場合を違反として報告し、終了コード 1 を返す。
 
 制限: 複数行にまたがる呼び出しは検査しない（現状リポジトリに存在しない）。
-Python / Ruby はキーワード引数なので対象外。docs/book/（生成物）は除外する。
+Python / Ruby はキーワード引数なので、`.search(` の 2 番目の引数のほかは対象外。
+変数に入れた問い（`index.search(q)`）は DSL 文字列と見分けられないので検査しない。
+docs/book/（生成物）は除外する。
 
 使い方: python3 scripts/check-binding-snippets.py
 """
@@ -57,10 +69,26 @@ ADD_FIELD_RE = re.compile(r"add[A-Z][A-Za-z0-9]*Field")
 CALL_RE = re.compile(
     rf"\b({ADD_FIELD_RE.pattern}|setVectorQuery|setVectorTextQuery"
     r"|setFilterQuery|setLexicalTermQuery|setLexicalPhraseQuery"
-    r"|setRrfFusion|setWeightedSumFusion|SearchRequest)\s*\("
+    r"|setRrfFusion|setWeightedSumFusion|SearchRequest|(?<=\.)search"
+    r"|(?<=\.)(?:mustNot|must|should))\s*\("
 )
 IDENT_RE = re.compile(r"^\$?[A-Za-z_][A-Za-z0-9_.]*$")
 NUMBER_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+# Node.js / WASM のスニペットを含むパス。この 2 つの `search` は DSL 文字列だけを
+# 取り、`BooleanQuery` に `must(query)` の形のメソッドは無いので、ここでは
+# `.search(new XxxQuery(...))` と `.must(` / `.mustNot(` / `.should(` が誤りになる。
+# Python / Ruby / PHP では問いのオブジェクトをそのまま渡せるので、ほかのパスでは
+# 検査しない。
+JS_BINDING_PREFIXES = (
+    "laurus-nodejs/",
+    "laurus-wasm/",
+    "docs/src/laurus-nodejs",
+    "docs/ja/src/laurus-nodejs",
+    "docs/src/laurus-wasm",
+    "docs/ja/src/laurus-wasm",
+)
+NEW_QUERY_RE = re.compile(r"^new\s+[A-Za-z0-9_]*Query\s*\(")
 
 # 現行 API から削除されたメソッド → 置き換え先。
 REMOVED_METHODS = {
@@ -114,7 +142,7 @@ def is_string_literal(arg: str) -> bool:
     return len(arg) >= 2 and arg[0] in "\"'`" and arg[-1] == arg[0]
 
 
-def violation_for(method: str, args: list[str]) -> str | None:
+def violation_for(method: str, args: list[str], path: Path) -> str | None:
     if ADD_FIELD_RE.fullmatch(method) and any(arg.startswith("{") for arg in args):
         return f"options object passed to {method}(); the add*Field methods take positional arguments"
     if method == "addTextField":
@@ -157,6 +185,29 @@ def violation_for(method: str, args: list[str]) -> str | None:
         if args and NUMBER_RE.match(args[0]):
             return "stale new SearchRequest(limit[, offset]); use new SearchRequest({ limit, offset })"
         return None
+    if method == "search":
+        if len(args) >= 2 and args[1].startswith("{"):
+            return (
+                "options object as the second argument of search(); the limit is a number "
+                "(Node.js, WASM, PHP) or a keyword argument (Python, Ruby)"
+            )
+        if (
+            path.as_posix().startswith(JS_BINDING_PREFIXES)
+            and args
+            and NEW_QUERY_RE.match(args[0])
+        ):
+            return (
+                "query object passed to search(), which takes a DSL string in Node.js and "
+                "WASM; in Node.js, set it on a SearchRequest and call searchWithRequest"
+            )
+        return None
+    if method in ("must", "mustNot", "should"):
+        if path.as_posix().startswith(JS_BINDING_PREFIXES):
+            return (
+                f"{method}() does not exist on the Node.js BooleanQuery, which has one method "
+                f"per query type ({method}Term, {method}Phrase, ...); WASM has no BooleanQuery"
+            )
+        return None
     return None
 
 
@@ -190,7 +241,7 @@ def main() -> int:
                 if args is None:
                     continue
                 call_sites += 1
-                reason = violation_for(match.group(1), args)
+                reason = violation_for(match.group(1), args, path)
                 if reason:
                     violations.append((path, lineno, reason, line.strip()))
 
