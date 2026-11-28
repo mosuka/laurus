@@ -113,7 +113,9 @@ pub trait Scorer: Send + Debug {
     ///
     /// # Arguments
     /// * `doc_id` - Document ID
-    /// * `term_freq` - Term frequency in the document
+    /// * `term_freq` - Term frequency in the document, as the matcher's
+    ///   [`Matcher::weighted_term_freq`](super::matcher::Matcher::weighted_term_freq)
+    ///   reports it: fractional for a weighted synonym (Issue #1704)
     /// * `field_length` - Length of the field (number of tokens). If `None`, a
     ///   scorer that knows its field's per-document lengths looks `doc_id`'s up;
     ///   otherwise it uses the average field length.
@@ -946,7 +948,7 @@ impl Scorer for BooleanScorer {
             match matcher.skip_to(doc_id) {
                 Ok(true) if matcher.doc_id() == doc_id => {
                     // This clause matches the document
-                    let tf = matcher.term_freq() as f32;
+                    let tf = matcher.weighted_term_freq();
                     total_score += scorer.score(doc_id, tf, None);
                 }
                 _ => {
@@ -1089,7 +1091,7 @@ impl Scorer for DisjunctionMaxScorer {
         for (scorer, matcher) in clauses.iter_mut() {
             if matches!(matcher.skip_to(doc_id), Ok(true)) && matcher.doc_id() == doc_id {
                 matched = true;
-                let tf = matcher.term_freq() as f32;
+                let tf = matcher.weighted_term_freq();
                 let score = scorer.score(doc_id, tf, None);
                 if score > max_score {
                     sum_of_others += max_score;
@@ -1251,6 +1253,9 @@ impl Scorer for CombinedFieldsScorer {
         for field in fields.iter_mut() {
             if matches!(field.matcher.skip_to(doc_id), Ok(true)) && field.matcher.doc_id() == doc_id
             {
+                // A field's matcher is always a `TermQuery`'s, never a
+                // weighted synonym's, so its plain frequency is the one to
+                // weight (`Matcher::weighted_term_freq`, Issue #1704).
                 term_freq += field.weight * field.matcher.term_freq() as f32;
             }
             // A document without the field adds nothing to the length.

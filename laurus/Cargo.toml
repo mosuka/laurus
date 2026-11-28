@@ -228,6 +228,11 @@ required-features = ["embeddings-candle"]
 [[example]]
 name = "total_hits_probe"
 
+# Instruction counts of the scoring hot paths: term, Boolean, synonym and
+# phrase searches, with and without weighted synonyms (Issue #1704).
+[[example]]
+name = "scoring_hot_path_probe"
+
 [[bench]]
 name = "distance_bench"
 harness = false

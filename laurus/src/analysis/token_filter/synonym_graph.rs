@@ -63,19 +63,27 @@ impl SynonymGraphFilter {
         Ok(Self::with_tokenizer(dictionary, tokenizer, keep_original))
     }
 
-    /// Set the boost multiplier for synonym tokens.
+    /// Set the boost multiplier for synonym tokens, to weigh synonym matches
+    /// less than the original words at query time.
     ///
-    /// This allows you to adjust the weight of synonym matches relative to original terms.
-    /// For example, a boost of 0.8 means synonyms will have 80% of the weight of exact matches.
+    /// The synonym tokens get a boost of `boost` times a base: 0.8 for a
+    /// one-word synonym of one word, 0.9 for a one-word synonym of several
+    /// words and for the first word of a multi-word synonym, and 0.8 for
+    /// the other words ([`SynonymGraphBuilder::with_boost`](crate::analysis::synonym::graph_builder::SynonymGraphBuilder::with_boost)).
+    /// The matched words keep their own boost. So with a boost of 0.8, a
+    /// one-word synonym of one word gets 0.64.
     ///
-    /// The boost is set on the output tokens, but search does not apply a
-    /// weight that differs between the alternatives at one position yet:
-    /// the query parser puts the position's largest token boost on its
-    /// `SynonymQuery` as a whole (Issue #1701), so a synonym scores like the
-    /// original term.
+    /// The query parser weighs each synonym's occurrences by its token's
+    /// boost relative to the largest at its position (Issue #1704), as
+    /// Lucene's `SynonymQuery` does, so with 0.8 an occurrence of a one-word
+    /// synonym counts as 0.64 of the original's. Indexing ignores token
+    /// boosts, so the weights rank documents only when the field's index
+    /// holds no synonyms (a query-time analyzer). A search fails when the
+    /// boost makes a token's boost not finite or negative.
     ///
     /// # Arguments
-    /// * `boost` - Boost multiplier for synonyms (typically 0.5-1.0)
+    /// * `boost` - Boost multiplier for synonyms, finite and 0 or more
+    ///   (typically 0.5-1.0)
     ///
     /// # Example
     /// ```
@@ -86,7 +94,7 @@ impl SynonymGraphFilter {
     /// dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
     ///
     /// let filter = SynonymGraphFilter::new(dict, true)
-    ///     .with_boost(0.8); // Synonyms get 80% weight
+    ///     .with_boost(0.8); // "machine" gets 0.72 and "learning" 0.64
     /// ```
     pub fn with_boost(mut self, boost: f32) -> Self {
         self.builder = self.builder.with_boost(boost);

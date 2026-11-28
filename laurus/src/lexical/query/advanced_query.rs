@@ -239,7 +239,7 @@ impl AdvancedQuery {
                 break;
             }
 
-            let score = scorer.score(doc_id, matcher.term_freq() as f32, None);
+            let score = scorer.score(doc_id, matcher.weighted_term_freq(), None);
             if score >= min_score {
                 results.push(QueryResult { doc_id, score });
 

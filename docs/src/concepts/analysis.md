@@ -385,11 +385,16 @@ dict.add_synonym_group(vec!["ai".into(), "artificial intelligence".into()]);
 
 // keep_original=true means original token is preserved alongside synonyms
 let filter = SynonymGraphFilter::new(dict, true)
-    .with_boost(0.8);  // stored on each synonym token, but not yet read by
-                        // scoring (see below)
+    .with_boost(0.8);  // synonyms weigh less at query time (see below)
 ```
 
-The `boost` parameter is stored on each synonym `Token`, but neither the indexer nor the query parser reads it today, so it has no effect on scoring or matching — a synonym match currently scores exactly like an exact match (see [Searching with synonyms](#searching-with-synonyms) below). Set it if you plan to consume it from a custom pipeline stage; do not rely on it to weight synonym matches lower.
+The `boost` parameter weights the synonym tokens. A one-word synonym of one word gets `0.8 × boost`, a one-word synonym of several words and the first word of a multi-word synonym `0.9 × boost`, and the other words of a multi-word synonym `0.8 × boost`. The matched words keep their own boost, 1 unless an earlier filter set it. Without `with_boost`, every synonym token has a boost of 1.
+
+Indexing ignores token boosts. The query parser applies them as [Boost](query_dsl.md#boost) describes (Issues #1701 and #1704): the synonyms stacked on a word weigh their occurrences by their boost relative to the word's, so with `with_boost(0.8)` an occurrence of a one-word synonym of one word counts as `0.64` of an occurrence of the word.
+
+- The weights rank documents only when the field's index holds no synonyms, as with a query-time analyzer. When the index expands the synonyms too (see [Searching with synonyms](#searching-with-synonyms) below), every matching document holds every alternative, so the weights lower all their scores alike.
+- Place a `boost` token filter after the synonym filter. Placed before it, the filter boosts the matched words only, and their synonyms weigh relatively less.
+- A search fails with an invalid argument error when the boost makes a token's boost not finite or negative.
 
 #### Matching entries of several words
 

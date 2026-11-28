@@ -622,7 +622,7 @@ impl InvertedIndexSearcher {
             // Gather per-doc inputs into the batch buffer, substituting the
             // scorer's avg when no per-doc length is available so the dense
             // SIMD slice stays valid.
-            let term_freq = matcher.term_freq() as f32;
+            let term_freq = matcher.weighted_term_freq();
             let field_length = field_lengths
                 .and_then(|lengths| lengths.get(doc_id))
                 .map_or(avg_fl, |len| len as f32);
@@ -3262,6 +3262,125 @@ mod tests {
         let query = should_terms(&["alpha", "beta", "gamma"]);
         for k in [1usize, 3, 10] {
             assert_fanout_top_k_is_exact(&store, query.as_ref(), k, &format!("k {k}"));
+        }
+    }
+
+    /// A store of one segment: "big dog" (doc 0), "large dog" (doc 1),
+    /// "big cat" (doc 2), "large cat" (doc 3), and fillers.
+    fn weighted_synonym_store() -> crate::lexical::store::LexicalStore {
+        use crate::Document;
+        use crate::lexical::store::LexicalStore;
+        use crate::lexical::store::config::LexicalIndexConfig;
+
+        let storage = Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let store = LexicalStore::new(storage, LexicalIndexConfig::default()).unwrap();
+        let doc = |text: &str| Document::builder().add_text("body", text).build();
+        for (id, text) in ["big dog", "large dog", "big cat", "large cat"]
+            .iter()
+            .enumerate()
+        {
+            store.upsert_document(id as u64, doc(text)).unwrap();
+        }
+        for id in 4..12u64 {
+            store.upsert_document(id, doc("filler filler")).unwrap();
+        }
+        store.commit().unwrap();
+        store
+    }
+
+    /// `large` at weight 0.5 next to `big` at 1.
+    fn weighted_big_large() -> Box<dyn Query> {
+        use crate::lexical::query::synonym::SynonymQuery;
+        Box::new(SynonymQuery::weighted(
+            "body",
+            vec![("big", 1.0), ("large", 0.5)],
+        ))
+    }
+
+    /// Issue #1704: a top-level weighted synonym scores a document holding
+    /// its lighter alternative as BM25 scores half an occurrence, through
+    /// the searcher's regular loop.
+    #[test]
+    fn a_top_level_weighted_synonym_scores_the_weighted_frequency() {
+        let store = weighted_synonym_store();
+        let hits = store
+            .search(LexicalSearchRequest::new(weighted_big_large()).limit(20))
+            .unwrap()
+            .hits;
+        let score_of = |doc_id: u64| {
+            hits.iter()
+                .find(|h| h.doc_id == doc_id)
+                .unwrap_or_else(|| panic!("doc {doc_id} must match: {hits:?}"))
+                .score
+        };
+        // The four documents are as long as the fillers, so they share a
+        // length norm of 1, and BM25's tf is f (k1 + 1) / (f + k1).
+        let (k1, f) = (1.2_f32, 0.5_f32);
+        let expected_ratio = (f * (k1 + 1.0) / (f + k1)) / 1.0;
+        let ratio = score_of(1) / score_of(0);
+        assert!(
+            (ratio - expected_ratio).abs() < 1e-4,
+            "large / big = {ratio}, expected {expected_ratio}"
+        );
+    }
+
+    /// Issue #1704: under a `BooleanQuery`, a weighted synonym scores the
+    /// same through Block-Max-WAND (`TopDocsCollector`) as through the
+    /// regular loop's `BooleanScorer` (`NonBmwTopDocs`), and in both a
+    /// document holding the lighter alternative scores below one holding
+    /// the original.
+    #[test]
+    fn a_weighted_synonym_in_a_boolean_query_scores_the_same_with_and_without_bmw() {
+        let store = weighted_synonym_store();
+        let searcher = InvertedIndexSearcher::from_arc(store.reader_for_tests().unwrap());
+        let query = || -> Box<dyn Query> {
+            let mut query = BooleanQuery::new();
+            query.add_should(weighted_big_large());
+            query.add_should(Box::new(TermQuery::new("body", "dog")));
+            Box::new(query)
+        };
+        let sorted = |mut hits: Vec<crate::lexical::query::SearchHit>| {
+            hits.sort_by_key(|hit| hit.doc_id);
+            hits.into_iter()
+                .map(|hit| (hit.doc_id, hit.score))
+                .collect::<Vec<_>>()
+        };
+        let bmw = sorted(
+            searcher
+                .search_with_collector(query(), TopDocsCollector::new(100))
+                .unwrap()
+                .results(),
+        );
+        let regular = sorted(
+            searcher
+                .search_with_collector(query(), NonBmwTopDocs(TopDocsCollector::new(100)))
+                .unwrap()
+                .results(),
+        );
+        for (label, scores) in [("bmw", &bmw), ("regular", &regular)] {
+            let score_of = |doc_id: u64| {
+                scores
+                    .iter()
+                    .find(|&&(d, _)| d == doc_id)
+                    .unwrap_or_else(|| panic!("{label}: doc {doc_id} must match: {scores:?}"))
+                    .1
+            };
+            assert!(
+                score_of(1) < score_of(0),
+                "{label}: large dog < big dog: {scores:?}"
+            );
+            assert!(
+                score_of(3) < score_of(2),
+                "{label}: large cat < big cat: {scores:?}"
+            );
+        }
+        assert_eq!(bmw.len(), regular.len(), "{bmw:?} {regular:?}");
+        for ((bmw_doc, bmw_score), (doc, score)) in bmw.iter().zip(&regular) {
+            assert_eq!(bmw_doc, doc);
+            assert!(
+                (bmw_score - score).abs() < 1e-5,
+                "doc {doc}: bmw {bmw_score}, regular {score}"
+            );
         }
     }
 

@@ -983,8 +983,8 @@ impl LexicalQueryParser {
 
             let slop = slop.unwrap_or(0);
             // The boost goes on each clause here.
-            let one_position = |alternatives: Vec<String>, boost: f32| {
-                one_position_query(field_name, alternatives, boost)
+            let one_position = |position: PositionTerms, boost: f32| {
+                one_position_query(field_name, position, boost)
             };
             let phrase = |positions: Vec<Vec<String>>, boost: f32| -> Box<dyn Query> {
                 Box::new(
@@ -994,12 +994,13 @@ impl LexicalQueryParser {
                 )
             };
             let mut clauses: Vec<Box<dyn Query>> = match phrase_graph(&tokens) {
-                // The tokens' boosts multiply the query's (Issue #1701), as
-                // in Lucene's `QueryBuilder`: one position's boost, or the
-                // product over a phrase's positions.
+                // The tokens' boosts reach the score as in Lucene's
+                // `QueryBuilder`: one position's, weighing its alternatives
+                // by their own (`one_position_query`, Issues #1701 and
+                // #1704), or the product over a phrase's positions, each
+                // position's largest.
                 PhraseGraph::Flat(mut positions) if positions.len() == 1 => {
-                    let position = positions.remove(0);
-                    vec![one_position(position.terms, boost * position.boost)]
+                    vec![one_position(positions.remove(0), boost)]
                 }
                 PhraseGraph::Flat(positions) => {
                     let tokens_boost: f32 = positions.iter().map(|p| p.boost).product();
@@ -1015,9 +1016,7 @@ impl LexicalQueryParser {
                     // into a single term.
                     let mut clauses: Vec<Box<dyn Query>> = match direct {
                         None => Vec::new(),
-                        Some(direct) => {
-                            vec![one_position(direct.terms, boost * direct.boost)]
-                        }
+                        Some(direct) => vec![one_position(direct, boost)],
                     };
                     if arcs.windows(2).all(|pair| pair[0].0.to == pair[1].0.from) {
                         // At most one path of two or more positions, as
@@ -1179,13 +1178,9 @@ impl LexicalQueryParser {
             let mut positions = group_tokens_by_position(tokens);
 
             if positions.len() == 1 {
-                // The tokens' boost multiplies the query's (Issue #1701).
-                let position = positions.remove(0);
-                Ok(one_position_query(
-                    field_name,
-                    position.terms,
-                    boost * position.boost,
-                ))
+                // The tokens' boosts reach the score (Issues #1701 and
+                // #1704).
+                Ok(one_position_query(field_name, positions.remove(0), boost))
             } else {
                 // The analyzer split one *bare* (unquoted) term into
                 // tokens at several positions. This happens for a
@@ -1209,7 +1204,7 @@ impl LexicalQueryParser {
                     // it did before this path grouped by position, so each
                     // clause carries only its tokens' boost (Issue #1701).
                     bool_query.add_clause(BooleanClause::new(
-                        one_position_query(field_name, position.terms, position.boost),
+                        one_position_query(field_name, position, 1.0),
                         Occur::Should,
                     ));
                 }
@@ -1384,16 +1379,19 @@ enum PhraseGraph {
 fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
     let token_arcs = token_arcs(tokens);
 
-    // (from, to) → alternatives, and their largest boost (Issue #1701).
+    // (from, to) → alternatives with each one's largest boost, and the
+    // largest of them (Issues #1701 and #1704).
     let mut arcs: BTreeMap<(u32, u32), Vec<String>> = BTreeMap::new();
+    let mut term_boosts: BTreeMap<(u32, u32), Vec<f32>> = BTreeMap::new();
     let mut boosts: BTreeMap<(u32, u32), f32> = BTreeMap::new();
     for (token, &arc) in tokens.iter().zip(&token_arcs) {
         let boost = boosts.entry(arc).or_insert(token.boost);
         *boost = boost.max(token.boost);
-        let alternatives = arcs.entry(arc).or_default();
-        if !alternatives.contains(&token.text) {
-            alternatives.push(token.text.clone());
-        }
+        add_alternative(
+            arcs.entry(arc).or_default(),
+            term_boosts.entry(arc).or_default(),
+            token,
+        );
     }
     let first = token_arcs[0].0;
     let last = arcs.keys().map(|&(_, to)| to).max().unwrap_or(first);
@@ -1413,9 +1411,13 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
     for (arc, origin) in arcs {
         let boost = boosts[&origin];
         if arc.from == 0 && arc.to == last {
-            // Each (from, to) is one arc, so there is at most one.
+            // Each (from, to) is one arc, so there is at most one. Its
+            // alternatives keep their own boosts, to weigh them as a bare
+            // term's are (Issue #1704); `complete_paths_with_origins` keeps
+            // an arc's terms in the order `term_boosts` holds them.
             direct = Some(PositionTerms {
                 terms: arc.terms,
+                term_boosts: term_boosts.remove(&origin).unwrap_or_default(),
                 boost,
             });
         } else {
@@ -1428,7 +1430,7 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
     }
 }
 
-/// The query for one field position's `alternatives`.
+/// The query for one field `position`'s alternatives.
 ///
 /// Several alternatives (synonyms the analyzer stacked there) become one
 /// [`SynonymQuery`], which scores them as one blended term (Issue #1257)
@@ -1437,33 +1439,53 @@ fn phrase_graph(tokens: &[Token]) -> PhraseGraph {
 /// scores would double-count it. A single alternative stays a plain
 /// `TermQuery`. Shared by the quoted ([`LexicalQueryParser::parse_phrase_query`])
 /// and bare ([`LexicalQueryParser::parse_simple_term`]) paths; each passes
-/// the `boost` its own shape puts on a clause, with the position's tokens'
-/// boost multiplied in ([`PositionTerms::boost`], Issue #1701).
-fn one_position_query(
-    field_name: &str,
-    mut alternatives: Vec<String>,
-    boost: f32,
-) -> Box<dyn Query> {
-    if alternatives.len() == 1 {
-        Box::new(TermQuery::new(field_name, alternatives.remove(0)).with_boost(boost))
-    } else {
-        Box::new(SynonymQuery::new(field_name, alternatives).with_boost(boost))
+/// the `boost` its own shape puts on a clause.
+///
+/// The position's tokens' boosts reach the score as Lucene's `QueryBuilder`
+/// applies them (Issues #1701 and #1704). The largest
+/// ([`PositionTerms::boost`]) multiplies `boost`. Each alternative's boost
+/// divided by the largest weighs its occurrences in the blended term
+/// frequency ([`SynonymQuery::weighted`]), so the weights are in [0, 1] and
+/// a uniform boost is the query's factor alone. With the original word at
+/// 1 and its synonyms below, the weights are Lucene's own. A boost that is
+/// not finite or is negative gives a weight that
+/// [`Query::validate_boosts`] rejects, so the search fails.
+fn one_position_query(field_name: &str, position: PositionTerms, boost: f32) -> Box<dyn Query> {
+    let PositionTerms {
+        mut terms,
+        term_boosts,
+        boost: largest,
+    } = position;
+    if terms.len() == 1 {
+        return Box::new(TermQuery::new(field_name, terms.remove(0)).with_boost(boost * largest));
     }
+    let query = if term_boosts.iter().all(|&b| b == largest) {
+        SynonymQuery::new(field_name, terms)
+    } else {
+        let weights = term_boosts.into_iter().map(|b| b / largest);
+        SynonymQuery::weighted(field_name, terms.into_iter().zip(weights).collect())
+    };
+    Box::new(query.with_boost(boost * largest))
 }
 
 /// One field position of analyzed text: the alternative terms the analyzer
-/// put there and the largest of their tokens' boosts.
+/// put there, each with the largest boost of its tokens, and the largest of
+/// them all.
 ///
-/// The boost multiplies the query's when the position becomes a query
-/// (Issue #1701), as Lucene's `QueryBuilder` applies a token's
-/// `BoostAttribute`. Lucene gives each alternative of a `SynonymQuery` its
-/// own boost; one factor for the position applies a uniform boost, such as
-/// a `boost` token filter's, exactly, but not a synonym weight that differs
-/// between the alternatives (`SynonymGraphFilter::with_boost`).
+/// The boosts reach the score when the position becomes a query (Issues
+/// #1701 and #1704), as Lucene's `QueryBuilder` applies a token's
+/// `BoostAttribute`: the largest multiplies the query's boost, and each
+/// alternative's divided by it weighs that alternative's occurrences
+/// ([`one_position_query`]). A uniform boost, such as a `boost` token
+/// filter's, is then the query's factor alone, and a synonym weight that
+/// differs between the alternatives (`SynonymGraphFilter::with_boost`)
+/// weighs the synonyms' occurrences.
 #[derive(Debug, PartialEq)]
 struct PositionTerms {
     /// The alternative terms, deduplicated, in token order.
     terms: Vec<String>,
+    /// The largest boost of each term's tokens, in the order of `terms`.
+    term_boosts: Vec<f32>,
     /// The largest boost of the tokens at the position.
     boost: f32,
 }
@@ -1482,16 +1504,28 @@ fn group_tokens_by_position(tokens: Vec<Token>) -> Vec<PositionTerms> {
         if i == 0 || positions[i - 1] != position {
             by_position.push(PositionTerms {
                 terms: Vec::new(),
+                term_boosts: Vec::new(),
                 boost: token.boost,
             });
         }
         let current = by_position.last_mut().expect("pushed above");
         current.boost = current.boost.max(token.boost);
-        if !current.terms.contains(&token.text) {
-            current.terms.push(token.text.clone());
-        }
+        add_alternative(&mut current.terms, &mut current.term_boosts, token);
     }
     by_position
+}
+
+/// Add `token`'s text to the alternatives `terms` with its boost in
+/// `term_boosts`, or raise the boost of the alternative already there to
+/// the token's when larger.
+fn add_alternative(terms: &mut Vec<String>, term_boosts: &mut Vec<f32>, token: &Token) {
+    match terms.iter().position(|term| *term == token.text) {
+        Some(i) => term_boosts[i] = term_boosts[i].max(token.boost),
+        None => {
+            terms.push(token.text.clone());
+            term_boosts.push(token.boost);
+        }
+    }
 }
 
 /// Walk a `geo3d_*` pair and collect every nested `signed_float` token
@@ -2987,6 +3021,18 @@ mod tests {
         )
     }
 
+    /// A weighted synonym over `terms` (term, weight), as `should_clauses`
+    /// describes it: the description shows each weight that is not 1.
+    fn weighted_synonym(terms: &[(&str, f32)], boost: f32) -> (String, f32) {
+        let terms: Vec<(String, f32)> = terms.iter().map(|&(t, w)| (t.to_string(), w)).collect();
+        (
+            SynonymQuery::weighted("body", terms)
+                .with_boost(boost)
+                .description(),
+            boost,
+        )
+    }
+
     fn phrase(positions: &[&[&str]], slop: u32, boost: f32) -> (String, f32) {
         let positions = positions
             .iter()
@@ -3443,7 +3489,7 @@ mod tests {
     /// boost, not the first token's: here the first is 0.5 and the largest
     /// 1.0.
     #[test]
-    fn stacked_alternatives_share_their_largest_token_boost() {
+    fn stacked_alternatives_weigh_their_occurrences_by_their_token_boosts() {
         let tokens = vec![
             Token::new("large", 0).with_boost(0.5),
             Token::new("big", 0)
@@ -3455,10 +3501,101 @@ mod tests {
             let query = parser.parse(input).unwrap();
             assert_eq!(
                 should_clauses(query.as_ref()),
-                vec![synonym(&["large", "big"], 1.0)],
+                vec![weighted_synonym(&[("large", 0.5), ("big", 1.0)], 1.0)],
                 "{input}"
             );
         }
+    }
+
+    /// The largest boost of a position is the query's factor and the others
+    /// are weights relative to it (Issue #1704): a uniform boost, such as a
+    /// `boost` filter's, leaves the alternatives unweighted, a boost above 1
+    /// stays on the query, and boosts of 0 leave nothing to weigh.
+    #[test]
+    fn a_position_splits_its_token_boosts_into_a_factor_and_weights() {
+        let stacked = |large: f32, big: f32| {
+            vec![
+                Token::new("large", 0).with_boost(large),
+                Token::new("big", 0)
+                    .with_position_increment(0)
+                    .with_boost(big),
+            ]
+        };
+        let cases = [
+            (
+                "uniform",
+                stacked(2.0, 2.0),
+                synonym(&["large", "big"], 2.0),
+            ),
+            (
+                "above 1",
+                stacked(1.6, 2.0),
+                weighted_synonym(&[("large", 0.8), ("big", 1.0)], 2.0),
+            ),
+            ("zero", stacked(0.0, 0.0), synonym(&["large", "big"], 0.0)),
+            // A term stacked twice keeps the larger of its tokens' boosts.
+            (
+                "duplicate",
+                {
+                    let mut tokens = stacked(0.5, 1.0);
+                    tokens.push(
+                        Token::new("large", 0)
+                            .with_position_increment(0)
+                            .with_boost(0.8),
+                    );
+                    tokens
+                },
+                weighted_synonym(&[("large", 0.8), ("big", 1.0)], 1.0),
+            ),
+            // A negative boost is not hidden by a largest of 0: its weight
+            // is out of range, and the search fails (`validate_boosts`).
+            (
+                "negative",
+                stacked(-1.0, 0.0),
+                weighted_synonym(&[("large", f32::NEG_INFINITY), ("big", f32::NAN)], 0.0),
+            ),
+        ];
+        let mut mismatches = Vec::new();
+        for (label, tokens, expected) in cases {
+            let parser =
+                LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+            for input in ["anything", "\"anything\""] {
+                let actual = should_clauses(parser.parse(input).unwrap().as_ref());
+                if actual != vec![expected.clone()] {
+                    mismatches.push(format!("{label} {input}: {actual:?} != {expected:?}"));
+                }
+            }
+            // `^3` multiplies the factor, not the weights.
+            let boosted = parser.parse("anything^3").unwrap().boost();
+            if boosted != expected.1 * 3.0 {
+                mismatches.push(format!("{label} ^3: boost {boosted}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// A `boost` filter placed before the synonym filter boosts the matched
+    /// word only: `SynonymGraphFilter` makes its synonym tokens at 1.0, so
+    /// the synonym weighs 1 / boost of the word (Issue #1704).
+    #[test]
+    fn a_boost_filter_before_the_synonym_filter_weighs_the_synonyms_down() {
+        use crate::analysis::analyzer::pipeline::PipelineAnalyzer;
+        use crate::analysis::synonym::dictionary::SynonymDictionary;
+        use crate::analysis::token_filter::boost::BoostFilter;
+        use crate::analysis::token_filter::synonym_graph::SynonymGraphFilter;
+        use crate::analysis::tokenizer::whitespace::WhitespaceTokenizer;
+
+        let mut dict = SynonymDictionary::new(None).unwrap();
+        dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+        let analyzer = PipelineAnalyzer::new(Arc::new(WhitespaceTokenizer::new()))
+            .add_filter(Arc::new(BoostFilter::new(2.0)))
+            .add_filter(Arc::new(SynonymGraphFilter::new(dict, true)));
+        let parser = LexicalQueryParser::new(Arc::new(analyzer)).with_default_field("body");
+        let query = parser.parse("big").unwrap();
+        assert_eq!(
+            should_clauses(query.as_ref()),
+            vec![weighted_synonym(&[("big", 1.0), ("large", 0.5)], 2.0)]
+        );
     }
 
     /// In a graph with one path of several positions next to the one-position

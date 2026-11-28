@@ -29,6 +29,19 @@ pub trait Matcher: Send + Debug {
         1 // Default implementation for matchers that don't track term frequency
     }
 
+    /// Get the frequency to score the current document with: the term
+    /// frequency, with each occurrence weighted by its term's weight.
+    ///
+    /// Every place that passes a matcher's frequency to
+    /// [`Scorer::score`](super::scorer::Scorer::score) reads this one. It is
+    /// [`term_freq`](Self::term_freq) for every matcher but a weighted
+    /// synonym's, whose alternatives weigh their occurrences by their token
+    /// boosts (Issue #1704).
+    #[inline]
+    fn weighted_term_freq(&self) -> f32 {
+        self.term_freq() as f32
+    }
+
     /// Erased self-reference for runtime downcasting (#466).
     /// Used by [`super::scorer::LeafScorer::from_box`] / `LeafMatcher`
     /// dispatch helpers to specialise production hot-path matcher
@@ -706,6 +719,10 @@ impl Matcher for ConjunctionNotMatcher {
 
     fn term_freq(&self) -> u64 {
         self.positive.term_freq()
+    }
+
+    fn weighted_term_freq(&self) -> f32 {
+        self.positive.weighted_term_freq()
     }
 
     fn is_exhausted(&self) -> bool {
@@ -1425,6 +1442,18 @@ impl LeafMatcher {
             LeafMatcher::Empty(m) => m.term_freq(),
             LeafMatcher::All(m) => m.term_freq(),
             LeafMatcher::Other(m) => m.term_freq(),
+        }
+    }
+
+    /// The frequency to score the current document with
+    /// ([`Matcher::weighted_term_freq`]).
+    #[inline(always)]
+    pub fn weighted_term_freq(&self) -> f32 {
+        match self {
+            LeafMatcher::Posting(m) => m.weighted_term_freq(),
+            LeafMatcher::Empty(m) => m.weighted_term_freq(),
+            LeafMatcher::All(m) => m.weighted_term_freq(),
+            LeafMatcher::Other(m) => m.weighted_term_freq(),
         }
     }
 }
