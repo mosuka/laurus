@@ -209,9 +209,9 @@ cargo doc --open
 | `GeoBoundingBoxQuery::within_bounding_box(...)` | 2D 地理バウンディングボックス | [Lexical Search](../concepts/search.md) を参照 |
 | `GeoPolygonQuery::within_polygon(...)` | 穴を持てる 2D 地理多角形 | [Lexical Search](../concepts/search.md) を参照 |
 | `GeoPolylineQuery::within_distance(...)` | 2D 地理の折れ線から距離以内 | [Lexical Search](../concepts/search.md) を参照 |
-| `Geo3dDistanceQuery::within_sphere(...)` | 3D ECEF 球 | [3D 地理検索](../concepts/geo3d.md) を参照 |
-| `Geo3dBoundingBoxQuery::within_box(...)` | 3D ECEF 軸並行バウンディングボックス | [3D 地理検索](../concepts/geo3d.md) を参照 |
-| `Geo3dNearestQuery::k_nearest(...)` | 3D ECEF k-NN | [3D 地理検索](../concepts/geo3d.md) を参照 |
+| `Geo3dDistanceQuery::new(field, center, distance_m)` | 3D ECEF 球 | [3D 地理検索](../concepts/geo3d.md) を参照 |
+| `Geo3dBoundingBoxQuery::new(field, min, max)?` | 3D ECEF 軸並行バウンディングボックス（どれかの軸で `min` が `max` より大きいと誤り） | [3D 地理検索](../concepts/geo3d.md) を参照 |
+| `Geo3dNearestQuery::new(field, center, k)` | 3D ECEF k-NN | [3D 地理検索](../concepts/geo3d.md) を参照 |
 | `Geo3dPolylineQuery::new(...)` | 3D ECEF の折れ線から距離以内 | [3D 地理検索](../concepts/geo3d.md) を参照 |
 | `SpanNearQuery::new(...)` | 近接 | [Lexical Search](../concepts/search.md) を参照 |
 | `PrefixQuery::new(field, prefix)` | 前方一致 | `PrefixQuery::new("body", "pro")` |
