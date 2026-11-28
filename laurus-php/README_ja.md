@@ -171,10 +171,15 @@ if (Laurus\peek_commit_generation($path) !== $before) {
 | `FuzzyQuery(field, term, maxEdits)` | 近似一致検索 |
 | `WildcardQuery(field, pattern)` | ワイルドカード検索（`*`、`?`） |
 | `NumericRangeQuery(field, min, max, numericType)` | 数値範囲検索（integer または float） |
-| `GeoDistanceQuery::withinRadius(field, lat, lon, distanceKm)` | 地理的距離検索（半径指定） |
+| `DateTimeRangeQuery(field, min, max)` | 日時の範囲検索（両端を含む。開いた端は `null`） |
+| `GeoDistanceQuery::withinRadius(field, lat, lon, distanceM)` | 地理的距離検索（半径指定。距離はメートル） |
 | `GeoBoundingBoxQuery::withinBoundingBox(field, minLat, minLon, maxLat, maxLon)` | 地理的バウンディングボックス検索 |
 | `GeoPolygonQuery::withinPolygon(field, exterior, holes)` | 地理的な多角形の検索（穴を持てる）。頂点は `['lat' => ..., 'lon' => ...]` |
 | `GeoPolylineQuery::withinDistance(field, vertices, distanceM)` | 地理的な折れ線からの距離の検索 |
+| `Geo3dDistanceQuery::withinSphere(field, x, y, z, distanceM)` | 3D ECEF 球距離検索 |
+| `Geo3dBoundingBoxQuery::withinBox(field, minX, minY, minZ, maxX, maxY, maxZ)` | 3D ECEF 軸並行バウンディングボックス検索 |
+| `Geo3dNearestQuery::kNearest(field, x, y, z, k)` | 3D ECEF k 最近傍検索 |
+| `Geo3dPolylineQuery::withinDistance(field, vertices, distanceM)` | 3D ECEF の折れ線からの距離の検索。頂点は `['x' => ..., 'y' => ..., 'z' => ...]` |
 | `BooleanQuery` | 複合ブール検索（must/should/mustNot） |
 | `SpanQuery::near(field, terms, slop, ordered)` | 近接検索（スパン） |
 | `VectorQuery(field, vector)` | 事前計算済みベクトルによる類似度検索 |
@@ -200,8 +205,8 @@ $results = $index->search($bq, 10)->getResults();
 use Laurus\GeoBoundingBoxQuery;
 use Laurus\GeoDistanceQuery;
 
-// 半径検索
-$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10.0), 10)->getResults();
+// 半径検索: 10 km 以内（距離はメートルで渡す）
+$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10000.0), 10)->getResults();
 
 // バウンディングボックス検索
 $results = $index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 35.0, 139.0, 36.0, 140.0), 10)->getResults();

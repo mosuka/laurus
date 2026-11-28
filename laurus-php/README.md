@@ -172,10 +172,15 @@ Every parameter after `name` (and `dimension` for vector fields) has a default, 
 | `FuzzyQuery(field, term, maxEdits)` | Approximate term match |
 | `WildcardQuery(field, pattern)` | Wildcard pattern match (`*`, `?`) |
 | `NumericRangeQuery(field, min, max, numericType)` | Numeric range (integer or float) |
-| `GeoDistanceQuery::withinRadius(field, lat, lon, distanceKm)` | Geo-distance radius search |
+| `DateTimeRangeQuery(field, min, max)` | DateTime range, both bounds inclusive; `null` for an open bound |
+| `GeoDistanceQuery::withinRadius(field, lat, lon, distanceM)` | Geo-distance radius search (the distance in metres) |
 | `GeoBoundingBoxQuery::withinBoundingBox(field, minLat, minLon, maxLat, maxLon)` | Geo bounding box search |
 | `GeoPolygonQuery::withinPolygon(field, exterior, holes)` | Geo polygon search, with holes; vertices `['lat' => ..., 'lon' => ...]` |
 | `GeoPolylineQuery::withinDistance(field, vertices, distanceM)` | Geo distance-to-polyline search |
+| `Geo3dDistanceQuery::withinSphere(field, x, y, z, distanceM)` | 3D ECEF sphere search |
+| `Geo3dBoundingBoxQuery::withinBox(field, minX, minY, minZ, maxX, maxY, maxZ)` | 3D ECEF axis-aligned box search |
+| `Geo3dNearestQuery::kNearest(field, x, y, z, k)` | 3D ECEF k-nearest neighbours |
+| `Geo3dPolylineQuery::withinDistance(field, vertices, distanceM)` | 3D ECEF distance-to-polyline search; vertices `['x' => ..., 'y' => ..., 'z' => ...]` |
 | `BooleanQuery` | Compound boolean logic (must/should/mustNot) |
 | `SpanQuery::near(field, terms, slop, ordered)` | Proximity / ordered span match |
 | `VectorQuery(field, vector)` | Pre-computed vector similarity |
@@ -201,8 +206,8 @@ $results = $index->search($bq, 10)->getResults();
 use Laurus\GeoBoundingBoxQuery;
 use Laurus\GeoDistanceQuery;
 
-// Radius search
-$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10.0), 10)->getResults();
+// Radius search: within 10 km (the distance is in metres)
+$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10000.0), 10)->getResults();
 
 // Bounding box search
 $results = $index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 35.0, 139.0, 36.0, 140.0), 10)->getResults();
