@@ -174,6 +174,8 @@ Every parameter after `name` (and `dimension` for vector fields) has a default, 
 | `NumericRangeQuery(field, min, max, numericType)` | Numeric range (integer or float) |
 | `GeoDistanceQuery::withinRadius(field, lat, lon, distanceKm)` | Geo-distance radius search |
 | `GeoBoundingBoxQuery::withinBoundingBox(field, minLat, minLon, maxLat, maxLon)` | Geo bounding box search |
+| `GeoPolygonQuery::withinPolygon(field, exterior, holes)` | Geo polygon search, with holes; vertices `['lat' => ..., 'lon' => ...]` |
+| `GeoPolylineQuery::withinDistance(field, vertices, distanceM)` | Geo distance-to-polyline search |
 | `BooleanQuery` | Compound boolean logic (must/should/mustNot) |
 | `SpanQuery::near(field, terms, slop, ordered)` | Proximity / ordered span match |
 | `VectorQuery(field, vector)` | Pre-computed vector similarity |

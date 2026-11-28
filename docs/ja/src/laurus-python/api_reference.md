@@ -466,6 +466,68 @@ GeoBoundingBoxQuery.within_bounding_box(
 ±180° を通って `max_lon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
 ±180° のときは、もう一方の符号で保存された点にもマッチします。
 
+### GeoPolygonQuery
+
+```python
+GeoPolygonQuery.within_polygon(
+    field: str,
+    exterior: list[dict],
+    holes: list[list[dict]] | None = None,
+)
+```
+
+`Geo` フィールドへの多角形の検索で、[クエリ DSL](../concepts/query_dsl.md) の
+`geo_polygon` と同じです。外周の中にあり、どの穴の中にもない点を持つドキュメントを
+返します。外周の上の点はマッチし、穴の辺の上の点はマッチしません。どの一致も点数は
+1.0 です。
+
+頂点は、ほかのバインディングと同じく鍵付きで、鍵 `"lat"` と `"lon"` を持つ dict です。
+`(lat, lon)` の tuple は頂点として受け付けません。環は、最後の頂点が最初の頂点と違えば閉じられます。辺は 2 つの
+頂点の間の近いほう（経度の差が 180° 以下のほう）を通るので、多角形は日付変更線を
+またげます。
+
+頂点が点でない、環の異なる頂点が 3 つ未満、緯度か経度が範囲外、経度の差がちょうど
+180° の辺がある、環が極を囲む、のどれかのときは、クエリを作る時点で `ValueError` を
+送出します。
+
+```python
+q = laurus.GeoPolygonQuery.within_polygon(
+    "location",
+    [{"lat": 35.0, "lon": 139.0}, {"lat": 35.0, "lon": 140.0},
+     {"lat": 36.0, "lon": 140.0}, {"lat": 36.0, "lon": 139.0}],
+    holes=[[{"lat": 35.4, "lon": 139.4}, {"lat": 35.4, "lon": 139.6},
+            {"lat": 35.6, "lon": 139.6}, {"lat": 35.6, "lon": 139.4}]],
+)
+results = index.search(q, limit=10).results
+```
+
+### GeoPolylineQuery
+
+```python
+GeoPolylineQuery.within_distance(
+    field: str, vertices: list[dict], distance_m: float,
+)
+```
+
+`Geo` フィールドへの、折れ線からの距離の検索で、[クエリ DSL](../concepts/query_dsl.md)
+の `geo_polyline` と同じです。折れ線から `distance_m` メートル以内の点を持つドキュ
+メントを返します。距離は `GeoDistanceQuery` と同じく地表の距離（半径 6,371,000 m）
+です。各辺は 2 つの頂点の間の短いほうの大円の弧で、頂点が 1 つなら点です。点数は、
+最も近い点の距離を `d` として `1 - d / distance_m` です。
+
+頂点の書き方は `GeoPolygonQuery` と同じです。頂点が点でない、頂点がない、緯度か経度が
+範囲外、対蹠点（とそこから約 640 m 以内の点）を結ぶ辺がある、のどれかのときは、
+クエリを作る時点で `ValueError` を送出します。対蹠点を結ぶ辺には、間に頂点を置いて
+ください。
+
+```python
+q = laurus.GeoPolylineQuery.within_distance(
+    "location",
+    [{"lat": 35.68, "lon": 139.76}, {"lat": 35.71, "lon": 139.81}],
+    1000.0,
+)
+```
+
 ### Geo3dDistanceQuery
 
 ```python
@@ -507,6 +569,33 @@ Geo3dNearestQuery.k_nearest(
 3D ECEF 座標フィールドへの k 最近傍検索。`(x, y, z)` から最も近い `k` 件のドキュ
 メントを返します。`initial_radius_m` / `max_radius_m` は反復拡張サーチの探索コーン
 を調整します。
+
+### Geo3dPolylineQuery
+
+```python
+Geo3dPolylineQuery.within_distance(
+    field: str, vertices: list[dict], distance_m: float,
+)
+```
+
+3D ECEF 座標フィールドへの、折れ線からの距離の検索で、
+[クエリ DSL](../concepts/query_dsl.md) の `geo3d_polyline` と同じです。折れ線から
+`distance_m` メートル以内の点を持つドキュメントを返します。各辺は 2 つの頂点を結ぶ
+線分で、地表の下を通る弦です（[Geo3d の概念](../concepts/geo3d.md) を参照）。頂点が
+1 つなら点です。点数は、最も近い点の距離を `d` として `1 - d / distance_m` です。
+
+頂点は、鍵 `"x"`・`"y"`・`"z"`（メートル）を持つ dict です。`(x, y, z)` の tuple は
+頂点として受け付けません。頂点が点でない、頂点がない、座標が有限でない、の
+どれかのときは、クエリを作る時点で `ValueError` を送出します。
+
+```python
+q = laurus.Geo3dPolylineQuery.within_distance(
+    "position",
+    [{"x": -3955182.0, "y": 3350553.0, "z": 3700276.0},
+     {"x": -3961178.0, "y": 3346187.0, "z": 3702490.0}],
+    500.0,
+)
+```
 
 ### BooleanQuery
 

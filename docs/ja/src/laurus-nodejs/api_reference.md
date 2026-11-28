@@ -461,6 +461,66 @@ GeoBoundingBoxQuery.withinBoundingBox(
 ±180° を通って `maxLon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
 ±180° のときは、もう一方の符号で保存された点にもマッチします。
 
+### GeoPolygonQuery
+
+```typescript
+GeoPolygonQuery.withinPolygon(
+  field: string,
+  exterior: { lat: number; lon: number }[],
+  holes?: { lat: number; lon: number }[][],
+): GeoPolygonQuery
+```
+
+`Geo` フィールドへの多角形の検索で、[クエリ DSL](../concepts/query_dsl.md) の
+`geo_polygon` と同じです。外周の中にあり、どの穴の中にもない点を持つドキュメントを
+返します。外周の上の点はマッチし、穴の辺の上の点はマッチしません。どの一致も点数は
+1.0 です。
+
+頂点は、ドキュメントの点と同じ `{ lat, lon }` のオブジェクトです。環は、最後の頂点が
+最初の頂点と違えば閉じられます。辺は 2 つの頂点の間の近いほう（経度の差が 180° 以下の
+ほう）を通るので、多角形は日付変更線をまたげます。
+
+頂点が `{ lat, lon }` のオブジェクトでない、環の異なる頂点が 3 つ未満、緯度か経度が
+範囲外、経度の差がちょうど 180° の辺がある、環が極を囲む、のどれかのときは、クエリを
+作る時点で例外を投げます。
+
+```javascript
+const q = GeoPolygonQuery.withinPolygon(
+  "location",
+  [
+    { lat: 35.0, lon: 139.0 }, { lat: 35.0, lon: 140.0 },
+    { lat: 36.0, lon: 140.0 }, { lat: 36.0, lon: 139.0 },
+  ],
+  [[
+    { lat: 35.4, lon: 139.4 }, { lat: 35.4, lon: 139.6 },
+    { lat: 35.6, lon: 139.6 }, { lat: 35.6, lon: 139.4 },
+  ]],
+);
+const req = new SearchRequest({ limit: 10 });
+req.setLexicalGeoPolygon(q);
+const { results } = await index.searchWithRequest(req);
+```
+
+### GeoPolylineQuery
+
+```typescript
+GeoPolylineQuery.withinDistance(
+  field: string,
+  vertices: { lat: number; lon: number }[],
+  distanceM: number,
+): GeoPolylineQuery
+```
+
+`Geo` フィールドへの、折れ線からの距離の検索で、[クエリ DSL](../concepts/query_dsl.md)
+の `geo_polyline` と同じです。折れ線から `distanceM` メートル以内の点を持つドキュメントを
+返します。距離は `GeoDistanceQuery` と同じく地表の距離（半径 6,371,000 m）です。各辺は
+2 つの頂点の間の短いほうの大円の弧で、頂点が 1 つなら点です。点数は、最も近い点の距離を
+`d` として `1 - d / distanceM` です。
+
+頂点が `{ lat, lon }` のオブジェクトでない、頂点がない、緯度か経度が範囲外、対蹠点
+（とそこから約 640 m 以内の点）を結ぶ辺がある、のどれかのときは、クエリを作る時点で
+例外を投げます。対蹠点を結ぶ辺には、間に頂点を置いてください。
+
 ### Geo3dDistanceQuery
 
 ```typescript
@@ -502,6 +562,26 @@ Geo3dNearestQuery.kNearest(
 3D ECEF 座標フィールドへの k 最近傍検索。`initialRadiusM` / `maxRadiusM` は
 反復拡張サーチの探索コーンを調整します。
 
+### Geo3dPolylineQuery
+
+```typescript
+Geo3dPolylineQuery.withinDistance(
+  field: string,
+  vertices: { x: number; y: number; z: number }[],
+  distanceM: number,
+): Geo3dPolylineQuery
+```
+
+3D ECEF 座標フィールドへの、折れ線からの距離の検索で、
+[クエリ DSL](../concepts/query_dsl.md) の `geo3d_polyline` と同じです。折れ線から
+`distanceM` メートル以内の点を持つドキュメントを返します。各辺は 2 つの頂点を結ぶ線分で、
+地表の下を通る弦です（[Geo3d の概念](../concepts/geo3d.md) を参照）。頂点が 1 つなら点
+です。点数は、最も近い点の距離を `d` として `1 - d / distanceM` です。
+
+頂点は、ドキュメントの点と同じ `{ x, y, z }`（メートル）のオブジェクトです。頂点が
+`{ x, y, z }` のオブジェクトでない、頂点がない、座標が有限でない、のどれかのときは、
+クエリを作る時点で例外を投げます。
+
 ### BooleanQuery
 
 ```typescript
@@ -509,8 +589,8 @@ class BooleanQuery {
   constructor();
   // 各クエリタイプ X について（X は次のいずれか）:
   //   { Term, Phrase, Fuzzy, Wildcard, NumericRange, DateTimeRange,
-  //     GeoDistance, GeoBoundingBox,
-  //     Geo3dDistance, Geo3dBoundingBox, Geo3dNearest,
+  //     GeoDistance, GeoBoundingBox, GeoPolygon, GeoPolyline,
+  //     Geo3dDistance, Geo3dBoundingBox, Geo3dNearest, Geo3dPolyline,
   //     Boolean, Span }
   mustX(query: X): void;
   shouldX(query: X): void;
@@ -523,8 +603,8 @@ MUST / SHOULD / MUST_NOT 句による複合ブーリアンクエリ。各句は�
 `mustTerm(new TermQuery("body", "rust"))` や
 `shouldGeo3dNearest(Geo3dNearestQuery.kNearest(...))`。
 
-Node.js バインディングは多態 `must(query)` ではなく 39 個の per-type メソッド
-（13 クエリタイプ × 3 極性）を公開しています。これは `js_name` を上書きした
+Node.js バインディングは多態 `must(query)` ではなく 48 個の per-type メソッド
+（16 クエリタイプ × 3 極性）を公開しています。これは `js_name` を上書きした
 クラスに対する `napi-derive` の `Either<&T, ...>` 引数バリデーションの制限を
 回避するためです。
 
@@ -626,15 +706,16 @@ per-type セッターで設定します。`BooleanQuery` 同様、`napi-derive` 
 ### Lexical セッター（per-type）
 
 `X` を `{ Term, Phrase, Fuzzy, Wildcard, NumericRange, DateTimeRange,
-GeoDistance, GeoBoundingBox, Geo3dDistance, Geo3dBoundingBox, Geo3dNearest,
-Boolean, Span }` の各クエリタイプとして、以下のメソッドが公開されています:
+GeoDistance, GeoBoundingBox, GeoPolygon, GeoPolyline, Geo3dDistance,
+Geo3dBoundingBox, Geo3dNearest, Geo3dPolyline, Boolean, Span }` の各クエリタイプ
+として、以下のメソッドが公開されています:
 
 | メソッド | 説明 |
 | :--- | :--- |
 | `setLexicalX(query: X)` | 明示的なハイブリッドリクエストの Lexical コンポーネントを設定。 |
 | `setFilterX(query: X)` | スコアリング後のフィルタコンポーネントを設定。 |
 
-合計 26 個の per-type セッター（13 lexical + 13 filter）に加え、上記の DSL /
+合計 32 個の per-type セッター（16 lexical + 16 filter）に加え、上記の DSL /
 ベクトル / フュージョンセッターが利用可能です。例:
 `setLexicalNumericRange(q)` / `setFilterNumericRange(q)`、
 `setLexicalDateTimeRange(q)` / `setFilterDateTimeRange(q)`。

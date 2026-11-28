@@ -350,6 +350,58 @@ console.log(response.totalHits);      // { relation: 'eq', value: 5 }
 console.log((await index.search("body:rust", 2)).totalHits); // undefined
 ```
 
+#### `searchGeoPolygon(field, exterior, holes?, limit?, offset?)`
+
+Polygon search over a `Geo` field, as `geo_polygon` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point inside
+the exterior ring and outside every hole: a point on the exterior is inside, a
+point on the edge of a hole is outside. Every hit scores 1.0.
+
+A vertex is a `{ lat, lon }` object, as a point in a document is written. A ring
+is closed if its last vertex is not its first. An edge takes the shorter way
+between its two vertices (their longitudes differ by 180° or less), so a polygon
+may cross the antimeridian. Rejects if a vertex is not a `{ lat, lon }` object, a
+ring has fewer than 3 distinct vertices, a latitude or longitude is out of
+range, an edge spans exactly 180° of longitude, or a ring goes around a pole.
+
+- **Parameters:**
+  - `field` (string) -- Geo field name.
+  - `exterior` (`{ lat, lon }[]`) -- The exterior ring.
+  - `holes` (`{ lat, lon }[][]`, optional) -- Rings like `exterior`; `null` or
+    `undefined` for none.
+  - `limit`, `offset` (number, optional)
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
+
+```javascript
+const exterior = [
+  { lat: 35.0, lon: 139.0 }, { lat: 35.0, lon: 140.0 },
+  { lat: 36.0, lon: 140.0 }, { lat: 36.0, lon: 139.0 },
+];
+const hole = [
+  { lat: 35.4, lon: 139.4 }, { lat: 35.4, lon: 139.6 },
+  { lat: 35.6, lon: 139.6 }, { lat: 35.6, lon: 139.4 },
+];
+const { results } = await index.searchGeoPolygon("location", exterior, [hole], 10);
+```
+
+#### `searchGeoPolyline(field, vertices, distanceM, limit?, offset?)`
+
+Distance-to-polyline search over a `Geo` field, as `geo_polyline` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point within
+`distanceM` metres of the polyline, along the surface (radius 6,371,000 m, as
+`geo_distance`). Each edge is the shorter great-circle arc between its two
+vertices; one vertex is a point. A hit scores `1 - d / distanceM` by its
+closest point. Rejects if a vertex is not a `{ lat, lon }` object, there is no
+vertex, a latitude or longitude is out of range, or an edge joins two antipodal
+points (or points within about 640 m of them); add a vertex between them.
+
+- **Parameters:**
+  - `field` (string) -- Geo field name.
+  - `vertices` (`{ lat, lon }[]`) -- The polyline.
+  - `distanceM` (number) -- Maximum distance from the polyline (metres).
+  - `limit`, `offset` (number, optional)
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
+
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
 
 Sphere search over a 3D ECEF point field. Returns documents whose `(x, y, z)`
@@ -385,6 +437,23 @@ documents closest to `(x, y, z)`. The optional `initialRadiusM` and
   - `k` (number) -- Number of nearest neighbours to return.
   - `limit`, `offset` (number, optional)
   - `initialRadiusM`, `maxRadiusM` (number, optional)
+- **Returns:** `Promise<SearchResponse>`, without `totalHits`
+
+#### `searchGeo3dPolyline(field, vertices, distanceM, limit?, offset?)`
+
+Distance-to-polyline search over a 3D ECEF point field, as `geo3d_polyline` in
+the [query DSL](../concepts/query_dsl.md). Returns documents whose point is
+within `distanceM` metres of the polyline. Each edge is the straight segment
+between its two vertices, a chord below the surface (see
+[Geo3d concepts](../concepts/geo3d.md)); one vertex is a point. A hit scores
+`1 - d / distanceM` by its closest point. Rejects if a vertex is not an
+`{ x, y, z }` object, there is no vertex, or a coordinate is not finite.
+
+- **Parameters:**
+  - `field` (string) -- Geo3d field name.
+  - `vertices` (`{ x, y, z }[]`) -- The polyline, in ECEF metres.
+  - `distanceM` (number) -- Maximum distance from the polyline (metres).
+  - `limit`, `offset` (number, optional)
 - **Returns:** `Promise<SearchResponse>`, without `totalHits`
 
 #### `stats()`
@@ -610,11 +679,14 @@ predicate (Lucene-style "any match"), scoring the document by its closest
 point. See [Geo3d concepts](../concepts/geo3d.md) for ECEF theory, and
 `docValues` above.
 
-The WASM binding does not expose `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery`
-/ `Geo3dNearestQuery` as JS classes (wasm-bindgen cannot expose `dyn Query`
-trait objects). Instead, use the `Index.searchGeo3dDistance` /
-`Index.searchGeo3dBoundingBox` / `Index.searchGeo3dNearest` methods documented
-above.
+The WASM binding does not expose `GeoPolygonQuery` / `GeoPolylineQuery` /
+`Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` / `Geo3dNearestQuery` /
+`Geo3dPolylineQuery` as JS classes (wasm-bindgen cannot expose `dyn Query`
+trait objects). Instead, use the `Index.searchGeoPolygon` /
+`Index.searchGeoPolyline` / `Index.searchGeo3dDistance` /
+`Index.searchGeo3dBoundingBox` / `Index.searchGeo3dNearest` /
+`Index.searchGeo3dPolyline` methods documented above, or the query DSL to
+combine them with other clauses.
 
 #### `addBytesField(name, stored?, multiValued?)`
 

@@ -425,6 +425,71 @@ With `$minLon > $maxLon` the box crosses the antimeridian (±180°): it runs eas
 from `$minLon` through ±180° to `$maxLon`, as in GeoJSON (RFC 7946). An edge on
 exactly ±180° also matches points stored with the other sign.
 
+### GeoPolygonQuery
+
+```php
+\Laurus\GeoPolygonQuery::withinPolygon(
+    string $field,
+    array $exterior,
+    ?array $holes = null,
+): GeoPolygonQuery
+```
+
+Polygon search over a `Geo` field, as `geo_polygon` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point inside
+the exterior ring and outside every hole: a point on the exterior is inside, a
+point on the edge of a hole is outside. Every hit scores 1.0.
+
+A vertex is an array with the keys `'lat'` and `'lon'` (floats), as a point in a
+document is written; `$holes` is an array of rings. A ring is closed if its
+last vertex is not its first. An edge takes the shorter way between its two
+vertices (their longitudes differ by 180° or less), so a polygon may cross the
+antimeridian.
+
+Throws `\ValueError` when the query is built if a ring has fewer than 3
+distinct vertices, a latitude or longitude is out of range, an edge spans
+exactly 180° of longitude, a ring goes around a pole, or a vertex has no
+`'lat'` or `'lon'`; `\TypeError` if a vertex is not an array or a coordinate is
+not a float.
+
+```php
+$q = \Laurus\GeoPolygonQuery::withinPolygon(
+    "location",
+    [
+        ['lat' => 35.0, 'lon' => 139.0], ['lat' => 35.0, 'lon' => 140.0],
+        ['lat' => 36.0, 'lon' => 140.0], ['lat' => 36.0, 'lon' => 139.0],
+    ],
+    [[
+        ['lat' => 35.4, 'lon' => 139.4], ['lat' => 35.4, 'lon' => 139.6],
+        ['lat' => 35.6, 'lon' => 139.6], ['lat' => 35.6, 'lon' => 139.4],
+    ]],
+);
+$results = $index->search($q, 10)->getResults();
+```
+
+### GeoPolylineQuery
+
+```php
+\Laurus\GeoPolylineQuery::withinDistance(
+    string $field,
+    array $vertices,
+    float $distanceM,
+): GeoPolylineQuery
+```
+
+Distance-to-polyline search over a `Geo` field, as `geo_polyline` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point within
+`$distanceM` metres of the polyline, along the surface (radius 6,371,000 m, as
+`GeoDistanceQuery`). Each edge is the shorter great-circle arc between its two
+vertices; one vertex is a point. A hit scores `1 - d / $distanceM` by its
+closest point.
+
+Vertices are given as for `GeoPolygonQuery`. Throws `\ValueError` when the
+query is built if there is no vertex, a latitude or longitude is out of range,
+an edge joins two antipodal points (or points within about 640 m of them; add
+a vertex between them), or a vertex has no `'lat'` or `'lon'`; `\TypeError` if
+a vertex is not an array or a coordinate is not a float.
+
 ### Geo3dDistanceQuery
 
 ```php
@@ -467,6 +532,29 @@ k-nearest-neighbour search over a 3D ECEF point field. The optional
 `$initialRadiusM` and `$maxRadiusM` parameters tune the iterative-expansion
 search cone. `$k` must be between 0 and 4294967295; `kNearest` throws
 `\ValueError` otherwise (Issue #1590).
+
+### Geo3dPolylineQuery
+
+```php
+\Laurus\Geo3dPolylineQuery::withinDistance(
+    string $field,
+    array $vertices,
+    float $distanceM,
+): Geo3dPolylineQuery
+```
+
+Distance-to-polyline search over a 3D ECEF point field, as `geo3d_polyline` in
+the [query DSL](../concepts/query_dsl.md). Returns documents whose point is
+within `$distanceM` metres of the polyline. Each edge is the straight segment
+between its two vertices, a chord below the surface (see
+[Geo3d concepts](../concepts/geo3d.md)); one vertex is a point. A hit scores
+`1 - d / $distanceM` by its closest point.
+
+A vertex is an array with the keys `'x'`, `'y'` and `'z'` (floats, metres), as a
+point in a document is written. Throws `\ValueError` when the query is built if
+there is no vertex, a coordinate is not finite, or a vertex has no `'x'`, `'y'`
+or `'z'`; `\TypeError` if a vertex is not an array or a coordinate is not a
+float.
 
 ### BooleanQuery
 

@@ -422,6 +422,68 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 ±180° を通って `$maxLon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
 ±180° のときは、もう一方の符号で保存された点にもマッチします。
 
+### GeoPolygonQuery
+
+```php
+\Laurus\GeoPolygonQuery::withinPolygon(
+    string $field,
+    array $exterior,
+    ?array $holes = null,
+): GeoPolygonQuery
+```
+
+`Geo` フィールドへの多角形の検索で、[クエリ DSL](../concepts/query_dsl.md) の
+`geo_polygon` と同じです。外周の中にあり、どの穴の中にもない点を持つドキュメントを
+返します。外周の上の点はマッチし、穴の辺の上の点はマッチしません。どの一致も点数は
+1.0 です。
+
+頂点は、ドキュメントの点と同じく、鍵 `'lat'` と `'lon'`（float）を持つ配列です。
+`$holes` は環の配列です。環は、最後の頂点が最初の頂点と違えば閉じられます。辺は 2 つの
+頂点の間の近いほう（経度の差が 180° 以下のほう）を通るので、多角形は日付変更線を
+またげます。
+
+環の異なる頂点が 3 つ未満、緯度か経度が範囲外、経度の差がちょうど 180° の辺がある、
+環が極を囲む、頂点に `'lat'` か `'lon'` がない、のどれかのときは、クエリを作る時点で
+`\ValueError` を投げます。頂点が配列でないときと、座標が float でないときは
+`\TypeError` です。
+
+```php
+$q = \Laurus\GeoPolygonQuery::withinPolygon(
+    "location",
+    [
+        ['lat' => 35.0, 'lon' => 139.0], ['lat' => 35.0, 'lon' => 140.0],
+        ['lat' => 36.0, 'lon' => 140.0], ['lat' => 36.0, 'lon' => 139.0],
+    ],
+    [[
+        ['lat' => 35.4, 'lon' => 139.4], ['lat' => 35.4, 'lon' => 139.6],
+        ['lat' => 35.6, 'lon' => 139.6], ['lat' => 35.6, 'lon' => 139.4],
+    ]],
+);
+$results = $index->search($q, 10)->getResults();
+```
+
+### GeoPolylineQuery
+
+```php
+\Laurus\GeoPolylineQuery::withinDistance(
+    string $field,
+    array $vertices,
+    float $distanceM,
+): GeoPolylineQuery
+```
+
+`Geo` フィールドへの、折れ線からの距離の検索で、[クエリ DSL](../concepts/query_dsl.md)
+の `geo_polyline` と同じです。折れ線から `$distanceM` メートル以内の点を持つドキュメントを
+返します。距離は `GeoDistanceQuery` と同じく地表の距離（半径 6,371,000 m）です。各辺は
+2 つの頂点の間の短いほうの大円の弧で、頂点が 1 つなら点です。点数は、最も近い点の距離を
+`d` として `1 - d / $distanceM` です。
+
+頂点の書き方は `GeoPolygonQuery` と同じです。頂点がない、緯度か経度が範囲外、対蹠点
+（とそこから約 640 m 以内の点）を結ぶ辺がある、頂点に `'lat'` か `'lon'` がない、の
+どれかのときは、クエリを作る時点で `\ValueError` を投げます（対蹠点を結ぶ辺には、間に
+頂点を置いてください）。頂点が配列でないときと、座標が float でないときは
+`\TypeError` です。
+
 ### Geo3dDistanceQuery
 
 ```php
@@ -464,6 +526,27 @@ new \Laurus\DateTimeRangeQuery(string $field, ?string $min = null, ?string $max 
 （オプション）で反復拡張サーチの探索コーンを調整できます。`$k` は 0 以上
 4294967295 以下でなければならず、それ以外では `kNearest` が `\ValueError` を
 投げます（Issue #1590）。
+
+### Geo3dPolylineQuery
+
+```php
+\Laurus\Geo3dPolylineQuery::withinDistance(
+    string $field,
+    array $vertices,
+    float $distanceM,
+): Geo3dPolylineQuery
+```
+
+3D ECEF 座標フィールドへの、折れ線からの距離の検索で、
+[クエリ DSL](../concepts/query_dsl.md) の `geo3d_polyline` と同じです。折れ線から
+`$distanceM` メートル以内の点を持つドキュメントを返します。各辺は 2 つの頂点を結ぶ線分で、
+地表の下を通る弦です（[Geo3d の概念](../concepts/geo3d.md) を参照）。頂点が 1 つなら点
+です。点数は、最も近い点の距離を `d` として `1 - d / $distanceM` です。
+
+頂点は、ドキュメントの点と同じく、鍵 `'x'`・`'y'`・`'z'`（float、メートル）を持つ
+配列です。頂点がない、座標が有限でない、頂点に `'x'`・`'y'`・`'z'` のどれかがない、の
+どれかのときは、クエリを作る時点で `\ValueError` を投げます。頂点が配列でないときと、
+座標が float でないときは `\TypeError` です。
 
 ### BooleanQuery
 

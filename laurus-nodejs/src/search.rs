@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use crate::convert::{data_value_to_json, optional_unsigned_param, track_total_hits_param};
 use crate::query::{
     JsBooleanQuery, JsDateTimeRangeQuery, JsFuzzyQuery, JsGeo3dBoundingBoxQuery,
-    JsGeo3dDistanceQuery, JsGeo3dNearestQuery, JsGeoBoundingBoxQuery, JsGeoDistanceQuery,
-    JsNumericRangeQuery, JsPhraseQuery, JsQuery, JsSpanQuery, JsTermQuery, JsVectorQuery,
-    JsVectorQueryInner, JsVectorTextQuery, JsWildcardQuery, extract_lexical_query,
-    query_to_lexical_search_query, vector_query_to_search_query,
+    JsGeo3dDistanceQuery, JsGeo3dNearestQuery, JsGeo3dPolylineQuery, JsGeoBoundingBoxQuery,
+    JsGeoDistanceQuery, JsGeoPolygonQuery, JsGeoPolylineQuery, JsNumericRangeQuery, JsPhraseQuery,
+    JsQuery, JsSpanQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery,
+    JsWildcardQuery, extract_lexical_query, query_to_lexical_search_query,
+    vector_query_to_search_query,
 };
 use laurus::vector::Vector;
 use laurus::{
@@ -626,6 +627,24 @@ impl JsSearchRequest {
         self.lexical_query = Some(JsQuery::Geo3dNearestQuery(query.clone()));
     }
 
+    /// Set a [`JsGeoPolygonQuery`] as the lexical clause.
+    #[napi]
+    pub fn set_lexical_geo_polygon(&mut self, query: &JsGeoPolygonQuery) {
+        self.lexical_query = Some(JsQuery::GeoPolygonQuery(query.clone()));
+    }
+
+    /// Set a [`JsGeoPolylineQuery`] as the lexical clause.
+    #[napi]
+    pub fn set_lexical_geo_polyline(&mut self, query: &JsGeoPolylineQuery) {
+        self.lexical_query = Some(JsQuery::GeoPolylineQuery(query.clone()));
+    }
+
+    /// Set a [`JsGeo3dPolylineQuery`] as the lexical clause.
+    #[napi(js_name = "setLexicalGeo3dPolyline")]
+    pub fn set_lexical_geo3d_polyline(&mut self, query: &JsGeo3dPolylineQuery) {
+        self.lexical_query = Some(JsQuery::Geo3dPolylineQuery(query.clone()));
+    }
+
     /// Set a [`JsBooleanQuery`] as the lexical clause.
     #[napi]
     pub fn set_lexical_boolean(&mut self, query: &JsBooleanQuery) {
@@ -704,6 +723,24 @@ impl JsSearchRequest {
     #[napi(js_name = "setFilterGeo3dNearest")]
     pub fn set_filter_geo3d_nearest(&mut self, query: &JsGeo3dNearestQuery) {
         self.filter_query = Some(JsQuery::Geo3dNearestQuery(query.clone()));
+    }
+
+    /// Set a [`JsGeoPolygonQuery`] as the filter clause.
+    #[napi]
+    pub fn set_filter_geo_polygon(&mut self, query: &JsGeoPolygonQuery) {
+        self.filter_query = Some(JsQuery::GeoPolygonQuery(query.clone()));
+    }
+
+    /// Set a [`JsGeoPolylineQuery`] as the filter clause.
+    #[napi]
+    pub fn set_filter_geo_polyline(&mut self, query: &JsGeoPolylineQuery) {
+        self.filter_query = Some(JsQuery::GeoPolylineQuery(query.clone()));
+    }
+
+    /// Set a [`JsGeo3dPolylineQuery`] as the filter clause.
+    #[napi(js_name = "setFilterGeo3dPolyline")]
+    pub fn set_filter_geo3d_polyline(&mut self, query: &JsGeo3dPolylineQuery) {
+        self.filter_query = Some(JsQuery::Geo3dPolylineQuery(query.clone()));
     }
 
     /// Set a [`JsBooleanQuery`] as the filter clause.

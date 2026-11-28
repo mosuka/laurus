@@ -11,14 +11,16 @@ use ext_php_rs::zend::ce;
 use laurus::{DataValue, Document};
 
 /// A `\TypeError` for a document's value or key of the wrong type, such as
-/// an object or an integer key (Issue #1630).
-fn type_error(message: impl Into<String>) -> PhpException {
+/// an object or an integer key (Issue #1630), and for a vertex of a polygon
+/// or a polyline that is not an array (Issue #1596).
+pub(crate) fn type_error(message: impl Into<String>) -> PhpException {
     PhpException::new(message.into(), 0, ce::type_error())
 }
 
 /// A `\ValueError` for a document's value of the right type but a wrong
-/// value, such as a geo point out of range (Issue #1630).
-fn value_error(message: impl Into<String>) -> PhpException {
+/// value, such as a geo point out of range (Issue #1630), and for a vertex
+/// without one of its keys (Issue #1596).
+pub(crate) fn value_error(message: impl Into<String>) -> PhpException {
     PhpException::new(message.into(), 0, ce::value_error())
 }
 

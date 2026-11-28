@@ -22,9 +22,9 @@ use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use query::{
     PyBooleanQuery, PyDateTimeRangeQuery, PyFuzzyQuery, PyGeo3dBoundingBoxQuery,
-    PyGeo3dDistanceQuery, PyGeo3dNearestQuery, PyGeoBoundingBoxQuery, PyGeoDistanceQuery,
-    PyNumericRangeQuery, PyPhraseQuery, PySpanQuery, PyTermQuery, PyVectorQuery, PyVectorTextQuery,
-    PyWildcardQuery,
+    PyGeo3dDistanceQuery, PyGeo3dNearestQuery, PyGeo3dPolylineQuery, PyGeoBoundingBoxQuery,
+    PyGeoDistanceQuery, PyGeoPolygonQuery, PyGeoPolylineQuery, PyNumericRangeQuery, PyPhraseQuery,
+    PySpanQuery, PyTermQuery, PyVectorQuery, PyVectorTextQuery, PyWildcardQuery,
 };
 use schema::PySchema;
 use search::{
@@ -87,9 +87,12 @@ fn laurus(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDateTimeRangeQuery>()?;
     m.add_class::<PyGeoDistanceQuery>()?;
     m.add_class::<PyGeoBoundingBoxQuery>()?;
+    m.add_class::<PyGeoPolygonQuery>()?;
+    m.add_class::<PyGeoPolylineQuery>()?;
     m.add_class::<PyGeo3dDistanceQuery>()?;
     m.add_class::<PyGeo3dBoundingBoxQuery>()?;
     m.add_class::<PyGeo3dNearestQuery>()?;
+    m.add_class::<PyGeo3dPolylineQuery>()?;
     m.add_class::<PyBooleanQuery>()?;
     m.add_class::<PySpanQuery>()?;
 

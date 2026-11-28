@@ -173,6 +173,8 @@ if (Laurus\peek_commit_generation($path) !== $before) {
 | `NumericRangeQuery(field, min, max, numericType)` | 数値範囲検索（integer または float） |
 | `GeoDistanceQuery::withinRadius(field, lat, lon, distanceKm)` | 地理的距離検索（半径指定） |
 | `GeoBoundingBoxQuery::withinBoundingBox(field, minLat, minLon, maxLat, maxLon)` | 地理的バウンディングボックス検索 |
+| `GeoPolygonQuery::withinPolygon(field, exterior, holes)` | 地理的な多角形の検索（穴を持てる）。頂点は `['lat' => ..., 'lon' => ...]` |
+| `GeoPolylineQuery::withinDistance(field, vertices, distanceM)` | 地理的な折れ線からの距離の検索 |
 | `BooleanQuery` | 複合ブール検索（must/should/mustNot） |
 | `SpanQuery::near(field, terms, slop, ordered)` | 近接検索（スパン） |
 | `VectorQuery(field, vector)` | 事前計算済みベクトルによる類似度検索 |

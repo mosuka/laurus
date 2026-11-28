@@ -12,18 +12,22 @@ use std::cell::RefCell;
 use ext_php_rs::convert::FromZval;
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendClassObject, Zval};
+use ext_php_rs::types::{ZendClassObject, ZendHashTable, Zval};
 use ext_php_rs::zend::ce;
 use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, NumericType,
-    PhraseQuery, TermQuery, WildcardQuery,
+    Geo3dNearestQuery, Geo3dPolyline, Geo3dPolylineQuery, GeoBoundingBoxQuery, GeoDistanceQuery,
+    GeoPolygonQuery, GeoPolylineQuery, NumericRangeQuery, NumericType, PhraseQuery, TermQuery,
+    WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
 use laurus::{DataValue, LexicalSearchQuery, QueryPayload, VectorSearchQuery};
+
+use crate::convert::{type_error, value_error};
+use crate::errors::laurus_err;
 
 // ---------------------------------------------------------------------------
 // Helper: extract a lexical query from any PHP query object
@@ -98,6 +102,18 @@ pub fn extract_lexical_query(zv: &Zval) -> PhpResult<Box<dyn laurus::lexical::Qu
     if let Some(obj) = <&ZendClassObject<PhpGeo3dNearestQuery>>::from_zval(zv) {
         let q: &PhpGeo3dNearestQuery = obj;
         return Ok(q.build());
+    }
+    if let Some(obj) = <&ZendClassObject<PhpGeoPolygonQuery>>::from_zval(zv) {
+        let q: &PhpGeoPolygonQuery = obj;
+        return Ok(Box::new(q.query.clone()));
+    }
+    if let Some(obj) = <&ZendClassObject<PhpGeoPolylineQuery>>::from_zval(zv) {
+        let q: &PhpGeoPolylineQuery = obj;
+        return Ok(Box::new(q.query.clone()));
+    }
+    if let Some(obj) = <&ZendClassObject<PhpGeo3dPolylineQuery>>::from_zval(zv) {
+        let q: &PhpGeo3dPolylineQuery = obj;
+        return Ok(Box::new(q.query.clone()));
     }
     if let Some(obj) = <&ZendClassObject<PhpBooleanQuery>>::from_zval(zv) {
         let q: &PhpBooleanQuery = obj;
@@ -926,6 +942,249 @@ impl PhpGeo3dNearestQuery {
             q = q.with_max_radius(r);
         }
         Box::new(q)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vertices of a polygon or a polyline (Issue #1596)
+// ---------------------------------------------------------------------------
+
+/// The coordinates `keys` of each vertex of `vertices`, an array with those
+/// keys as a point in a document is written. Other keys are not read.
+///
+/// `what` names the list in the errors ("the exterior", "hole 0", "the
+/// polyline"). A vertex that is not an array, or a coordinate that is not a
+/// float, throws `\TypeError`; a missing key throws `\ValueError`, as for a
+/// point in a document.
+fn vertex_coordinates<const N: usize>(
+    vertices: &ZendHashTable,
+    what: &str,
+    keys: [&str; N],
+) -> PhpResult<Vec<[f64; N]>> {
+    let quoted = || {
+        keys.iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    vertices
+        .values()
+        .enumerate()
+        .map(|(i, vertex)| {
+            let point = vertex.array().ok_or_else(|| {
+                type_error(format!(
+                    "vertex {i} of {what} must be an array with the keys {}",
+                    quoted()
+                ))
+            })?;
+            let mut coordinates = [0.0; N];
+            for (coordinate, key) in coordinates.iter_mut().zip(keys) {
+                let value = point.get(key).ok_or_else(|| {
+                    value_error(format!(
+                        "vertex {i} of {what} has no '{key}': a vertex is an array with the keys {}",
+                        quoted()
+                    ))
+                })?;
+                *coordinate = f64::from_zval(value).ok_or_else(|| {
+                    type_error(format!("vertex {i} of {what}: '{key}' must be a float"))
+                })?;
+            }
+            Ok(coordinates)
+        })
+        .collect()
+}
+
+/// The `(lat, lon)` pairs of `vertices`.
+fn lat_lon_vertices(vertices: &ZendHashTable, what: &str) -> PhpResult<Vec<(f64, f64)>> {
+    Ok(vertex_coordinates(vertices, what, ["lat", "lon"])?
+        .into_iter()
+        .map(|[lat, lon]| (lat, lon))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolygonQuery
+// ---------------------------------------------------------------------------
+
+/// Polygon query over a `Geo` field (`Laurus\GeoPolygonQuery`).
+///
+/// Matches the documents with a point inside a polygon, with holes, as
+/// `geo_polygon` in the DSL does. Every hit scores 1.0. Construct via the
+/// `withinPolygon` static factory.
+#[php_class]
+#[php(name = "Laurus\\GeoPolygonQuery")]
+pub struct PhpGeoPolygonQuery {
+    pub query: GeoPolygonQuery,
+}
+
+#[php_impl]
+impl PhpGeoPolygonQuery {
+    /// Create a polygon query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo field name.
+    /// * `exterior` - The exterior ring: arrays with the keys `'lat'` and
+    ///   `'lon'`.
+    /// * `holes` - Rings like `exterior` (optional).
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if a ring has fewer than 3 distinct vertices, a
+    /// latitude or longitude is out of range, an edge spans exactly 180
+    /// degrees of longitude, a ring goes around a pole, or a vertex has no
+    /// `'lat'` or `'lon'`; `\TypeError` if a vertex is not an array or a
+    /// coordinate is not a float.
+    pub fn within_polygon(
+        field: String,
+        exterior: &ZendHashTable,
+        holes: Option<&ZendHashTable>,
+    ) -> PhpResult<Self> {
+        let exterior = lat_lon_vertices(exterior, "the exterior")?;
+        let holes: Vec<Vec<(f64, f64)>> = match holes {
+            None => Vec::new(),
+            Some(holes) => holes
+                .values()
+                .enumerate()
+                .map(|(i, hole)| {
+                    let what = format!("hole {i}");
+                    let ring = hole.array().ok_or_else(|| {
+                        type_error(format!("{what} must be an array of vertices"))
+                    })?;
+                    lat_lon_vertices(ring, &what)
+                })
+                .collect::<PhpResult<_>>()?,
+        };
+        let holes: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+        let query =
+            GeoPolygonQuery::within_polygon(field, &exterior, &holes).map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        let polygon = self.query.polygon();
+        format!(
+            "GeoPolygonQuery.withinPolygon(field='{}', exterior={} vertices, holes={})",
+            self.query.field(),
+            // The ring is kept closed: its last vertex repeats its first.
+            polygon.exterior().len() - 1,
+            polygon.holes().len()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// Distance-to-polyline query over a `Geo` field
+/// (`Laurus\GeoPolylineQuery`).
+///
+/// Matches the documents with a point within a distance of a polyline of
+/// great-circle arcs, as `geo_polyline` in the DSL does. A hit scores
+/// `1 - d / distanceM` by its closest point. Construct via the
+/// `withinDistance` static factory.
+#[php_class]
+#[php(name = "Laurus\\GeoPolylineQuery")]
+pub struct PhpGeoPolylineQuery {
+    pub query: GeoPolylineQuery,
+}
+
+#[php_impl]
+impl PhpGeoPolylineQuery {
+    /// Create a distance-to-polyline query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo field name.
+    /// * `vertices` - The polyline: arrays with the keys `'lat'` and
+    ///   `'lon'`. One vertex is a point.
+    /// * `distanceM` - Maximum distance from the polyline in meters.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if there is no vertex, a latitude or longitude
+    /// is out of range, an edge joins two antipodal points, or a vertex has
+    /// no `'lat'` or `'lon'`; `\TypeError` if a vertex is not an array or a
+    /// coordinate is not a float.
+    pub fn within_distance(
+        field: String,
+        vertices: &ZendHashTable,
+        distanceM: f64,
+    ) -> PhpResult<Self> {
+        let vertices = lat_lon_vertices(vertices, "the polyline")?;
+        let query =
+            GeoPolylineQuery::within_distance(field, &vertices, distanceM).map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        format!(
+            "GeoPolylineQuery.withinDistance(field='{}', vertices={}, distanceM={})",
+            self.query.field(),
+            self.query.polyline().vertices().len(),
+            self.query.distance_m()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geo3dPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// 3D ECEF distance-to-polyline query (`Laurus\Geo3dPolylineQuery`).
+///
+/// Matches the documents whose point lies within `distanceM` meters of a
+/// polyline of straight segments, as `geo3d_polyline` in the DSL does. A
+/// hit scores `1 - d / distanceM` by its closest point. Construct via the
+/// `withinDistance` static factory.
+#[php_class]
+#[php(name = "Laurus\\Geo3dPolylineQuery")]
+pub struct PhpGeo3dPolylineQuery {
+    pub query: Geo3dPolylineQuery,
+}
+
+#[php_impl]
+impl PhpGeo3dPolylineQuery {
+    /// Create a 3D distance-to-polyline query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo3d field name.
+    /// * `vertices` - The polyline: arrays with the keys `'x'`, `'y'` and
+    ///   `'z'` in ECEF meters. One vertex is a point.
+    /// * `distanceM` - Maximum distance from the polyline in meters.
+    ///
+    /// # Errors
+    ///
+    /// Throws `\ValueError` if there is no vertex, a coordinate is not
+    /// finite, or a vertex has no `'x'`, `'y'` or `'z'`; `\TypeError` if a
+    /// vertex is not an array or a coordinate is not a float.
+    pub fn within_distance(
+        field: String,
+        vertices: &ZendHashTable,
+        distanceM: f64,
+    ) -> PhpResult<Self> {
+        let vertices = vertex_coordinates(vertices, "the polyline", ["x", "y", "z"])?
+            .into_iter()
+            .map(|[x, y, z]| GeoEcefPoint::new(x, y, z))
+            .collect();
+        let polyline = Geo3dPolyline::new(vertices).map_err(laurus_err)?;
+        Ok(Self {
+            query: Geo3dPolylineQuery::new(field, polyline, distanceM),
+        })
+    }
+
+    /// Return a string representation.
+    pub fn __to_string(&self) -> String {
+        format!(
+            "Geo3dPolylineQuery.withinDistance(field='{}', vertices={}, distanceM={})",
+            self.query.field(),
+            self.query.polyline().vertices().len(),
+            self.query.distance_m()
+        )
     }
 }
 
