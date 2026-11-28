@@ -347,6 +347,56 @@ console.log(response.totalHits);      // { relation: 'eq', value: 5 }
 console.log((await index.search("body:rust", 2)).totalHits); // undefined
 ```
 
+#### `searchGeoPolygon(field, exterior, holes?, limit?, offset?)`
+
+`Geo` フィールドへの多角形の検索で、[クエリ DSL](../concepts/query_dsl.md) の
+`geo_polygon` と同じです。外周の中にあり、どの穴の中にもない点を持つドキュメントを
+返します。外周の上の点はマッチし、穴の辺の上の点はマッチしません。どの一致も点数は
+1.0 です。
+
+頂点は、ドキュメントの点と同じ `{ lat, lon }` のオブジェクトです。環は、最後の頂点が
+最初の頂点と違えば閉じられます。辺は 2 つの頂点の間の近いほう（経度の差が 180° 以下の
+ほう）を通るので、多角形は日付変更線をまたげます。頂点が `{ lat, lon }` のオブジェクト
+でない、環の異なる頂点が 3 つ未満、緯度か経度が範囲外、経度の差がちょうど 180° の辺が
+ある、環が極を囲む、のどれかのときは reject します。
+
+- **引数:**
+  - `field` (string) -- Geo フィールド名
+  - `exterior` (`{ lat, lon }[]`) -- 外周
+  - `holes` (`{ lat, lon }[][]`, 省略可) -- `exterior` と同じ形の環。穴がなければ
+    `null` か `undefined`
+  - `limit`, `offset` (number, 省略可)
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
+
+```javascript
+const exterior = [
+  { lat: 35.0, lon: 139.0 }, { lat: 35.0, lon: 140.0 },
+  { lat: 36.0, lon: 140.0 }, { lat: 36.0, lon: 139.0 },
+];
+const hole = [
+  { lat: 35.4, lon: 139.4 }, { lat: 35.4, lon: 139.6 },
+  { lat: 35.6, lon: 139.6 }, { lat: 35.6, lon: 139.4 },
+];
+const { results } = await index.searchGeoPolygon("location", exterior, [hole], 10);
+```
+
+#### `searchGeoPolyline(field, vertices, distanceM, limit?, offset?)`
+
+`Geo` フィールドへの、折れ線からの距離の検索で、[クエリ DSL](../concepts/query_dsl.md)
+の `geo_polyline` と同じです。折れ線から `distanceM` メートル以内の点を持つドキュメントを
+返します。距離は `geo_distance` と同じく地表の距離（半径 6,371,000 m）です。各辺は 2 つの
+頂点の間の短いほうの大円の弧で、頂点が 1 つなら点です。点数は、最も近い点の距離を `d`
+として `1 - d / distanceM` です。頂点が `{ lat, lon }` のオブジェクトでない、頂点がない、
+緯度か経度が範囲外、対蹠点（とそこから約 640 m 以内の点）を結ぶ辺がある、のどれかの
+ときは reject します。対蹠点を結ぶ辺には、間に頂点を置いてください。
+
+- **引数:**
+  - `field` (string) -- Geo フィールド名
+  - `vertices` (`{ lat, lon }[]`) -- 折れ線
+  - `distanceM` (number) -- 折れ線からの最大距離（メートル）
+  - `limit`, `offset` (number, 省略可)
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
+
 #### `searchGeo3dDistance(field, x, y, z, distanceM, limit?, offset?)`
 
 3D ECEF 座標フィールドへの球距離検索。中心 `(x, y, z)` から `distanceM` メートル以内
@@ -382,6 +432,23 @@ console.log((await index.search("body:rust", 2)).totalHits); // undefined
   - `k` (number) -- 返す近傍件数
   - `limit`, `offset` (number, 省略可)
   - `initialRadiusM`, `maxRadiusM` (number, 省略可)
+- **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
+
+#### `searchGeo3dPolyline(field, vertices, distanceM, limit?, offset?)`
+
+3D ECEF 座標フィールドへの、折れ線からの距離の検索で、
+[クエリ DSL](../concepts/query_dsl.md) の `geo3d_polyline` と同じです。折れ線から
+`distanceM` メートル以内の点を持つドキュメントを返します。各辺は 2 つの頂点を結ぶ線分で、
+地表の下を通る弦です（[Geo3d の概念](../concepts/geo3d.md) を参照）。頂点が 1 つなら点
+です。点数は、最も近い点の距離を `d` として `1 - d / distanceM` です。頂点が
+`{ x, y, z }` のオブジェクトでない、頂点がない、座標が有限でない、のどれかのときは
+reject します。
+
+- **引数:**
+  - `field` (string) -- Geo3d フィールド名
+  - `vertices` (`{ x, y, z }[]`) -- 折れ線（ECEF、メートル）
+  - `distanceM` (number) -- 折れ線からの最大距離（メートル）
+  - `limit`, `offset` (number, 省略可)
 - **戻り値:** `Promise<SearchResponse>`（`totalHits` なし）
 
 #### `stats()`
@@ -604,11 +671,14 @@ term frequency を増やします）します。値は真偽値の配列とし�
 スコアはドキュメント内で最も近いポイントで決まります。詳細は
 [Geo3d の概念](../concepts/geo3d.md) を参照。`docValues` は上記を参照。
 
-WASM バインディングは `Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` /
-`Geo3dNearestQuery` を JS クラスとして公開していません（wasm-bindgen は
+WASM バインディングは `GeoPolygonQuery` / `GeoPolylineQuery` /
+`Geo3dDistanceQuery` / `Geo3dBoundingBoxQuery` / `Geo3dNearestQuery` /
+`Geo3dPolylineQuery` を JS クラスとして公開していません（wasm-bindgen は
 `dyn Query` トレイトオブジェクトを公開できないため）。代わりに上記の
+`Index.searchGeoPolygon` / `Index.searchGeoPolyline` /
 `Index.searchGeo3dDistance` / `Index.searchGeo3dBoundingBox` /
-`Index.searchGeo3dNearest` メソッドを使用してください。
+`Index.searchGeo3dNearest` / `Index.searchGeo3dPolyline` メソッドを使用して
+ください。ほかの句と組み合わせるときはクエリ DSL を使います。
 
 #### `addBytesField(name, stored?, multiValued?)`
 

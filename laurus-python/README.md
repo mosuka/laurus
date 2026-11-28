@@ -166,9 +166,12 @@ the default per-record durability.
 | `NumericRangeQuery(field, min, max)` | Numeric range (int or float) |
 | `GeoDistanceQuery.within_radius(field, lat, lon, distance_m)` | Geo-distance radius search |
 | `GeoBoundingBoxQuery.within_bounding_box(field, min_lat, min_lon, max_lat, max_lon)` | Geo bounding-box search |
+| `GeoPolygonQuery.within_polygon(field, exterior, holes=None)` | Geo polygon search, with holes; vertices `{"lat": ..., "lon": ...}` |
+| `GeoPolylineQuery.within_distance(field, vertices, distance_m)` | Geo distance-to-polyline search |
 | `Geo3dDistanceQuery.within_sphere(field, x, y, z, distance_m)` | 3D ECEF sphere search |
 | `Geo3dBoundingBoxQuery.within_box(field, min_x, min_y, min_z, max_x, max_y, max_z)` | 3D ECEF AABB search |
 | `Geo3dNearestQuery.k_nearest(field, x, y, z, k)` | 3D ECEF k-nearest neighbours |
+| `Geo3dPolylineQuery.within_distance(field, vertices, distance_m)` | 3D ECEF distance-to-polyline search; vertices `{"x": ..., "y": ..., "z": ...}` |
 | `BooleanQuery(must, should, must_not)` | Compound boolean logic |
 | `SpanNearQuery(field, [terms], slop)` | Proximity / ordered span match |
 | `VectorQuery(field, vector)` | Pre-computed vector similarity |

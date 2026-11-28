@@ -7,8 +7,9 @@ use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, NumericType,
-    PhraseQuery, TermQuery, WildcardQuery,
+    Geo3dNearestQuery, Geo3dPolyline, Geo3dPolylineQuery, GeoBoundingBoxQuery, GeoDistanceQuery,
+    GeoPolygonQuery, GeoPolylineQuery, NumericRangeQuery, NumericType, PhraseQuery, TermQuery,
+    WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -17,6 +18,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use crate::convert::{optional_unsigned_param, unsigned_param};
+use crate::errors::laurus_err;
 
 // ---------------------------------------------------------------------------
 // Helper: extract a lexical query from a JsQuery enum
@@ -52,6 +54,9 @@ pub fn extract_lexical_query(query: &JsQuery) -> Result<Box<dyn laurus::lexical:
         JsQuery::GeoBoundingBoxQuery(q) => q
             .build()
             .map_err(|e| napi::Error::from_reason(e.to_string())),
+        JsQuery::GeoPolygonQuery(q) => Ok(Box::new(q.query.clone())),
+        JsQuery::GeoPolylineQuery(q) => Ok(Box::new(q.query.clone())),
+        JsQuery::Geo3dPolylineQuery(q) => Ok(Box::new(q.query.clone())),
         JsQuery::Geo3dDistanceQuery(q) => Ok(q.build()),
         JsQuery::Geo3dBoundingBoxQuery(q) => q
             .build()
@@ -115,9 +120,12 @@ pub enum JsQuery {
     DateTimeRangeQuery(JsDateTimeRangeQuery),
     GeoDistanceQuery(JsGeoDistanceQuery),
     GeoBoundingBoxQuery(JsGeoBoundingBoxQuery),
+    GeoPolygonQuery(JsGeoPolygonQuery),
+    GeoPolylineQuery(JsGeoPolylineQuery),
     Geo3dDistanceQuery(JsGeo3dDistanceQuery),
     Geo3dBoundingBoxQuery(JsGeo3dBoundingBoxQuery),
     Geo3dNearestQuery(JsGeo3dNearestQuery),
+    Geo3dPolylineQuery(JsGeo3dPolylineQuery),
     BooleanQuery(JsBooleanQuery),
     SpanQuery(JsSpanQuery),
 }
@@ -787,6 +795,221 @@ impl JsGeo3dNearestQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Vertices of a polygon or a polyline (Issue #1596)
+// ---------------------------------------------------------------------------
+
+/// A vertex of a `Geo` polygon or polyline: `{ lat, lon }`, as a point in
+/// a document is written. Other keys are not read.
+#[napi(object)]
+pub struct JsGeoVertex {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// A vertex of a `Geo3d` polyline: `{ x, y, z }` in ECEF meters, as a
+/// point in a document is written. Other keys are not read.
+#[napi(object)]
+pub struct JsGeo3dVertex {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+/// The `(lat, lon)` pairs of `vertices`, as the core constructors take them.
+fn lat_lon_pairs(vertices: &[JsGeoVertex]) -> Vec<(f64, f64)> {
+    vertices.iter().map(|v| (v.lat, v.lon)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolygonQuery
+// ---------------------------------------------------------------------------
+
+/// Matches the documents with a point of a `Geo` field inside a polygon,
+/// with holes, as `geo_polygon` in the DSL does.
+///
+/// An edge takes the shorter way between its vertices, so a polygon may
+/// cross the antimeridian; a ring is closed if its last vertex is not its
+/// first. Every hit scores 1.0.
+///
+/// ## Example
+///
+/// ```javascript
+/// const { GeoPolygonQuery, SearchRequest } = require("laurus-nodejs");
+/// const q = GeoPolygonQuery.withinPolygon(
+///     "location",
+///     [{ lat: 35.0, lon: 139.0 }, { lat: 35.0, lon: 140.0 },
+///      { lat: 36.0, lon: 140.0 }, { lat: 36.0, lon: 139.0 }],
+///     [[{ lat: 35.4, lon: 139.4 }, { lat: 35.4, lon: 139.6 },
+///       { lat: 35.6, lon: 139.6 }, { lat: 35.6, lon: 139.4 }]],
+/// );
+/// const req = new SearchRequest({ limit: 10 });
+/// req.setLexicalGeoPolygon(q);
+/// const { results } = await index.searchWithRequest(req);
+/// ```
+#[derive(Clone)]
+#[napi(js_name = "GeoPolygonQuery")]
+pub struct JsGeoPolygonQuery {
+    pub(crate) query: GeoPolygonQuery,
+}
+
+#[napi]
+impl JsGeoPolygonQuery {
+    /// Create a polygon query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo field name.
+    /// * `exterior` - The exterior ring: `{ lat, lon }` vertices.
+    /// * `holes` - Rings like `exterior`. Optional.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if a ring has fewer than 3 distinct
+    /// vertices, a latitude or longitude is out of range, an edge spans
+    /// exactly 180 degrees of longitude, or a ring goes around a pole; and
+    /// an error if a vertex is not a `{ lat, lon }` object.
+    #[napi(factory)]
+    pub fn within_polygon(
+        field: String,
+        exterior: Vec<JsGeoVertex>,
+        holes: Option<Vec<Vec<JsGeoVertex>>>,
+    ) -> Result<Self> {
+        let holes: Vec<Vec<(f64, f64)>> = holes
+            .unwrap_or_default()
+            .iter()
+            .map(|hole| lat_lon_pairs(hole))
+            .collect();
+        let holes: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+        let query = GeoPolygonQuery::within_polygon(field, &lat_lon_pairs(&exterior), &holes)
+            .map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// Matches the documents with a point of a `Geo` field within a distance of
+/// a polyline, as `geo_polyline` in the DSL does.
+///
+/// Each edge is the shorter great-circle arc between its vertices, and the
+/// distance is along the surface to the closest point of the polyline.
+/// A hit scores `1 - d / distanceM` by its closest point.
+///
+/// ## Example
+///
+/// ```javascript
+/// const { GeoPolylineQuery, SearchRequest } = require("laurus-nodejs");
+/// const q = GeoPolylineQuery.withinDistance(
+///     "location",
+///     [{ lat: 35.68, lon: 139.76 }, { lat: 35.71, lon: 139.81 }],
+///     1000.0,
+/// );
+/// const req = new SearchRequest({ limit: 10 });
+/// req.setLexicalGeoPolyline(q);
+/// const { results } = await index.searchWithRequest(req);
+/// ```
+#[derive(Clone)]
+#[napi(js_name = "GeoPolylineQuery")]
+pub struct JsGeoPolylineQuery {
+    pub(crate) query: GeoPolylineQuery,
+}
+
+#[napi]
+impl JsGeoPolylineQuery {
+    /// Create a distance-to-polyline query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo field name.
+    /// * `vertices` - The polyline: `{ lat, lon }` vertices. One vertex is
+    ///   a point.
+    /// * `distance_m` - Maximum distance from the polyline in meters.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if there is no vertex, a latitude or
+    /// longitude is out of range, or an edge joins two antipodal points;
+    /// and an error if a vertex is not a `{ lat, lon }` object.
+    #[napi(factory)]
+    pub fn within_distance(
+        field: String,
+        vertices: Vec<JsGeoVertex>,
+        distance_m: f64,
+    ) -> Result<Self> {
+        let query = GeoPolylineQuery::within_distance(field, &lat_lon_pairs(&vertices), distance_m)
+            .map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geo3dPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// 3D ECEF distance-to-polyline query: matches the documents whose stored
+/// `{ x, y, z }` point lies within `distanceM` meters of a polyline, as
+/// `geo3d_polyline` in the DSL does.
+///
+/// Each edge is the straight segment between its vertices. A hit scores
+/// `1 - d / distanceM` by its closest point.
+///
+/// ## Example
+///
+/// ```javascript
+/// const { Geo3dPolylineQuery, SearchRequest } = require("laurus-nodejs");
+/// const q = Geo3dPolylineQuery.withinDistance(
+///     "position",
+///     [{ x: -3955182.0, y: 3350553.0, z: 3700276.0 },
+///      { x: -3961178.0, y: 3346187.0, z: 3702490.0 }],
+///     500.0,
+/// );
+/// const req = new SearchRequest({ limit: 10 });
+/// req.setLexicalGeo3dPolyline(q);
+/// const { results } = await index.searchWithRequest(req);
+/// ```
+#[derive(Clone)]
+#[napi(js_name = "Geo3dPolylineQuery")]
+pub struct JsGeo3dPolylineQuery {
+    pub(crate) query: Geo3dPolylineQuery,
+}
+
+#[napi]
+impl JsGeo3dPolylineQuery {
+    /// Create a 3D distance-to-polyline query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo3d field name.
+    /// * `vertices` - The polyline: `{ x, y, z }` vertices in ECEF meters.
+    ///   One vertex is a point.
+    /// * `distance_m` - Maximum distance from the polyline in meters.
+    ///
+    /// # Errors
+    ///
+    /// Throws an `InvalidArg` error if there is no vertex or a coordinate is
+    /// not finite, and an error if a vertex is not an `{ x, y, z }` object.
+    #[napi(factory)]
+    pub fn within_distance(
+        field: String,
+        vertices: Vec<JsGeo3dVertex>,
+        distance_m: f64,
+    ) -> Result<Self> {
+        let polyline = Geo3dPolyline::new(
+            vertices
+                .iter()
+                .map(|v| GeoEcefPoint::new(v.x, v.y, v.z))
+                .collect(),
+        )
+        .map_err(laurus_err)?;
+        Ok(Self {
+            query: Geo3dPolylineQuery::new(field, polyline, distance_m),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BooleanQuery
 // ---------------------------------------------------------------------------
 
@@ -823,7 +1046,7 @@ impl JsBooleanQuery {
         }
     }
 
-    // The 36 methods below cover {must, should, must_not} × 12 query
+    // The 48 methods below cover {must, should, must_not} × 16 query
     // types. We have to expose one method per concrete query type rather
     // than a single polymorphic `must(query)` taking a union, because
     // napi-derive's auto-generated `ValidateNapiValue` impl for `&T`
@@ -900,6 +1123,24 @@ impl JsBooleanQuery {
     #[napi(js_name = "mustGeo3dNearest")]
     pub fn must_geo3d_nearest(&mut self, query: &JsGeo3dNearestQuery) {
         self.musts.push(JsQuery::Geo3dNearestQuery(query.clone()));
+    }
+
+    /// Add a MUST clause from a [`JsGeoPolygonQuery`].
+    #[napi]
+    pub fn must_geo_polygon(&mut self, query: &JsGeoPolygonQuery) {
+        self.musts.push(JsQuery::GeoPolygonQuery(query.clone()));
+    }
+
+    /// Add a MUST clause from a [`JsGeoPolylineQuery`].
+    #[napi]
+    pub fn must_geo_polyline(&mut self, query: &JsGeoPolylineQuery) {
+        self.musts.push(JsQuery::GeoPolylineQuery(query.clone()));
+    }
+
+    /// Add a MUST clause from a [`JsGeo3dPolylineQuery`].
+    #[napi(js_name = "mustGeo3dPolyline")]
+    pub fn must_geo3d_polyline(&mut self, query: &JsGeo3dPolylineQuery) {
+        self.musts.push(JsQuery::Geo3dPolylineQuery(query.clone()));
     }
 
     /// Add a MUST clause from another [`JsBooleanQuery`] (nested).
@@ -982,6 +1223,25 @@ impl JsBooleanQuery {
     #[napi(js_name = "shouldGeo3dNearest")]
     pub fn should_geo3d_nearest(&mut self, query: &JsGeo3dNearestQuery) {
         self.shoulds.push(JsQuery::Geo3dNearestQuery(query.clone()));
+    }
+
+    /// Add a SHOULD clause from a [`JsGeoPolygonQuery`].
+    #[napi]
+    pub fn should_geo_polygon(&mut self, query: &JsGeoPolygonQuery) {
+        self.shoulds.push(JsQuery::GeoPolygonQuery(query.clone()));
+    }
+
+    /// Add a SHOULD clause from a [`JsGeoPolylineQuery`].
+    #[napi]
+    pub fn should_geo_polyline(&mut self, query: &JsGeoPolylineQuery) {
+        self.shoulds.push(JsQuery::GeoPolylineQuery(query.clone()));
+    }
+
+    /// Add a SHOULD clause from a [`JsGeo3dPolylineQuery`].
+    #[napi(js_name = "shouldGeo3dPolyline")]
+    pub fn should_geo3d_polyline(&mut self, query: &JsGeo3dPolylineQuery) {
+        self.shoulds
+            .push(JsQuery::Geo3dPolylineQuery(query.clone()));
     }
 
     /// Add a SHOULD clause from another [`JsBooleanQuery`] (nested).
@@ -1067,6 +1327,26 @@ impl JsBooleanQuery {
     pub fn must_not_geo3d_nearest(&mut self, query: &JsGeo3dNearestQuery) {
         self.must_nots
             .push(JsQuery::Geo3dNearestQuery(query.clone()));
+    }
+
+    /// Add a MUST_NOT clause from a [`JsGeoPolygonQuery`].
+    #[napi]
+    pub fn must_not_geo_polygon(&mut self, query: &JsGeoPolygonQuery) {
+        self.must_nots.push(JsQuery::GeoPolygonQuery(query.clone()));
+    }
+
+    /// Add a MUST_NOT clause from a [`JsGeoPolylineQuery`].
+    #[napi]
+    pub fn must_not_geo_polyline(&mut self, query: &JsGeoPolylineQuery) {
+        self.must_nots
+            .push(JsQuery::GeoPolylineQuery(query.clone()));
+    }
+
+    /// Add a MUST_NOT clause from a [`JsGeo3dPolylineQuery`].
+    #[napi(js_name = "mustNotGeo3dPolyline")]
+    pub fn must_not_geo3d_polyline(&mut self, query: &JsGeo3dPolylineQuery) {
+        self.must_nots
+            .push(JsQuery::Geo3dPolylineQuery(query.clone()));
     }
 
     /// Add a MUST_NOT clause from another [`JsBooleanQuery`] (nested).

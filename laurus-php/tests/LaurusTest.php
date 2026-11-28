@@ -1132,6 +1132,299 @@ class LaurusTest extends TestCase
         $this->assertEquals(["tokyo_skytree", "tokyo_tower"], $ids);
     }
 
+    // ── Polygons and polylines (Issue #1596) ─────────────────────────────
+    //
+    // The points are placed so that reading a vertex with its latitude and
+    // longitude swapped gives another valid shape with other hits: "mirror"
+    // is "inside" with its coordinates swapped.
+
+    private const GEO_SHAPE_POINTS = [
+        // Around the polygon: latitudes 10 to 20, longitudes 30 to 40, with
+        // a hole over latitudes 14 to 16, longitudes 34 to 36.
+        "inside" => ["lat" => 12.0, "lon" => 32.0],
+        "inside_east" => ["lat" => 18.0, "lon" => 38.0],
+        "in_hole" => ["lat" => 15.0, "lon" => 35.0],
+        "outside" => ["lat" => 25.0, "lon" => 35.0],
+        "mirror" => ["lat" => 32.0, "lon" => 12.0],
+        // Around the polyline along the equator from longitude 0 to 10.
+        "on_line" => ["lat" => 0.0, "lon" => 3.0],
+        "near_line" => ["lat" => 1.0, "lon" => 5.0],
+        "past_end" => ["lat" => 0.0, "lon" => 11.5],
+        "far" => ["lat" => 5.0, "lon" => 5.0],
+    ];
+
+    private const GEO_SHAPE_POSITIONS = [
+        // Around the 3D polyline (0, 0, 0) -> (1000, 0, 0) -> (1000, 1000, 0).
+        "p_on" => ["x" => 500.0, "y" => 0.0, "z" => 0.0],
+        "p_near" => ["x" => 1000.0, "y" => 500.0, "z" => 50.0],
+        "p_end" => ["x" => 1000.0, "y" => 1060.0, "z" => 0.0],
+        "p_far" => ["x" => 500.0, "y" => 500.0, "z" => 0.0],
+    ];
+
+    private const GEO_SHAPE_EXTERIOR = [
+        ["lat" => 10.0, "lon" => 30.0],
+        ["lat" => 10.0, "lon" => 40.0],
+        ["lat" => 20.0, "lon" => 40.0],
+        ["lat" => 20.0, "lon" => 30.0],
+    ];
+
+    private const GEO_SHAPE_HOLE = [
+        ["lat" => 14.0, "lon" => 34.0],
+        ["lat" => 14.0, "lon" => 36.0],
+        ["lat" => 16.0, "lon" => 36.0],
+        ["lat" => 16.0, "lon" => 34.0],
+    ];
+
+    private const GEO_SHAPE_LINE = [["lat" => 0.0, "lon" => 0.0], ["lat" => 0.0, "lon" => 10.0]];
+
+    private const GEO_SHAPE_LINE_3D = [
+        ["x" => 0.0, "y" => 0.0, "z" => 0.0],
+        ["x" => 1000.0, "y" => 0.0, "z" => 0.0],
+        ["x" => 1000.0, "y" => 1000.0, "z" => 0.0],
+    ];
+
+    private function createGeoShapesIndex(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("kind");
+        $schema->addGeoField("location");
+        $schema->addGeo3dField("position");
+        $idx = new Laurus\Index(null, $schema);
+        foreach (self::GEO_SHAPE_POINTS as $id => $point) {
+            $kind = $id === "inside_east" ? "bar" : "cafe";
+            $idx->putDocument($id, ["kind" => $kind, "location" => $point]);
+        }
+        foreach (self::GEO_SHAPE_POSITIONS as $id => $position) {
+            $idx->putDocument($id, ["kind" => "cafe", "position" => $position]);
+        }
+        $idx->commit();
+        return $idx;
+    }
+
+    private function geoPolygon(): Laurus\GeoPolygonQuery
+    {
+        return Laurus\GeoPolygonQuery::withinPolygon(
+            "location", self::GEO_SHAPE_EXTERIOR, [self::GEO_SHAPE_HOLE]
+        );
+    }
+
+    private function geoPolyline(): Laurus\GeoPolylineQuery
+    {
+        return Laurus\GeoPolylineQuery::withinDistance("location", self::GEO_SHAPE_LINE, 200000.0);
+    }
+
+    private function geo3dPolyline(): Laurus\Geo3dPolylineQuery
+    {
+        return Laurus\Geo3dPolylineQuery::withinDistance("position", self::GEO_SHAPE_LINE_3D, 100.0);
+    }
+
+    /** @return array<int, array{0: object, 1: string[]}> each query with its hits, sorted */
+    private function geoShapeQueries(): array
+    {
+        return [
+            [$this->geoPolygon(), ["inside", "inside_east"]],
+            [$this->geoPolyline(), ["near_line", "on_line", "past_end"]],
+            [$this->geo3dPolyline(), ["p_end", "p_near", "p_on"]],
+        ];
+    }
+
+    /** @return string[] the ids of the cafes, sorted */
+    private function geoShapeCafes(): array
+    {
+        $ids = array_merge(
+            array_keys(self::GEO_SHAPE_POINTS),
+            array_keys(self::GEO_SHAPE_POSITIONS)
+        );
+        $ids = array_values(array_filter($ids, fn ($id) => $id !== "inside_east"));
+        sort($ids);
+        return $ids;
+    }
+
+    public function testGeoPolygonQueryWithAHole(): void
+    {
+        $idx = $this->createGeoShapesIndex();
+        $this->assertSame(
+            ["inside", "inside_east"],
+            $this->idsOf($idx->search($this->geoPolygon(), 20)->getResults())
+        );
+    }
+
+    public function testGeoPolygonQueryWithoutHolesTakesTheHole(): void
+    {
+        $idx = $this->createGeoShapesIndex();
+        $q = Laurus\GeoPolygonQuery::withinPolygon("location", self::GEO_SHAPE_EXTERIOR);
+        $this->assertSame(
+            ["in_hole", "inside", "inside_east"],
+            $this->idsOf($idx->search($q, 20)->getResults())
+        );
+    }
+
+    public function testGeoPolylineQueryRanksTheClosestFirst(): void
+    {
+        // 0 m, about 111 km and about 167 km of 200 km.
+        $idx = $this->createGeoShapesIndex();
+        $results = $idx->search($this->geoPolyline(), 20)->getResults();
+        $this->assertSame(
+            ["on_line", "near_line", "past_end"],
+            array_map(fn ($r) => $r->getId(), $results)
+        );
+        $this->assertEqualsWithDelta(1.0, $results[0]->getScore(), 1e-6);
+    }
+
+    public function testGeo3dPolylineQueryRanksTheClosestFirst(): void
+    {
+        // 0 m, 50 m and 60 m of 100 m.
+        $idx = $this->createGeoShapesIndex();
+        $results = $idx->search($this->geo3dPolyline(), 20)->getResults();
+        $this->assertSame(["p_on", "p_near", "p_end"], array_map(fn ($r) => $r->getId(), $results));
+        foreach ([1.0, 0.5, 0.4] as $i => $score) {
+            $this->assertEqualsWithDelta($score, $results[$i]->getScore(), 1e-6);
+        }
+    }
+
+    public function testGeoShapeDslGivesTheSameHits(): void
+    {
+        $idx = $this->createGeoShapesIndex();
+        $ranked = fn ($q) => array_map(fn ($r) => $r->getId(), $idx->search($q, 20)->getResults());
+        $this->assertSame(
+            $this->idsOf($idx->search($this->geoPolygon(), 20)->getResults()),
+            $this->idsOf($idx->search(
+                "location:geo_polygon((10, 30, 10, 40, 20, 40, 20, 30), (14, 34, 14, 36, 16, 36, 16, 34))",
+                20
+            )->getResults())
+        );
+        $this->assertSame(
+            $ranked($this->geoPolyline()),
+            $ranked("location:geo_polyline((0, 0, 0, 10), 200000)")
+        );
+        $this->assertSame(
+            $ranked($this->geo3dPolyline()),
+            $ranked("position:geo3d_polyline((0, 0, 0, 1000, 0, 0, 1000, 1000, 0), 100)")
+        );
+    }
+
+    public function testGeoShapeQueriesInABooleanQuery(): void
+    {
+        $idx = $this->createGeoShapesIndex();
+        $cafes = $this->geoShapeCafes();
+        foreach ($this->geoShapeQueries() as [$query, $hits]) {
+            $must = new Laurus\BooleanQuery();
+            $must->must($query);
+            $must->must(new Laurus\TermQuery("kind", "cafe"));
+            $this->assertSame(
+                array_values(array_intersect($hits, $cafes)),
+                $this->idsOf($idx->search($must, 20)->getResults()),
+                (string) $query
+            );
+
+            $mustNot = new Laurus\BooleanQuery();
+            $mustNot->must(new Laurus\TermQuery("kind", "cafe"));
+            $mustNot->mustNot($query);
+            $this->assertSame(
+                array_values(array_diff($cafes, $hits)),
+                $this->idsOf($idx->search($mustNot, 20)->getResults()),
+                (string) $query
+            );
+        }
+    }
+
+    public function testGeoShapeQueriesAsAFilter(): void
+    {
+        $idx = $this->createGeoShapesIndex();
+        $cafes = $this->geoShapeCafes();
+        foreach ($this->geoShapeQueries() as [$query, $hits]) {
+            $req = new Laurus\SearchRequest(
+                null, // query
+                new Laurus\TermQuery("kind", "cafe"), // lexicalQuery
+                null, // vectorQuery
+                $query, // filterQuery
+                null, // fusion
+                20, // limit
+            );
+            $this->assertSame(
+                array_values(array_intersect($hits, $cafes)),
+                $this->idsOf($idx->search($req)->getResults()),
+                (string) $query
+            );
+        }
+    }
+
+    public function testGeoShapeRejectedWhenBuilt(): void
+    {
+        $cases = [
+            "an exterior of 2 points" => [\ValueError::class, fn () => Laurus\GeoPolygonQuery::withinPolygon(
+                "location",
+                [["lat" => 0.0, "lon" => 0.0], ["lat" => 0.0, "lon" => 1.0]]
+            )],
+            "a hole of 2 points" => [\ValueError::class, fn () => Laurus\GeoPolygonQuery::withinPolygon(
+                "location",
+                self::GEO_SHAPE_EXTERIOR,
+                [[["lat" => 15.0, "lon" => 35.0], ["lat" => 15.0, "lon" => 36.0]]]
+            )],
+            "a latitude out of range" => [\ValueError::class, fn () => Laurus\GeoPolygonQuery::withinPolygon(
+                "location",
+                [["lat" => 95.0, "lon" => 0.0], ["lat" => 0.0, "lon" => 1.0], ["lat" => 1.0, "lon" => 1.0]]
+            )],
+            "an edge across exactly 180 degrees" => [\ValueError::class, fn () => Laurus\GeoPolygonQuery::withinPolygon(
+                "location",
+                [["lat" => 0.0, "lon" => -90.0], ["lat" => 0.0, "lon" => 90.0], ["lat" => 10.0, "lon" => 90.0]]
+            )],
+            "a polyline edge between antipodes" => [\ValueError::class, fn () => Laurus\GeoPolylineQuery::withinDistance(
+                "location",
+                [["lat" => 0.0, "lon" => 0.0], ["lat" => 0.0, "lon" => 180.0]],
+                1000.0
+            )],
+            "a polyline without vertices" => [\ValueError::class,
+                fn () => Laurus\GeoPolylineQuery::withinDistance("location", [], 1000.0)],
+            "a NaN coordinate in 3D" => [\ValueError::class, fn () => Laurus\Geo3dPolylineQuery::withinDistance(
+                "position",
+                [["x" => 0.0, "y" => 0.0, "z" => 0.0], ["x" => NAN, "y" => 0.0, "z" => 0.0]],
+                100.0
+            )],
+            "a 3D polyline without vertices" => [\ValueError::class,
+                fn () => Laurus\Geo3dPolylineQuery::withinDistance("position", [], 100.0)],
+            "a vertex without its longitude" => [\ValueError::class,
+                fn () => Laurus\GeoPolylineQuery::withinDistance("location", [["lat" => 1.0]], 1000.0)],
+            "a vertex without its z" => [\ValueError::class,
+                fn () => Laurus\Geo3dPolylineQuery::withinDistance("position", [["x" => 1.0, "y" => 2.0]], 100.0)],
+            "a vertex that is not an array" => [\TypeError::class,
+                fn () => Laurus\GeoPolylineQuery::withinDistance("location", ["10, 30"], 1000.0)],
+            "a latitude that is not a number" => [\TypeError::class,
+                fn () => Laurus\GeoPolylineQuery::withinDistance("location", [["lat" => "north", "lon" => 1.0]], 1000.0)],
+        ];
+        $wrong = [];
+        foreach ($cases as $label => [$expected, $build]) {
+            $thrown = null;
+            try {
+                $build();
+            } catch (\Throwable $e) {
+                $thrown = $e;
+            }
+            if ($thrown === null) {
+                $wrong[] = "$label: accepted";
+            } elseif (!($thrown instanceof $expected)) {
+                $wrong[] = "$label: " . get_class($thrown) . ": " . $thrown->getMessage();
+            }
+        }
+        $this->assertSame([], $wrong);
+    }
+
+    public function testGeoShapeToString(): void
+    {
+        $this->assertSame(
+            "GeoPolygonQuery.withinPolygon(field='location', exterior=4 vertices, holes=1)",
+            (string) $this->geoPolygon()
+        );
+        $this->assertSame(
+            "GeoPolylineQuery.withinDistance(field='location', vertices=2, distanceM=200000)",
+            (string) $this->geoPolyline()
+        );
+        $this->assertSame(
+            "Geo3dPolylineQuery.withinDistance(field='position', vertices=3, distanceM=100)",
+            (string) $this->geo3dPolyline()
+        );
+    }
+
     // ── Vector search ───────────────────────────────────────────────────
 
     public function testVectorQuery(): void

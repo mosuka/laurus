@@ -9,8 +9,8 @@ use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
-    TermQuery, WildcardQuery,
+    Geo3dNearestQuery, Geo3dPolyline, Geo3dPolylineQuery, GeoBoundingBoxQuery, GeoDistanceQuery,
+    GeoPolygonQuery, GeoPolylineQuery, NumericRangeQuery, PhraseQuery, TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
@@ -18,6 +18,8 @@ use laurus::{DataValue, LexicalSearchQuery, QueryPayload, VectorSearchQuery};
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
 use magnus::{Error, RArray, RHash, RModule, Ruby, Value};
+
+use crate::errors::laurus_err;
 
 // ---------------------------------------------------------------------------
 // Helper: extract a lexical query from any Ruby query object
@@ -71,6 +73,15 @@ pub fn extract_lexical_query(value: Value) -> Result<Box<dyn laurus::lexical::Qu
         return q
             .build()
             .map_err(|e| Error::new(ruby.exception_arg_error(), e.to_string()));
+    }
+    if let Ok(q) = <&RbGeoPolygonQuery>::try_convert(value) {
+        return Ok(Box::new(q.query.clone()));
+    }
+    if let Ok(q) = <&RbGeoPolylineQuery>::try_convert(value) {
+        return Ok(Box::new(q.query.clone()));
+    }
+    if let Ok(q) = <&RbGeo3dPolylineQuery>::try_convert(value) {
+        return Ok(Box::new(q.query.clone()));
     }
     if let Ok(q) = <&RbGeo3dDistanceQuery>::try_convert(value) {
         return Ok(q.build());
@@ -845,6 +856,237 @@ impl RbGeo3dNearestQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Vertices of a polygon or a polyline (Issue #1596)
+// ---------------------------------------------------------------------------
+
+/// The coordinates `keys` of each vertex of `vertices`, a Hash with those
+/// string keys as a point in a document is written. Other keys are not
+/// read.
+///
+/// `what` names the list in the errors ("the exterior", "hole 0", "the
+/// polyline"). A vertex that is not a Hash raises `TypeError`, a missing
+/// key `ArgumentError`, and a coordinate that is not a number what
+/// converting it to a `Float` raises (`TypeError`), as for a point in a
+/// document.
+fn vertex_coordinates<const N: usize>(
+    vertices: RArray,
+    what: &str,
+    keys: [&str; N],
+) -> Result<Vec<[f64; N]>, Error> {
+    let ruby = Ruby::get().expect("called from Ruby thread");
+    let quoted = || {
+        keys.iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let elements: Vec<Value> = vertices.into_iter().collect();
+    elements
+        .into_iter()
+        .enumerate()
+        .map(|(i, vertex)| {
+            let hash = RHash::from_value(vertex).ok_or_else(|| {
+                Error::new(
+                    ruby.exception_type_error(),
+                    format!(
+                        "vertex {i} of {what} must be a Hash with the keys {}, got {}",
+                        quoted(),
+                        vertex.class()
+                    ),
+                )
+            })?;
+            let mut coordinates = [0.0; N];
+            for (coordinate, key) in coordinates.iter_mut().zip(keys) {
+                let value: Value = hash.get(ruby.str_new(key)).ok_or_else(|| {
+                    Error::new(
+                        ruby.exception_arg_error(),
+                        format!(
+                            "vertex {i} of {what} has no \"{key}\": a vertex is a Hash with the keys {}",
+                            quoted()
+                        ),
+                    )
+                })?;
+                *coordinate = f64::try_convert(value)?;
+            }
+            Ok(coordinates)
+        })
+        .collect()
+}
+
+/// The `(lat, lon)` pairs of `vertices`.
+fn lat_lon_vertices(vertices: RArray, what: &str) -> Result<Vec<(f64, f64)>, Error> {
+    Ok(vertex_coordinates(vertices, what, ["lat", "lon"])?
+        .into_iter()
+        .map(|[lat, lon]| (lat, lon))
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolygonQuery
+// ---------------------------------------------------------------------------
+
+/// Polygon query over a `Geo` field (`Laurus::GeoPolygonQuery`): matches
+/// the documents with a point inside a polygon, with holes, as
+/// `geo_polygon` in the DSL does. Every hit scores 1.0.
+#[magnus::wrap(class = "Laurus::GeoPolygonQuery")]
+pub struct RbGeoPolygonQuery {
+    pub query: GeoPolygonQuery,
+}
+
+impl RbGeoPolygonQuery {
+    /// Create a polygon query.
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Positional and keyword arguments:
+    ///   - `field` (String): Geo field name.
+    ///   - `exterior` (Array): The exterior ring: Hashes with the keys
+    ///     `"lat"` and `"lon"`.
+    ///   - `holes:` (Array, optional): Rings like `exterior`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if a ring has fewer than 3 distinct vertices,
+    /// a latitude or longitude is out of range, an edge spans exactly 180
+    /// degrees of longitude, a ring goes around a pole, or a vertex has no
+    /// `"lat"` or `"lon"`; `TypeError` if a vertex is not a Hash or a
+    /// coordinate is not a number.
+    fn within_polygon(args: &[Value]) -> Result<Self, Error> {
+        let args = scan_args::<(String, RArray), (), (), (), RHash, ()>(args)?;
+        let (field, exterior) = args.required;
+        // `Option<Option<_>>`: an explicit `nil` is no holes, as leaving
+        // the keyword out is (Issue #1616).
+        let kwargs =
+            get_kwargs::<_, (), (Option<Option<RArray>>,), ()>(args.keywords, &[], &["holes"])?;
+        let (holes,) = kwargs.optional;
+        let exterior = lat_lon_vertices(exterior, "the exterior")?;
+        let holes: Vec<Vec<(f64, f64)>> = match holes.flatten() {
+            None => Vec::new(),
+            Some(holes) => {
+                let elements: Vec<Value> = holes.into_iter().collect();
+                elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, hole)| {
+                        lat_lon_vertices(RArray::try_convert(hole)?, &format!("hole {i}"))
+                    })
+                    .collect::<Result<_, Error>>()?
+            }
+        };
+        let holes: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+        let query =
+            GeoPolygonQuery::within_polygon(field, &exterior, &holes).map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+
+    fn inspect(&self) -> String {
+        let polygon = self.query.polygon();
+        format!(
+            "GeoPolygonQuery.within_polygon(field='{}', exterior={} vertices, holes={})",
+            self.query.field(),
+            // The ring is kept closed: its last vertex repeats its first.
+            polygon.exterior().len() - 1,
+            polygon.holes().len()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// Distance-to-polyline query over a `Geo` field
+/// (`Laurus::GeoPolylineQuery`): matches the documents with a point within
+/// a distance of a polyline of great-circle arcs, as `geo_polyline` in the
+/// DSL does. A hit scores `1 - d / distance_m` by its closest point.
+#[magnus::wrap(class = "Laurus::GeoPolylineQuery")]
+pub struct RbGeoPolylineQuery {
+    pub query: GeoPolylineQuery,
+}
+
+impl RbGeoPolylineQuery {
+    /// Create a distance-to-polyline query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo field name.
+    /// * `vertices` - The polyline: Hashes with the keys `"lat"` and
+    ///   `"lon"`. One vertex is a point.
+    /// * `distance_m` - Maximum distance from the polyline in meters.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if there is no vertex, a latitude or longitude
+    /// is out of range, an edge joins two antipodal points, or a vertex has
+    /// no `"lat"` or `"lon"`; `TypeError` if a vertex is not a Hash or a
+    /// coordinate is not a number.
+    fn within_distance(field: String, vertices: RArray, distance_m: f64) -> Result<Self, Error> {
+        let vertices = lat_lon_vertices(vertices, "the polyline")?;
+        let query =
+            GeoPolylineQuery::within_distance(field, &vertices, distance_m).map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+
+    fn inspect(&self) -> String {
+        format!(
+            "GeoPolylineQuery.within_distance(field='{}', vertices={}, distance_m={})",
+            self.query.field(),
+            self.query.polyline().vertices().len(),
+            self.query.distance_m()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geo3dPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// 3D ECEF distance-to-polyline query (`Laurus::Geo3dPolylineQuery`):
+/// matches the documents whose point lies within `distance_m` meters of a
+/// polyline of straight segments, as `geo3d_polyline` in the DSL does. A
+/// hit scores `1 - d / distance_m` by its closest point.
+#[magnus::wrap(class = "Laurus::Geo3dPolylineQuery")]
+pub struct RbGeo3dPolylineQuery {
+    pub query: Geo3dPolylineQuery,
+}
+
+impl RbGeo3dPolylineQuery {
+    /// Create a 3D distance-to-polyline query.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - Geo3d field name.
+    /// * `vertices` - The polyline: Hashes with the keys `"x"`, `"y"` and
+    ///   `"z"` in ECEF meters. One vertex is a point.
+    /// * `distance_m` - Maximum distance from the polyline in meters.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ArgumentError` if there is no vertex, a coordinate is not
+    /// finite, or a vertex has no `"x"`, `"y"` or `"z"`; `TypeError` if a
+    /// vertex is not a Hash or a coordinate is not a number.
+    fn within_distance(field: String, vertices: RArray, distance_m: f64) -> Result<Self, Error> {
+        let vertices = vertex_coordinates(vertices, "the polyline", ["x", "y", "z"])?
+            .into_iter()
+            .map(|[x, y, z]| GeoEcefPoint::new(x, y, z))
+            .collect();
+        let polyline = Geo3dPolyline::new(vertices).map_err(laurus_err)?;
+        Ok(Self {
+            query: Geo3dPolylineQuery::new(field, polyline, distance_m),
+        })
+    }
+
+    fn inspect(&self) -> String {
+        format!(
+            "Geo3dPolylineQuery.within_distance(field='{}', vertices={}, distance_m={})",
+            self.query.field(),
+            self.query.polyline().vertices().len(),
+            self.query.distance_m()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BooleanQuery - stores extracted Rust queries, not Ruby Values
 // ---------------------------------------------------------------------------
 
@@ -1213,6 +1455,33 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
     )?;
     g3d_near.define_method("inspect", magnus::method!(RbGeo3dNearestQuery::inspect, 0))?;
     g3d_near.define_method("to_s", magnus::method!(RbGeo3dNearestQuery::inspect, 0))?;
+
+    // GeoPolygonQuery
+    let geo_polygon = module.define_class("GeoPolygonQuery", ruby.class_object())?;
+    geo_polygon.define_singleton_method(
+        "within_polygon",
+        magnus::function!(RbGeoPolygonQuery::within_polygon, -1),
+    )?;
+    geo_polygon.define_method("inspect", magnus::method!(RbGeoPolygonQuery::inspect, 0))?;
+    geo_polygon.define_method("to_s", magnus::method!(RbGeoPolygonQuery::inspect, 0))?;
+
+    // GeoPolylineQuery
+    let geo_polyline = module.define_class("GeoPolylineQuery", ruby.class_object())?;
+    geo_polyline.define_singleton_method(
+        "within_distance",
+        magnus::function!(RbGeoPolylineQuery::within_distance, 3),
+    )?;
+    geo_polyline.define_method("inspect", magnus::method!(RbGeoPolylineQuery::inspect, 0))?;
+    geo_polyline.define_method("to_s", magnus::method!(RbGeoPolylineQuery::inspect, 0))?;
+
+    // Geo3dPolylineQuery
+    let g3d_polyline = module.define_class("Geo3dPolylineQuery", ruby.class_object())?;
+    g3d_polyline.define_singleton_method(
+        "within_distance",
+        magnus::function!(RbGeo3dPolylineQuery::within_distance, 3),
+    )?;
+    g3d_polyline.define_method("inspect", magnus::method!(RbGeo3dPolylineQuery::inspect, 0))?;
+    g3d_polyline.define_method("to_s", magnus::method!(RbGeo3dPolylineQuery::inspect, 0))?;
 
     // BooleanQuery
     let bool_q = module.define_class("BooleanQuery", ruby.class_object())?;

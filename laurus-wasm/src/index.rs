@@ -8,7 +8,8 @@ use crate::convert::{data_value_to_json, json_to_document, track_total_hits_para
 use crate::errors::laurus_err;
 use crate::query::{
     JsDateTimeRangeQuery, JsGeo3dBoundingBoxQuery, JsGeo3dDistanceQuery, JsGeo3dNearestQuery,
-    JsQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery,
+    JsQuery, JsTermQuery, JsVectorQuery, JsVectorQueryInner, JsVectorTextQuery, geo_polygon_query,
+    geo_polyline_query, geo3d_polyline_query,
 };
 use crate::schema::WasmSchema;
 use crate::search::{
@@ -841,6 +842,141 @@ impl WasmIndex {
             initial_radius_m,
             max_radius_m,
         });
+        let request = build_lexical_request(&query, limit, offset)?;
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
+    }
+
+    /// Search using a polygon query over a Geo field, as `geo_polygon` in
+    /// the DSL does (Issue #1596).
+    ///
+    /// An edge takes the shorter way between its vertices, so a polygon may
+    /// cross the antimeridian; a ring is closed if its last vertex is not
+    /// its first. Every hit scores 1.0.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The Geo field name.
+    /// * `exterior` - The exterior ring: an array of `{ lat, lon }`
+    ///   objects, as a point in a document is written.
+    /// * `holes` - An array of rings like `exterior`; `null` or `undefined`
+    ///   for none.
+    /// * `limit` - Maximum number of results (default 10).
+    /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit` or `offset` is not an integer from 0 to
+    /// 4294967295, a vertex is not a `{ lat, lon }` object, a ring has
+    /// fewer than 3 distinct vertices, a latitude or longitude is out of
+    /// range, an edge spans exactly 180 degrees of longitude, or a ring goes
+    /// around a pole.
+    #[wasm_bindgen(js_name = "searchGeoPolygon")]
+    pub async fn search_geo_polygon(
+        &self,
+        field: String,
+        exterior: JsValue,
+        holes: Option<JsValue>,
+        limit: Option<f64>,
+        offset: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchGeoPolygon";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let query = JsQuery::GeoPolygonQuery(geo_polygon_query(CONTEXT, field, exterior, holes)?);
+        let request = build_lexical_request(&query, limit, offset)?;
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
+    }
+
+    /// Search using a distance-to-polyline query over a Geo field, as
+    /// `geo_polyline` in the DSL does (Issue #1596).
+    ///
+    /// Each edge is the shorter great-circle arc between its vertices, and
+    /// the distance is along the surface to the closest point of the
+    /// polyline. A hit scores `1 - d / distanceM` by its closest point.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The Geo field name.
+    /// * `vertices` - The polyline: an array of `{ lat, lon }` objects. One
+    ///   vertex is a point.
+    /// * `distance_m` - Maximum distance from the polyline in meters.
+    /// * `limit` - Maximum number of results (default 10).
+    /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit` or `offset` is not an integer from 0 to
+    /// 4294967295, a vertex is not a `{ lat, lon }` object, there is no
+    /// vertex, a latitude or longitude is out of range, or an edge joins two
+    /// antipodal points.
+    #[wasm_bindgen(js_name = "searchGeoPolyline")]
+    pub async fn search_geo_polyline(
+        &self,
+        field: String,
+        vertices: JsValue,
+        distance_m: f64,
+        limit: Option<f64>,
+        offset: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchGeoPolyline";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let query =
+            JsQuery::GeoPolylineQuery(geo_polyline_query(CONTEXT, field, vertices, distance_m)?);
+        let request = build_lexical_request(&query, limit, offset)?;
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
+    }
+
+    /// Search using a 3D ECEF distance-to-polyline query, as
+    /// `geo3d_polyline` in the DSL does (Issue #1596).
+    ///
+    /// Each edge is the straight segment between its vertices. A hit scores
+    /// `1 - d / distanceM` by its closest point.
+    ///
+    /// # Arguments
+    ///
+    /// * `field` - The Geo3d field name.
+    /// * `vertices` - The polyline: an array of `{ x, y, z }` objects in
+    ///   ECEF meters. One vertex is a point.
+    /// * `distance_m` - Maximum distance from the polyline in meters.
+    /// * `limit` - Maximum number of results (default 10).
+    /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
+    ///
+    /// # Errors
+    ///
+    /// Rejects if `limit` or `offset` is not an integer from 0 to
+    /// 4294967295, a vertex is not an `{ x, y, z }` object, there is no
+    /// vertex, or a coordinate is not finite.
+    #[wasm_bindgen(js_name = "searchGeo3dPolyline")]
+    pub async fn search_geo3d_polyline(
+        &self,
+        field: String,
+        vertices: JsValue,
+        distance_m: f64,
+        limit: Option<f64>,
+        offset: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        const CONTEXT: &str = "Index.searchGeo3dPolyline";
+        let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let query = JsQuery::Geo3dPolylineQuery(geo3d_polyline_query(
+            CONTEXT, field, vertices, distance_m,
+        )?);
         let request = build_lexical_request(&query, limit, offset)?;
         let response = self.engine.search(request).await.map_err(laurus_err)?;
         search_response_to_js(response)
@@ -2621,6 +2757,43 @@ mod tests {
                 .search_geo3d_nearest(n("p"), 0.0, 0.0, 0.0, 1.0, Some(10.0), Some(v), None, None)
                 .await;
             check(&mut m, "Index.searchGeo3dNearest", "offset", case, result);
+            let triangle = || {
+                plain(serde_json::json!([
+                    { "lat": 0.0, "lon": 0.0 },
+                    { "lat": 0.0, "lon": 1.0 },
+                    { "lat": 1.0, "lon": 1.0 }
+                ]))
+            };
+            let segment = || {
+                plain(serde_json::json!([
+                    { "x": 0.0, "y": 0.0, "z": 0.0 },
+                    { "x": 1.0, "y": 0.0, "z": 0.0 }
+                ]))
+            };
+            let result = index
+                .search_geo_polygon(n("g"), triangle(), None, Some(v), None)
+                .await;
+            check(&mut m, "Index.searchGeoPolygon", "limit", case, result);
+            let result = index
+                .search_geo_polygon(n("g"), triangle(), None, Some(10.0), Some(v))
+                .await;
+            check(&mut m, "Index.searchGeoPolygon", "offset", case, result);
+            let result = index
+                .search_geo_polyline(n("g"), triangle(), 1.0, Some(v), None)
+                .await;
+            check(&mut m, "Index.searchGeoPolyline", "limit", case, result);
+            let result = index
+                .search_geo_polyline(n("g"), triangle(), 1.0, Some(10.0), Some(v))
+                .await;
+            check(&mut m, "Index.searchGeoPolyline", "offset", case, result);
+            let result = index
+                .search_geo3d_polyline(n("p"), segment(), 1.0, Some(v), None)
+                .await;
+            check(&mut m, "Index.searchGeo3dPolyline", "limit", case, result);
+            let result = index
+                .search_geo3d_polyline(n("p"), segment(), 1.0, Some(10.0), Some(v))
+                .await;
+            check(&mut m, "Index.searchGeo3dPolyline", "offset", case, result);
             let result = index
                 .search_vector(n("vec"), vec(), Some(v), None, None, None)
                 .await;
@@ -2965,5 +3138,358 @@ mod tests {
         let vector = response_json(search_vector_grouped(&group_index().await, None).await);
         assert!(!vector["results"].as_array().unwrap().is_empty());
         assert!(vector.get("totalHits").is_none(), "{vector}");
+    }
+
+    // ── Polygons and polylines (Issue #1596) ────────────────────────────────
+
+    /// A JS value of plain objects and arrays, as a caller passes vertices:
+    /// through `JSON.parse`, since `serde_wasm_bindgen::to_value` turns a
+    /// JSON object into a `Map`.
+    fn plain(value: serde_json::Value) -> JsValue {
+        js_sys::JSON::parse(&serde_json::to_string(&value).unwrap()).unwrap()
+    }
+
+    /// The `Geo` points of the shape tests. They are placed so that reading
+    /// a vertex with its latitude and longitude swapped gives another valid
+    /// shape with other hits: "mirror" is "inside" with its coordinates
+    /// swapped.
+    const GEO_SHAPE_POINTS: [(&str, f64, f64); 9] = [
+        // Around the polygon: latitudes 10 to 20, longitudes 30 to 40, with
+        // a hole over latitudes 14 to 16, longitudes 34 to 36.
+        ("inside", 12.0, 32.0),
+        ("inside_east", 18.0, 38.0),
+        ("in_hole", 15.0, 35.0),
+        ("outside", 25.0, 35.0),
+        ("mirror", 32.0, 12.0),
+        // Around the polyline along the equator from longitude 0 to 10.
+        ("on_line", 0.0, 3.0),
+        ("near_line", 1.0, 5.0),
+        ("past_end", 0.0, 11.5),
+        ("far", 5.0, 5.0),
+    ];
+
+    /// The `Geo3d` points, around the polyline (0, 0, 0) -> (1000, 0, 0) ->
+    /// (1000, 1000, 0).
+    const GEO_SHAPE_POSITIONS: [(&str, f64, f64, f64); 4] = [
+        ("p_on", 500.0, 0.0, 0.0),
+        ("p_near", 1000.0, 500.0, 50.0),
+        ("p_end", 1000.0, 1060.0, 0.0),
+        ("p_far", 500.0, 500.0, 0.0),
+    ];
+
+    fn exterior_json() -> serde_json::Value {
+        serde_json::json!([
+            { "lat": 10.0, "lon": 30.0 },
+            { "lat": 10.0, "lon": 40.0 },
+            { "lat": 20.0, "lon": 40.0 },
+            { "lat": 20.0, "lon": 30.0 }
+        ])
+    }
+
+    fn exterior() -> JsValue {
+        plain(exterior_json())
+    }
+
+    fn holes() -> JsValue {
+        plain(serde_json::json!([[
+            { "lat": 14.0, "lon": 34.0 },
+            { "lat": 14.0, "lon": 36.0 },
+            { "lat": 16.0, "lon": 36.0 },
+            { "lat": 16.0, "lon": 34.0 }
+        ]]))
+    }
+
+    fn line() -> JsValue {
+        plain(serde_json::json!([
+            { "lat": 0.0, "lon": 0.0 },
+            { "lat": 0.0, "lon": 10.0 }
+        ]))
+    }
+
+    fn line_3d() -> JsValue {
+        plain(serde_json::json!([
+            { "x": 0.0, "y": 0.0, "z": 0.0 },
+            { "x": 1000.0, "y": 0.0, "z": 0.0 },
+            { "x": 1000.0, "y": 1000.0, "z": 0.0 }
+        ]))
+    }
+
+    async fn geo_shapes_index() -> WasmIndex {
+        let mut schema = WasmSchema::new();
+        schema
+            .add_text_field("kind".to_string(), None, None, None, None, None, None, None)
+            .unwrap();
+        schema
+            .add_geo_field("location".to_string(), None, None, None, None)
+            .unwrap();
+        schema
+            .add_geo3d_field("position".to_string(), None, None, None, None)
+            .unwrap();
+        let index = WasmIndex::create(Some(schema), None, None).await.unwrap();
+        for (id, lat, lon) in GEO_SHAPE_POINTS {
+            let kind = if id == "inside_east" { "bar" } else { "cafe" };
+            let doc = plain(serde_json::json!({
+                "kind": kind, "location": { "lat": lat, "lon": lon }
+            }));
+            index.put_document(id.to_string(), doc).await.unwrap();
+        }
+        for (id, x, y, z) in GEO_SHAPE_POSITIONS {
+            let doc = plain(serde_json::json!({
+                "kind": "cafe", "position": { "x": x, "y": y, "z": z }
+            }));
+            index.put_document(id.to_string(), doc).await.unwrap();
+        }
+        index.commit().await.unwrap();
+        index
+    }
+
+    /// The ids and scores of a search response, in its order.
+    fn scored(js_response: JsValue) -> Vec<(String, f64)> {
+        results_json(js_response)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["score"].as_f64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn sorted_ids(js_response: JsValue) -> Vec<String> {
+        let mut ids = ids(js_response);
+        ids.sort();
+        ids
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_polygon_with_a_hole() {
+        let index = geo_shapes_index().await;
+        let response = index
+            .search_geo_polygon(
+                "location".into(),
+                exterior(),
+                Some(holes()),
+                Some(20.0),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(response_json(response.clone()).get("totalHits").is_none());
+        assert_eq!(sorted_ids(response), ["inside", "inside_east"]);
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_polygon_without_holes_takes_the_hole() {
+        let index = geo_shapes_index().await;
+        for holes in [None, Some(JsValue::NULL), Some(JsValue::UNDEFINED)] {
+            let response = index
+                .search_geo_polygon("location".into(), exterior(), holes, Some(20.0), None)
+                .await
+                .unwrap();
+            assert_eq!(sorted_ids(response), ["in_hole", "inside", "inside_east"]);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_polyline_ranks_the_closest_first() {
+        // 0 m, about 111 km and about 167 km of 200 km.
+        let index = geo_shapes_index().await;
+        let hits = scored(
+            index
+                .search_geo_polyline("location".into(), line(), 200_000.0, Some(20.0), None)
+                .await
+                .unwrap(),
+        );
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["on_line", "near_line", "past_end"]);
+        assert!((hits[0].1 - 1.0).abs() < 1e-6, "{hits:?}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn a_geo3d_polyline_ranks_the_closest_first() {
+        // 0 m, 50 m and 60 m of 100 m.
+        let index = geo_shapes_index().await;
+        let hits = scored(
+            index
+                .search_geo3d_polyline("position".into(), line_3d(), 100.0, Some(20.0), None)
+                .await
+                .unwrap(),
+        );
+        let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["p_on", "p_near", "p_end"]);
+        for ((_, score), expected) in hits.iter().zip([1.0, 0.5, 0.4]) {
+            assert!((score - expected).abs() < 1e-6, "{hits:?}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_dsl_gives_the_same_hits() {
+        let index = geo_shapes_index().await;
+        let dsl = |q: &str| {
+            index.search(
+                q.to_string(),
+                Some(20.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let polygon = index
+            .search_geo_polygon(
+                "location".into(),
+                exterior(),
+                Some(holes()),
+                Some(20.0),
+                None,
+            )
+            .await
+            .unwrap();
+        let polygon_dsl = dsl("location:geo_polygon((10, 30, 10, 40, 20, 40, 20, 30), \
+             (14, 34, 14, 36, 16, 36, 16, 34))")
+        .await
+        .unwrap();
+        assert_eq!(sorted_ids(polygon), sorted_ids(polygon_dsl));
+        let polyline = index
+            .search_geo_polyline("location".into(), line(), 200_000.0, Some(20.0), None)
+            .await
+            .unwrap();
+        let polyline_dsl = dsl("location:geo_polyline((0, 0, 0, 10), 200000)")
+            .await
+            .unwrap();
+        assert_eq!(ids(polyline), ids(polyline_dsl));
+        let polyline_3d = index
+            .search_geo3d_polyline("position".into(), line_3d(), 100.0, Some(20.0), None)
+            .await
+            .unwrap();
+        let polyline_3d_dsl =
+            dsl("position:geo3d_polyline((0, 0, 0, 1000, 0, 0, 1000, 1000, 0), 100)")
+                .await
+                .unwrap();
+        assert_eq!(ids(polyline_3d), ids(polyline_3d_dsl));
+    }
+
+    #[wasm_bindgen_test]
+    async fn an_invalid_shape_is_rejected() {
+        #[derive(serde::Serialize)]
+        struct Xyz {
+            x: f64,
+            y: f64,
+            z: f64,
+        }
+        let index = geo_shapes_index().await;
+        let polygon = |exterior: serde_json::Value, holes: Option<serde_json::Value>| {
+            index.search_geo_polygon(
+                "location".into(),
+                plain(exterior),
+                holes.map(plain),
+                None,
+                None,
+            )
+        };
+        let polyline = |vertices: serde_json::Value| {
+            index.search_geo_polyline("location".into(), plain(vertices), 1000.0, None, None)
+        };
+        let polyline_3d = |vertices: JsValue| {
+            index.search_geo3d_polyline("position".into(), vertices, 100.0, None, None)
+        };
+        use serde_json::json;
+        let cases = [
+            (
+                "an exterior of 2 points",
+                polygon(
+                    json!([{ "lat": 0.0, "lon": 0.0 }, { "lat": 0.0, "lon": 1.0 }]),
+                    None,
+                )
+                .await,
+            ),
+            (
+                "a hole of 2 points",
+                polygon(
+                    exterior_json(),
+                    Some(json!([[{ "lat": 15.0, "lon": 35.0 }, { "lat": 15.0, "lon": 36.0 }]])),
+                )
+                .await,
+            ),
+            (
+                "a latitude out of range",
+                polygon(
+                    json!([
+                        { "lat": 95.0, "lon": 0.0 },
+                        { "lat": 0.0, "lon": 1.0 },
+                        { "lat": 1.0, "lon": 1.0 }
+                    ]),
+                    None,
+                )
+                .await,
+            ),
+            (
+                "an edge across exactly 180 degrees",
+                polygon(
+                    json!([
+                        { "lat": 0.0, "lon": -90.0 },
+                        { "lat": 0.0, "lon": 90.0 },
+                        { "lat": 10.0, "lon": 90.0 }
+                    ]),
+                    None,
+                )
+                .await,
+            ),
+            (
+                "a polyline edge between antipodes",
+                polyline(json!([{ "lat": 0.0, "lon": 0.0 }, { "lat": 0.0, "lon": 180.0 }])).await,
+            ),
+            ("a polyline without vertices", polyline(json!([])).await),
+            (
+                "a NaN coordinate in 3D",
+                polyline_3d(
+                    serde_wasm_bindgen::to_value(&[
+                        Xyz {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                        Xyz {
+                            x: f64::NAN,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                    ])
+                    .unwrap(),
+                )
+                .await,
+            ),
+            (
+                "a 3D polyline without vertices",
+                polyline_3d(plain(json!([]))).await,
+            ),
+            (
+                "a vertex without its longitude",
+                polyline(json!([{ "lat": 1.0 }])).await,
+            ),
+            (
+                "a vertex without its z",
+                polyline_3d(plain(json!([{ "x": 1.0, "y": 2.0 }]))).await,
+            ),
+            (
+                "a vertex that is a string",
+                polyline(json!(["10, 30"])).await,
+            ),
+            (
+                "a latitude that is not a number",
+                polyline(json!([{ "lat": "north", "lon": 1.0 }])).await,
+            ),
+        ];
+        let accepted: Vec<&str> = cases
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(label, _)| *label)
+            .collect();
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
     }
 }

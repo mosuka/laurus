@@ -468,6 +468,70 @@ With `min_lon > max_lon` the box crosses the antimeridian (±180°): it runs eas
 from `min_lon` through ±180° to `max_lon`, as in GeoJSON (RFC 7946). An edge on
 exactly ±180° also matches points stored with the other sign.
 
+### GeoPolygonQuery
+
+```python
+GeoPolygonQuery.within_polygon(
+    field: str,
+    exterior: list[dict],
+    holes: list[list[dict]] | None = None,
+)
+```
+
+Polygon search over a `Geo` field, as `geo_polygon` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point inside
+the exterior ring and outside every hole: a point on the exterior is inside, a
+point on the edge of a hole is outside. Every hit scores 1.0.
+
+A vertex is a dict with the keys `"lat"` and `"lon"`, as every binding takes a
+keyed vertex; a `(lat, lon)` tuple is not a vertex. A ring is closed if its last
+vertex is not its first. An edge takes the shorter way between its two vertices
+(their longitudes differ by 180° or less), so a polygon may cross the
+antimeridian.
+
+Raises `ValueError` when the query is built if a vertex is not a point, a ring
+has fewer than 3 distinct vertices, a latitude or longitude is out of range, an
+edge spans exactly 180° of longitude, or a ring goes around a pole.
+
+```python
+q = laurus.GeoPolygonQuery.within_polygon(
+    "location",
+    [{"lat": 35.0, "lon": 139.0}, {"lat": 35.0, "lon": 140.0},
+     {"lat": 36.0, "lon": 140.0}, {"lat": 36.0, "lon": 139.0}],
+    holes=[[{"lat": 35.4, "lon": 139.4}, {"lat": 35.4, "lon": 139.6},
+            {"lat": 35.6, "lon": 139.6}, {"lat": 35.6, "lon": 139.4}]],
+)
+results = index.search(q, limit=10).results
+```
+
+### GeoPolylineQuery
+
+```python
+GeoPolylineQuery.within_distance(
+    field: str, vertices: list[dict], distance_m: float,
+)
+```
+
+Distance-to-polyline search over a `Geo` field, as `geo_polyline` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point within
+`distance_m` metres of the polyline, along the surface (radius 6,371,000 m, as
+`GeoDistanceQuery`). Each edge is the shorter great-circle arc between its two
+vertices; one vertex is a point. A hit scores `1 - d / distance_m` by its
+closest point.
+
+Vertices are given as for `GeoPolygonQuery`. Raises `ValueError` when the query
+is built if a vertex is not a point, there is no vertex, a latitude or
+longitude is out of range, or an edge joins two antipodal points (or points
+within about 640 m of them); add a vertex between them.
+
+```python
+q = laurus.GeoPolylineQuery.within_distance(
+    "location",
+    [{"lat": 35.68, "lon": 139.76}, {"lat": 35.71, "lon": 139.81}],
+    1000.0,
+)
+```
+
 ### Geo3dDistanceQuery
 
 ```python
@@ -509,6 +573,35 @@ Geo3dNearestQuery.k_nearest(
 k-nearest-neighbour search over a 3D ECEF point field. Returns the `k`
 documents closest to `(x, y, z)`. The optional `initial_radius_m` and
 `max_radius_m` tune the iterative-expansion search cone.
+
+### Geo3dPolylineQuery
+
+```python
+Geo3dPolylineQuery.within_distance(
+    field: str, vertices: list[dict], distance_m: float,
+)
+```
+
+Distance-to-polyline search over a 3D ECEF point field, as `geo3d_polyline` in
+the [query DSL](../concepts/query_dsl.md). Returns documents whose point is
+within `distance_m` metres of the polyline. Each edge is the straight segment
+between its two vertices, a chord below the surface (see
+[Geo3d concepts](../concepts/geo3d.md)); one vertex is a point. A hit scores
+`1 - d / distance_m` by its closest point.
+
+A vertex is a dict with the keys `"x"`, `"y"` and `"z"` in metres; an
+`(x, y, z)` tuple is not a vertex. Raises
+`ValueError` when the query is built if a vertex is not a point, there is no
+vertex, or a coordinate is not finite.
+
+```python
+q = laurus.Geo3dPolylineQuery.within_distance(
+    "position",
+    [{"x": -3955182.0, "y": 3350553.0, "z": 3700276.0},
+     {"x": -3961178.0, "y": 3346187.0, "z": 3702490.0}],
+    500.0,
+)
+```
 
 ### BooleanQuery
 

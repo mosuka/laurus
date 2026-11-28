@@ -13,6 +13,10 @@ require_relative "test_helper"
 class TestExplicitNil < Minitest::Test
   TOKYO_TOWER = { "x" => -3_955_182.0, "y" => 3_350_553.0, "z" => 3_700_276.0 }.freeze
   MT_FUJI = { "x" => -3_916_073.0, "y" => 3_437_037.0, "z" => 3_672_751.0 }.freeze
+  SQUARE = [
+    { "lat" => 0.0, "lon" => 0.0 }, { "lat" => 0.0, "lon" => 1.0 },
+    { "lat" => 1.0, "lon" => 1.0 }, { "lat" => 1.0, "lon" => 0.0 }
+  ].freeze
 
   def setup
     schema = Laurus::Schema.new
@@ -117,6 +121,8 @@ class TestExplicitNil < Minitest::Test
        -> { Laurus::DateTimeRangeQuery.new("d", min: "2024-01-01").inspect }],
       ["Geo3dNearestQuery initial_radius_m:", -> { nearest(initial_radius_m: nil) }, -> { nearest }],
       ["Geo3dNearestQuery max_radius_m:", -> { nearest(max_radius_m: nil) }, -> { nearest }],
+      ["GeoPolygonQuery holes:", -> { Laurus::GeoPolygonQuery.within_polygon("g", SQUARE, holes: nil).inspect },
+       -> { Laurus::GeoPolygonQuery.within_polygon("g", SQUARE).inspect }],
       ["LateInteractionRescore window_size:",
        -> { Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0]], window_size: nil).inspect },
        -> { Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0]]).inspect }],

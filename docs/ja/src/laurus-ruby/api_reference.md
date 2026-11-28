@@ -413,6 +413,60 @@ Laurus::GeoBoundingBoxQuery.within_bounding_box(
 ±180° を通って `max_lon` までの範囲です（GeoJSON、RFC 7946 と同じ規約）。端がちょうど
 ±180° のときは、もう一方の符号で保存された点にもマッチします。
 
+### GeoPolygonQuery
+
+```ruby
+Laurus::GeoPolygonQuery.within_polygon(field, exterior, holes: nil)
+```
+
+`Geo` フィールドへの多角形の検索で、[クエリ DSL](../concepts/query_dsl.md) の
+`geo_polygon` と同じです。外周の中にあり、どの穴の中にもない点を持つドキュメントを
+返します。外周の上の点はマッチし、穴の辺の上の点はマッチしません。どの一致も点数は
+1.0 です。
+
+頂点は、ドキュメントの点と同じく、文字列の鍵 `"lat"` と `"lon"` を持つ Hash です。
+`holes:` は環の Array です。環は、最後の頂点が最初の頂点と違えば閉じられます。辺は
+2 つの頂点の間の近いほう（経度の差が 180° 以下のほう）を通るので、多角形は日付変更線を
+またげます。
+
+環の異なる頂点が 3 つ未満、緯度か経度が範囲外、経度の差がちょうど 180° の辺がある、
+環が極を囲む、頂点に `"lat"` か `"lon"` がない、のどれかのときは、クエリを作る時点で
+`ArgumentError` を送出します。頂点が Hash でないときと、座標が数でないときは
+`TypeError` です。
+
+```ruby
+q = Laurus::GeoPolygonQuery.within_polygon(
+  "location",
+  [
+    { "lat" => 35.0, "lon" => 139.0 }, { "lat" => 35.0, "lon" => 140.0 },
+    { "lat" => 36.0, "lon" => 140.0 }, { "lat" => 36.0, "lon" => 139.0 },
+  ],
+  holes: [[
+    { "lat" => 35.4, "lon" => 139.4 }, { "lat" => 35.4, "lon" => 139.6 },
+    { "lat" => 35.6, "lon" => 139.6 }, { "lat" => 35.6, "lon" => 139.4 },
+  ]],
+)
+results = index.search(q, limit: 10).results
+```
+
+### GeoPolylineQuery
+
+```ruby
+Laurus::GeoPolylineQuery.within_distance(field, vertices, distance_m)
+```
+
+`Geo` フィールドへの、折れ線からの距離の検索で、[クエリ DSL](../concepts/query_dsl.md)
+の `geo_polyline` と同じです。折れ線から `distance_m` メートル以内の点を持つドキュ
+メントを返します。距離は `GeoDistanceQuery` と同じく地表の距離（半径 6,371,000 m）
+です。各辺は 2 つの頂点の間の短いほうの大円の弧で、頂点が 1 つなら点です。点数は、
+最も近い点の距離を `d` として `1 - d / distance_m` です。
+
+頂点の書き方は `GeoPolygonQuery` と同じです。頂点がない、緯度か経度が範囲外、対蹠点
+（とそこから約 640 m 以内の点）を結ぶ辺がある、頂点に `"lat"` か `"lon"` がない、の
+どれかのときは、クエリを作る時点で `ArgumentError` を送出します（対蹠点を結ぶ辺には、
+間に頂点を置いてください）。頂点が Hash でないときと、座標が数でないときは
+`TypeError` です。
+
 ### Geo3dDistanceQuery
 
 ```ruby
@@ -447,6 +501,23 @@ Laurus::Geo3dNearestQuery.k_nearest(
 
 3D ECEF 座標フィールドへの k 最近傍検索。`initial_radius_m:` / `max_radius_m:`
 キーワード引数（オプション）で反復拡張サーチの探索コーンを調整できます。
+
+### Geo3dPolylineQuery
+
+```ruby
+Laurus::Geo3dPolylineQuery.within_distance(field, vertices, distance_m)
+```
+
+3D ECEF 座標フィールドへの、折れ線からの距離の検索で、
+[クエリ DSL](../concepts/query_dsl.md) の `geo3d_polyline` と同じです。折れ線から
+`distance_m` メートル以内の点を持つドキュメントを返します。各辺は 2 つの頂点を結ぶ
+線分で、地表の下を通る弦です（[Geo3d の概念](../concepts/geo3d.md) を参照）。頂点が
+1 つなら点です。点数は、最も近い点の距離を `d` として `1 - d / distance_m` です。
+
+頂点は、ドキュメントの点と同じく、文字列の鍵 `"x"`・`"y"`・`"z"`（メートル）を持つ
+Hash です。頂点がない、座標が有限でない、頂点に `"x"`・`"y"`・`"z"` のどれかがない、の
+どれかのときは、クエリを作る時点で `ArgumentError` を送出します。頂点が Hash でない
+ときと、座標が数でないときは `TypeError` です。
 
 ### BooleanQuery
 

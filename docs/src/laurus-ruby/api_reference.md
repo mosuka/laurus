@@ -416,6 +416,63 @@ With `min_lon > max_lon` the box crosses the antimeridian (±180°): it runs eas
 from `min_lon` through ±180° to `max_lon`, as in GeoJSON (RFC 7946). An edge on
 exactly ±180° also matches points stored with the other sign.
 
+### GeoPolygonQuery
+
+```ruby
+Laurus::GeoPolygonQuery.within_polygon(field, exterior, holes: nil)
+```
+
+Polygon search over a `Geo` field, as `geo_polygon` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point inside
+the exterior ring and outside every hole: a point on the exterior is inside, a
+point on the edge of a hole is outside. Every hit scores 1.0.
+
+A vertex is a Hash with the string keys `"lat"` and `"lon"`, as a point in a
+document is written; `holes:` is an Array of rings. A ring is closed if its
+last vertex is not its first. An edge takes the shorter way between its two
+vertices (their longitudes differ by 180° or less), so a polygon may cross the
+antimeridian.
+
+Raises `ArgumentError` when the query is built if a ring has fewer than 3
+distinct vertices, a latitude or longitude is out of range, an edge spans
+exactly 180° of longitude, a ring goes around a pole, or a vertex has no
+`"lat"` or `"lon"`; `TypeError` if a vertex is not a Hash or a coordinate is
+not a number.
+
+```ruby
+q = Laurus::GeoPolygonQuery.within_polygon(
+  "location",
+  [
+    { "lat" => 35.0, "lon" => 139.0 }, { "lat" => 35.0, "lon" => 140.0 },
+    { "lat" => 36.0, "lon" => 140.0 }, { "lat" => 36.0, "lon" => 139.0 },
+  ],
+  holes: [[
+    { "lat" => 35.4, "lon" => 139.4 }, { "lat" => 35.4, "lon" => 139.6 },
+    { "lat" => 35.6, "lon" => 139.6 }, { "lat" => 35.6, "lon" => 139.4 },
+  ]],
+)
+results = index.search(q, limit: 10).results
+```
+
+### GeoPolylineQuery
+
+```ruby
+Laurus::GeoPolylineQuery.within_distance(field, vertices, distance_m)
+```
+
+Distance-to-polyline search over a `Geo` field, as `geo_polyline` in the
+[query DSL](../concepts/query_dsl.md). Returns documents with a point within
+`distance_m` metres of the polyline, along the surface (radius 6,371,000 m, as
+`GeoDistanceQuery`). Each edge is the shorter great-circle arc between its two
+vertices; one vertex is a point. A hit scores `1 - d / distance_m` by its
+closest point.
+
+Vertices are given as for `GeoPolygonQuery`. Raises `ArgumentError` when the
+query is built if there is no vertex, a latitude or longitude is out of range,
+an edge joins two antipodal points (or points within about 640 m of them; add
+a vertex between them), or a vertex has no `"lat"` or `"lon"`; `TypeError` if a
+vertex is not a Hash or a coordinate is not a number.
+
 ### Geo3dDistanceQuery
 
 ```ruby
@@ -451,6 +508,25 @@ Laurus::Geo3dNearestQuery.k_nearest(
 k-nearest-neighbour search over a 3D ECEF point field. The optional
 `initial_radius_m:` and `max_radius_m:` keyword arguments tune the
 iterative-expansion search cone.
+
+### Geo3dPolylineQuery
+
+```ruby
+Laurus::Geo3dPolylineQuery.within_distance(field, vertices, distance_m)
+```
+
+Distance-to-polyline search over a 3D ECEF point field, as `geo3d_polyline` in
+the [query DSL](../concepts/query_dsl.md). Returns documents whose point is
+within `distance_m` metres of the polyline. Each edge is the straight segment
+between its two vertices, a chord below the surface (see
+[Geo3d concepts](../concepts/geo3d.md)); one vertex is a point. A hit scores
+`1 - d / distance_m` by its closest point.
+
+A vertex is a Hash with the string keys `"x"`, `"y"` and `"z"` in metres, as a
+point in a document is written. Raises `ArgumentError` when the query is built
+if there is no vertex, a coordinate is not finite, or a vertex has no `"x"`,
+`"y"` or `"z"`; `TypeError` if a vertex is not a Hash or a coordinate is not a
+number.
 
 ### BooleanQuery
 

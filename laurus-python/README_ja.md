@@ -166,9 +166,12 @@ index.commit()     # WAL もフラッシュされます
 | `NumericRangeQuery(field, min, max)` | 数値範囲検索（int または float） |
 | `GeoDistanceQuery.within_radius(field, lat, lon, distance_m)` | 地理的距離検索（半径指定） |
 | `GeoBoundingBoxQuery.within_bounding_box(field, min_lat, min_lon, max_lat, max_lon)` | 地理的範囲検索（バウンディングボックス） |
+| `GeoPolygonQuery.within_polygon(field, exterior, holes=None)` | 地理的な多角形の検索（穴を持てる）。頂点は `{"lat": ..., "lon": ...}` |
+| `GeoPolylineQuery.within_distance(field, vertices, distance_m)` | 地理的な折れ線からの距離の検索 |
 | `Geo3dDistanceQuery.within_sphere(field, x, y, z, distance_m)` | 3D ECEF 球距離検索 |
 | `Geo3dBoundingBoxQuery.within_box(field, min_x, min_y, min_z, max_x, max_y, max_z)` | 3D ECEF AABB 検索 |
 | `Geo3dNearestQuery.k_nearest(field, x, y, z, k)` | 3D ECEF k 最近傍検索 |
+| `Geo3dPolylineQuery.within_distance(field, vertices, distance_m)` | 3D ECEF の折れ線からの距離の検索。頂点は `{"x": ..., "y": ..., "z": ...}` |
 | `BooleanQuery(must, should, must_not)` | 複合ブール検索 |
 | `SpanNearQuery(field, [terms], slop)` | 近接検索（スパン） |
 | `VectorQuery(field, vector)` | 事前計算済みベクトルによる類似度検索 |

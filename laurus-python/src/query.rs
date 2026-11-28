@@ -8,14 +8,17 @@ use laurus::GeoEcefPoint;
 use laurus::lexical::span::{SpanQueryBuilder, SpanQueryWrapper};
 use laurus::lexical::{
     BooleanQuery, DateTimeRangeQuery, FuzzyQuery, Geo3dBoundingBoxQuery, Geo3dDistanceQuery,
-    Geo3dNearestQuery, GeoBoundingBoxQuery, GeoDistanceQuery, NumericRangeQuery, PhraseQuery,
-    TermQuery, WildcardQuery,
+    Geo3dNearestQuery, Geo3dPolyline, Geo3dPolylineQuery, GeoBoundingBoxQuery, GeoDistanceQuery,
+    GeoPolygonQuery, GeoPolylineQuery, NumericRangeQuery, PhraseQuery, TermQuery, WildcardQuery,
 };
 use laurus::vector::Vector;
 use laurus::vector::store::request::QueryVector;
 use laurus::{DataValue, LexicalSearchQuery, QueryPayload, VectorSearchQuery};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+use crate::errors::laurus_err;
 
 // ---------------------------------------------------------------------------
 // Helper: extract a lexical LexicalSearchQuery from any Python query object
@@ -25,7 +28,8 @@ use pyo3::prelude::*;
 ///
 /// Supports: `TermQuery`, `PhraseQuery`, `FuzzyQuery`, `WildcardQuery`,
 /// `NumericRangeQuery`, `GeoDistanceQuery`, `GeoBoundingBoxQuery`,
-/// `Geo3dDistanceQuery`, `Geo3dBoundingBoxQuery`, `Geo3dNearestQuery`,
+/// `GeoPolygonQuery`, `GeoPolylineQuery`, `Geo3dDistanceQuery`,
+/// `Geo3dBoundingBoxQuery`, `Geo3dNearestQuery`, `Geo3dPolylineQuery`,
 /// `BooleanQuery`, `SpanQuery`.
 pub fn extract_lexical_query(
     py: Python,
@@ -59,6 +63,15 @@ pub fn extract_lexical_query(
     }
     if let Ok(q) = obj.extract::<PyRef<PyGeoBoundingBoxQuery>>() {
         return q.build().map_err(|e| PyValueError::new_err(e.to_string()));
+    }
+    if let Ok(q) = obj.extract::<PyRef<PyGeoPolygonQuery>>() {
+        return Ok(Box::new(q.query.clone()));
+    }
+    if let Ok(q) = obj.extract::<PyRef<PyGeoPolylineQuery>>() {
+        return Ok(Box::new(q.query.clone()));
+    }
+    if let Ok(q) = obj.extract::<PyRef<PyGeo3dPolylineQuery>>() {
+        return Ok(Box::new(q.query.clone()));
     }
     if let Ok(q) = obj.extract::<PyRef<PyGeo3dDistanceQuery>>() {
         return Ok(q.build());
@@ -818,6 +831,287 @@ impl PyGeo3dNearestQuery {
             q = q.with_max_radius(r);
         }
         Box::new(q)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vertices of a polygon or a polyline (Issue #1596)
+// ---------------------------------------------------------------------------
+
+/// Read `obj`, an iterable, as a list of vertices, each read by `read`.
+///
+/// `what` names the list in the errors ("the exterior", "hole 0", "the
+/// polyline"). A `str` or a `dict` given for the list iterates its
+/// characters or keys, none of which is a vertex.
+fn vertices<T>(
+    obj: &Bound<PyAny>,
+    what: &str,
+    read: fn(&Bound<PyAny>, &str, usize) -> PyResult<T>,
+) -> PyResult<Vec<T>> {
+    obj.try_iter()?
+        .enumerate()
+        .map(|(i, vertex)| read(&vertex?, what, i))
+        .collect()
+}
+
+/// Read a vertex as `(lat, lon)`: a dict with the keys `"lat"` and `"lon"`.
+fn lat_lon_vertex(obj: &Bound<PyAny>, what: &str, index: usize) -> PyResult<(f64, f64)> {
+    let [lat, lon] = coordinates(obj, what, index, ["lat", "lon"])?;
+    Ok((lat, lon))
+}
+
+/// Read a vertex as an ECEF point: a dict with the keys `"x"`, `"y"` and
+/// `"z"`.
+fn ecef_vertex(obj: &Bound<PyAny>, what: &str, index: usize) -> PyResult<GeoEcefPoint> {
+    let [x, y, z] = coordinates(obj, what, index, ["x", "y", "z"])?;
+    Ok(GeoEcefPoint::new(x, y, z))
+}
+
+/// The coordinates `keys` of a vertex, a dict with those keys, as every
+/// binding takes a keyed vertex. Other keys are not read; a tuple is not a
+/// vertex.
+fn coordinates<const N: usize>(
+    obj: &Bound<PyAny>,
+    what: &str,
+    index: usize,
+    keys: [&str; N],
+) -> PyResult<[f64; N]> {
+    let quoted = || {
+        keys.iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let dict = obj.cast::<PyDict>().map_err(|_| {
+        PyValueError::new_err(format!(
+            "vertex {index} of {what} must be a dict with the keys {}, got {}",
+            quoted(),
+            type_name(obj)
+        ))
+    })?;
+    let mut coordinates = [0.0; N];
+    for (coordinate, key) in coordinates.iter_mut().zip(keys) {
+        let value = dict.get_item(key)?.ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "vertex {index} of {what} has no \"{key}\": a vertex is a dict with the keys {}",
+                quoted()
+            ))
+        })?;
+        *coordinate = value.extract::<f64>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "vertex {index} of {what} has a \"{key}\" that is not a number: {}",
+                type_name(&value)
+            ))
+        })?;
+    }
+    Ok(coordinates)
+}
+
+/// The Python type name of `obj`, for an error.
+fn type_name(obj: &Bound<PyAny>) -> String {
+    obj.get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolygonQuery
+// ---------------------------------------------------------------------------
+
+/// Matches the documents with a point of a `Geo` field inside a polygon,
+/// with holes, as `geo_polygon` in the DSL does.
+///
+/// An edge takes the shorter way between its vertices, so a polygon may
+/// cross the antimeridian; a ring is closed if its last vertex is not its
+/// first. Every hit scores 1.0.
+///
+/// ## Example
+///
+/// ```python
+/// q = laurus.GeoPolygonQuery.within_polygon(
+///     "location",
+///     [{"lat": 35.0, "lon": 139.0}, {"lat": 35.0, "lon": 140.0},
+///      {"lat": 36.0, "lon": 140.0}, {"lat": 36.0, "lon": 139.0}],
+///     holes=[[{"lat": 35.4, "lon": 139.4}, {"lat": 35.4, "lon": 139.6},
+///             {"lat": 35.6, "lon": 139.6}, {"lat": 35.6, "lon": 139.4}]],
+/// )
+/// results = index.search(q, limit=10).results
+/// ```
+#[pyclass(name = "GeoPolygonQuery")]
+pub struct PyGeoPolygonQuery {
+    pub query: GeoPolygonQuery,
+}
+
+#[pymethods]
+impl PyGeoPolygonQuery {
+    /// Create a polygon query.
+    ///
+    /// Args:
+    ///     field: Geo field name.
+    ///     exterior: The exterior ring: a list of vertices, each a dict
+    ///         with the keys "lat" and "lon".
+    ///     holes: A list of rings, each like `exterior`. Optional.
+    ///
+    /// Raises:
+    ///     ValueError: If a vertex is not a point, a ring has fewer than 3
+    ///         distinct vertices, a latitude or longitude is out of range,
+    ///         an edge spans exactly 180 degrees of longitude, or a ring
+    ///         goes around a pole.
+    #[staticmethod]
+    #[pyo3(signature = (field, exterior, holes=None))]
+    pub fn within_polygon(
+        field: String,
+        exterior: &Bound<PyAny>,
+        holes: Option<&Bound<PyAny>>,
+    ) -> PyResult<Self> {
+        let exterior = vertices(exterior, "the exterior", lat_lon_vertex)?;
+        let holes: Vec<Vec<(f64, f64)>> = match holes {
+            None => Vec::new(),
+            Some(holes) => vertices(holes, "holes", |hole, _, i| {
+                vertices(hole, &format!("hole {i}"), lat_lon_vertex)
+            })?,
+        };
+        let holes: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
+        let query =
+            GeoPolygonQuery::within_polygon(field, &exterior, &holes).map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+
+    fn __repr__(&self) -> String {
+        let polygon = self.query.polygon();
+        format!(
+            "GeoPolygonQuery.within_polygon(field='{}', exterior={} vertices, holes={})",
+            self.query.field(),
+            // The ring is kept closed: its last vertex repeats its first.
+            polygon.exterior().len() - 1,
+            polygon.holes().len()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeoPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// Matches the documents with a point of a `Geo` field within a distance of
+/// a polyline, as `geo_polyline` in the DSL does.
+///
+/// Each edge is the shorter great-circle arc between its vertices, and the
+/// distance is along the surface to the closest point of the polyline.
+/// A hit scores `1 - d / distance_m` by its closest point.
+///
+/// ## Example
+///
+/// ```python
+/// q = laurus.GeoPolylineQuery.within_distance(
+///     "location",
+///     [{"lat": 35.68, "lon": 139.76}, {"lat": 35.71, "lon": 139.81}],
+///     1000.0,
+/// )
+/// results = index.search(q, limit=10).results
+/// ```
+#[pyclass(name = "GeoPolylineQuery")]
+pub struct PyGeoPolylineQuery {
+    pub query: GeoPolylineQuery,
+}
+
+#[pymethods]
+impl PyGeoPolylineQuery {
+    /// Create a distance-to-polyline query.
+    ///
+    /// Args:
+    ///     field: Geo field name.
+    ///     vertices: The polyline: a list of vertices, each a dict with the
+    ///         keys "lat" and "lon". One vertex is a point.
+    ///     distance_m: Maximum distance from the polyline in meters.
+    ///
+    /// Raises:
+    ///     ValueError: If a vertex is not a point, there is no vertex, a
+    ///         latitude or longitude is out of range, or an edge joins two
+    ///         antipodal points.
+    #[staticmethod]
+    pub fn within_distance(
+        field: String,
+        vertices: &Bound<PyAny>,
+        distance_m: f64,
+    ) -> PyResult<Self> {
+        let vertices = self::vertices(vertices, "the polyline", lat_lon_vertex)?;
+        let query =
+            GeoPolylineQuery::within_distance(field, &vertices, distance_m).map_err(laurus_err)?;
+        Ok(Self { query })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GeoPolylineQuery.within_distance(field='{}', vertices={}, distance_m={})",
+            self.query.field(),
+            self.query.polyline().vertices().len(),
+            self.query.distance_m()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Geo3dPolylineQuery
+// ---------------------------------------------------------------------------
+
+/// 3D ECEF distance-to-polyline query: matches the documents whose stored
+/// `(x, y, z)` point lies within `distance_m` meters of a polyline, as
+/// `geo3d_polyline` in the DSL does.
+///
+/// Each edge is the straight segment between its vertices. A hit scores
+/// `1 - d / distance_m` by its closest point.
+///
+/// ## Example
+///
+/// ```python
+/// q = laurus.Geo3dPolylineQuery.within_distance(
+///     "position",
+///     [{"x": -3955182.0, "y": 3350553.0, "z": 3700276.0},
+///      {"x": -3961178.0, "y": 3346187.0, "z": 3702490.0}],
+///     500.0,
+/// )
+/// results = index.search(q, limit=10).results
+/// ```
+#[pyclass(name = "Geo3dPolylineQuery")]
+pub struct PyGeo3dPolylineQuery {
+    pub query: Geo3dPolylineQuery,
+}
+
+#[pymethods]
+impl PyGeo3dPolylineQuery {
+    /// Create a 3D distance-to-polyline query.
+    ///
+    /// Args:
+    ///     field: Geo3d field name.
+    ///     vertices: The polyline: a list of vertices, each a dict with the
+    ///         keys "x", "y" and "z", in ECEF meters. One vertex is a point.
+    ///     distance_m: Maximum distance from the polyline in meters.
+    ///
+    /// Raises:
+    ///     ValueError: If a vertex is not a point, there is no vertex, or a
+    ///         coordinate is not finite.
+    #[staticmethod]
+    pub fn within_distance(
+        field: String,
+        vertices: &Bound<PyAny>,
+        distance_m: f64,
+    ) -> PyResult<Self> {
+        let vertices = self::vertices(vertices, "the polyline", ecef_vertex)?;
+        let polyline = Geo3dPolyline::new(vertices).map_err(laurus_err)?;
+        Ok(Self {
+            query: Geo3dPolylineQuery::new(field, polyline, distance_m),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Geo3dPolylineQuery.within_distance(field='{}', vertices={}, distance_m={})",
+            self.query.field(),
+            self.query.polyline().vertices().len(),
+            self.query.distance_m()
+        )
     }
 }
 
