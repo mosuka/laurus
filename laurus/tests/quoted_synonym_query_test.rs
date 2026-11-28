@@ -389,6 +389,7 @@ async fn a_stacked_synonym_or_scores_like_the_repeated_word() -> Result<()> {
 fn weighted_syn_analyzer(boost: f32) -> Arc<dyn Analyzer> {
     let mut dict = SynonymDictionary::new(None).unwrap();
     dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+    dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
     Arc::new(plain_analyzer().add_filter(Arc::new(
         SynonymGraphFilter::new(dict, true).with_boost(boost),
     )))
@@ -471,6 +472,39 @@ async fn a_weighted_synonym_on_an_index_time_synonym_field_keeps_the_ranking() -
     assert!((big - large).abs() < 1e-6, "{weighted:?}");
     assert!(
         big < score_in(&unweighted, "big_dog"),
+        "{weighted:?} {unweighted:?}"
+    );
+    Ok(())
+}
+
+/// Issue #1704: a quoted value through a multi-word synonym weighs each
+/// path by its tokens' boosts. With query-time-only synonyms (`plain`), the
+/// document matching `ml is` (the original words, product 1) ranks above
+/// the one matching `machine learning is` (0.72 × 0.64), which an
+/// unweighted graph phrase scores the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_weighted_graph_phrase_ranks_the_original_words_path_first() -> Result<()> {
+    let engine = engine().await?;
+
+    let unweighted = scores(&engine, syn_analyzer(), "plain:\"ml is\"").await?;
+    assert!(
+        (score_in(&unweighted, "ml") - score_in(&unweighted, "machine_learning")).abs() < 1e-6,
+        "unweighted, both paths score alike: {unweighted:?}"
+    );
+
+    let weighted = scores(&engine, weighted_syn_analyzer(0.8), "plain:\"ml is\"").await?;
+    let (ml, machine_learning) = (
+        score_in(&weighted, "ml"),
+        score_in(&weighted, "machine_learning"),
+    );
+    assert!(
+        machine_learning < ml,
+        "the synonym's path scores below: {weighted:?}"
+    );
+    // The original words' path is the heaviest, so its document's score
+    // does not move.
+    assert!(
+        (ml - score_in(&unweighted, "ml")).abs() < 1e-6,
         "{weighted:?} {unweighted:?}"
     );
     Ok(())

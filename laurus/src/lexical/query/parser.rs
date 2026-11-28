@@ -1031,17 +1031,17 @@ impl LexicalQueryParser {
                         }
                     } else {
                         // Several paths of two or more positions, which
-                        // `GraphPhraseQuery` matches without listing them,
-                        // so there is no path to multiply the boosts of:
-                        // it keeps the query's boost only. Lucene's
-                        // multi-phrase path does not use them either.
+                        // `GraphPhraseQuery` matches without listing them.
+                        // Each arc carries its tokens' largest boost, and
+                        // the query weighs each path by the product of its
+                        // arcs' boosts (Issue #1704), as Lucene's
+                        // `analyzeGraphPhrase` boosts each path's phrase.
+                        let (arcs, boosts): (Vec<PhraseArc>, Vec<f32>) = arcs.into_iter().unzip();
                         clauses.push(Box::new(
-                            GraphPhraseQuery::from_arcs(
-                                field_name,
-                                arcs.into_iter().map(|(arc, _)| arc).collect(),
-                            )
-                            .with_slop(slop)
-                            .with_boost(boost),
+                            GraphPhraseQuery::from_arcs(field_name, arcs)
+                                .with_arc_boosts(boosts)
+                                .with_slop(slop)
+                                .with_boost(boost),
                         ));
                     }
                     clauses
@@ -3107,6 +3107,28 @@ mod tests {
         )
     }
 
+    /// A graph phrase over `arcs` (from, to, terms, boost), as
+    /// `should_clauses` describes it: the description shows each arc boost
+    /// that is not 1.
+    fn weighted_graph(arcs: &[(u32, u32, &[&str], f32)], slop: u32, boost: f32) -> (String, f32) {
+        let (arcs, boosts): (Vec<PhraseArc>, Vec<f32>) = arcs
+            .iter()
+            .map(|&(from, to, terms, arc_boost)| {
+                (
+                    PhraseArc::new(from, to, terms.iter().map(|t| t.to_string()).collect()),
+                    arc_boost,
+                )
+            })
+            .unzip();
+        (
+            GraphPhraseQuery::from_arcs("body", arcs)
+                .with_arc_boosts(boosts)
+                .with_slop(slop)
+                .description(),
+            boost,
+        )
+    }
+
     /// The Should clauses of `query`, or `query` itself.
     fn clauses(query: &dyn Query) -> Vec<&dyn Query> {
         match query.as_any().downcast_ref::<BooleanQuery>() {
@@ -3623,11 +3645,12 @@ mod tests {
     }
 
     /// A graph with several paths of two or more positions is one
-    /// `GraphPhraseQuery`, which matches them without listing them, so it
-    /// keeps the query's boost only: Lucene's multi-phrase path does not use
-    /// token boosts either.
+    /// `GraphPhraseQuery`, which matches them without listing them; each
+    /// arc carries its tokens' boost, so the query weighs each path by the
+    /// product of its arcs' boosts (Issue #1704), here 4 for `ml is` and 8
+    /// for `machine learning is`.
     #[test]
-    fn a_graph_phrase_keeps_the_query_boost_only() {
+    fn a_graph_phrase_carries_its_arcs_token_boosts() {
         let tokens = vec![
             Token::new("ml", 0).with_position_length(2).with_boost(2.0),
             Token::new("machine", 0)
@@ -3640,16 +3663,34 @@ mod tests {
         let query = parser.parse("\"anything\"").unwrap();
         assert_eq!(
             should_clauses(query.as_ref()),
-            vec![graph(
+            vec![weighted_graph(
                 &[
-                    (0, 1, &["machine"]),
-                    (0, 2, &["ml"]),
-                    (1, 2, &["learning"]),
-                    (2, 3, &["is"]),
+                    (0, 1, &["machine"], 2.0),
+                    (0, 2, &["ml"], 2.0),
+                    (1, 2, &["learning"], 2.0),
+                    (2, 3, &["is"], 2.0),
                 ],
                 0,
                 1.0
             )]
         );
+    }
+
+    /// A graph phrase whose tokens' boosts are all 1 has no arc boosts.
+    #[test]
+    fn a_graph_phrase_of_unboosted_tokens_carries_no_arc_boosts() {
+        let tokens = vec![
+            Token::new("ml", 0).with_position_length(2),
+            Token::new("machine", 0).with_position_increment(0),
+            Token::new("learning", 1),
+            Token::new("is", 2),
+        ];
+        let parser = LexicalQueryParser::new(Arc::new(Fixed(tokens))).with_default_field("body");
+        let query = parser.parse("\"anything\"").unwrap();
+        let graph = query
+            .as_any()
+            .downcast_ref::<GraphPhraseQuery>()
+            .expect("a graph phrase");
+        assert_eq!(graph.arc_boosts(), None);
     }
 }

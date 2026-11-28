@@ -8,15 +8,23 @@
 //! phrase matcher depends only on the previous matched position
 //! (`next_in_window`), so the positions a path can reach are carried from
 //! node to node along the arcs.
+//!
+//! The arcs can carry their tokens' boosts (Issue #1704), as Lucene's
+//! `QueryBuilder::analyzeGraphPhrase` boosts each path's phrase by the
+//! product of its tokens' boosts. The walk carries each path's product
+//! along with its positions, so the paths are weighed without being listed:
+//! the largest product over the graph multiplies the score, and a match
+//! counts as the largest product of the paths completing at its anchor
+//! divided by it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::error::Result;
+use crate::error::{LaurusError, Result};
 use crate::lexical::query::matcher::Matcher;
 use crate::lexical::query::phrase::{PhraseMatch, PhraseMatcher, PhraseScorer, next_in_window};
 use crate::lexical::query::scorer::{BM25Scorer, Scorer};
-use crate::lexical::query::{HighlightTerm, Query};
+use crate::lexical::query::{HighlightTerm, Query, check_query_boost, is_valid_boost};
 use crate::lexical::reader::LexicalIndexReader;
 
 /// One arc of a phrase graph: any of `terms` spans the positions from node
@@ -105,6 +113,11 @@ pub(crate) fn complete_paths_with_origins(
 /// documents matched are those that some path's phrase matches, but the
 /// work grows with the arcs, not with the number of paths. A document gets
 /// one phrase score, from the anchors where some path completes.
+///
+/// The parser gives each arc its tokens' largest boost (Issue #1704). The
+/// score is then multiplied by the largest product of the arc boosts over
+/// the paths, and each anchor counts as the largest product of the paths
+/// completing there divided by it ([`arc_boosts`](Self::arc_boosts)).
 #[derive(Debug, Clone)]
 pub struct GraphPhraseQuery {
     /// The field to search in.
@@ -119,6 +132,12 @@ pub struct GraphPhraseQuery {
     boost: f32,
     /// The largest gap allowed after each position, as in `PhraseQuery`.
     slop: u32,
+    /// Each arc's token boost, in the order of `arcs`, or `None` when every
+    /// arc's is 1 (Issue #1704).
+    arc_boosts: Option<Vec<f32>>,
+    /// The largest product of the arc boosts over the paths, which
+    /// multiplies the score; 1 without arc boosts.
+    path_factor: f32,
 }
 
 impl GraphPhraseQuery {
@@ -164,7 +183,43 @@ impl GraphPhraseQuery {
             longest: depth[last as usize],
             boost: 1.0,
             slop: 0,
+            arc_boosts: None,
+            path_factor: 1.0,
         }
+    }
+
+    /// Weigh each path by the product of its arcs' token boosts, `boosts`
+    /// in the order of the arcs (Issue #1704). The largest product over the
+    /// graph's paths multiplies the score, and a match counts as the largest
+    /// product of the paths completing at its anchor divided by it, so the
+    /// weights are in [0, 1]. The largest product comes from the graph, not
+    /// from the documents, so a document matching only a lighter path
+    /// scores below one matching the heaviest.
+    pub(crate) fn with_arc_boosts(mut self, boosts: Vec<f32>) -> Self {
+        debug_assert_eq!(boosts.len(), self.arcs.len(), "one boost per arc");
+        if boosts.iter().all(|&boost| boost == 1.0) {
+            self.arc_boosts = None;
+            self.path_factor = 1.0;
+            return self;
+        }
+        // Arcs are sorted by `from`, so every arc into a node comes before
+        // the arcs leaving it, as for the depth in `from_arcs`.
+        let mut best = vec![0.0_f32; self.last as usize + 1];
+        best[0] = 1.0;
+        for (arc, &boost) in self.arcs.iter().zip(&boosts) {
+            let through = best[arc.from as usize] * boost;
+            let reached = &mut best[arc.to as usize];
+            *reached = reached.max(through);
+        }
+        self.path_factor = best[self.last as usize];
+        self.arc_boosts = Some(boosts);
+        self
+    }
+
+    /// Get each arc's token boost, in the order of [`arcs`](Self::arcs), or
+    /// `None` when every arc's is 1.
+    pub fn arc_boosts(&self) -> Option<&[f32]> {
+        self.arc_boosts.as_deref()
     }
 
     /// Set the boost factor for this query.
@@ -199,6 +254,56 @@ impl GraphPhraseQuery {
     /// Each distinct term's postings are read once. A term missing from the
     /// index only drops its alternative, as in `PhraseQuery`.
     pub(crate) fn find_matches(&self, reader: &dyn LexicalIndexReader) -> Result<Vec<PhraseMatch>> {
+        Ok(self
+            .match_anchors::<()>(reader)?
+            .into_iter()
+            .map(|(doc_id, anchors)| {
+                // `(u64, ())` is laid out as `u64`, so this collects in place.
+                phrase_match(
+                    doc_id,
+                    anchors.into_iter().map(|(anchor, ())| anchor).collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// The matches of [`find_matches`](Self::find_matches), with each
+    /// document's weighted phrase frequency: the sum, over its anchors, of
+    /// the largest product of the paths completing there divided by the
+    /// graph's largest (Issue #1704).
+    fn weighted_matches(&self, reader: &dyn LexicalIndexReader) -> Result<WeightedMatches> {
+        let factor = self.path_factor;
+        let mut matches = Vec::new();
+        let mut freqs = Vec::new();
+        for (doc_id, anchors) in self.match_anchors::<f32>(reader)? {
+            // With no path weighing more than 0, every score is 0 anyway.
+            let freq: f32 = anchors
+                .iter()
+                .map(|&(_, product)| {
+                    if factor > 0.0 {
+                        (product / factor).min(1.0)
+                    } else {
+                        1.0
+                    }
+                })
+                .sum();
+            freqs.push((doc_id, freq));
+            matches.push(phrase_match(
+                doc_id,
+                anchors.into_iter().map(|(anchor, _)| anchor).collect(),
+            ));
+        }
+        Ok((matches, freqs))
+    }
+
+    /// Per document where some path matches, sorted by document ID, the
+    /// anchors where a path completes, sorted, each with the weight `W` of
+    /// the paths completing there ([`complete_anchors`]).
+    fn match_anchors<W: PathWeight>(
+        &self,
+        reader: &dyn LexicalIndexReader,
+    ) -> Result<AnchorsByDoc<W>> {
+        let boosts = self.arc_boosts.as_deref().unwrap_or(&[]);
         let mut terms: Vec<&str> = Vec::new();
         let mut term_ids: HashMap<&str, usize> = HashMap::new();
         let arc_terms: Vec<Vec<usize>> = self
@@ -257,16 +362,13 @@ impl GraphPhraseQuery {
                 })
                 .collect();
 
-            let anchors = complete_anchors(&self.arcs, self.last, &occurrences, self.slop);
+            let anchors =
+                complete_anchors::<_, W>(&self.arcs, boosts, self.last, &occurrences, self.slop);
             if !anchors.is_empty() {
-                matches.push(PhraseMatch {
-                    doc_id,
-                    phrase_freq: u32::try_from(anchors.len()).unwrap_or(u32::MAX),
-                    positions: anchors,
-                });
+                matches.push((doc_id, anchors));
             }
         }
-        matches.sort_by_key(|m| m.doc_id);
+        matches.sort_by_key(|&(doc_id, _)| doc_id);
         Ok(matches)
     }
 
@@ -287,18 +389,93 @@ impl GraphPhraseQuery {
             return Ok(Box::new(BM25Scorer::new(0, 0, 0, 1.0, 1, self.boost)));
         }
         let avg_field_length = reader.field_statistics(&self.field)?.avg_field_length;
-        let boost = self.boost * (1.0 + 0.2 * (self.longest as f32 - 1.0));
         Ok(Box::new(PhraseScorer::new(
             matches,
             total_docs,
             avg_field_length,
-            boost,
+            self.score_boost(),
         )))
+    }
+
+    /// A phrase scorer over each document's weighted phrase frequency, as
+    /// [`scorer_for`](Self::scorer_for), with the largest path product
+    /// multiplied into the boost (Issue #1704).
+    ///
+    /// # Errors
+    ///
+    /// As [`scorer_for`](Self::scorer_for).
+    fn weighted_scorer_for(
+        &self,
+        reader: &dyn LexicalIndexReader,
+        freqs: Vec<(u64, f32)>,
+    ) -> Result<Box<dyn Scorer>> {
+        let total_docs = reader.doc_count();
+        if total_docs == 0 {
+            return Ok(Box::new(BM25Scorer::new(0, 0, 0, 1.0, 1, self.boost)));
+        }
+        let avg_field_length = reader.field_statistics(&self.field)?.avg_field_length;
+        Ok(Box::new(PhraseScorer::from_phrase_freqs(
+            freqs,
+            total_docs,
+            avg_field_length,
+            self.score_boost() * self.path_factor,
+        )))
+    }
+
+    /// The query's boost with the length boost of the longest path.
+    fn score_boost(&self) -> f32 {
+        self.boost * (1.0 + 0.2 * (self.longest as f32 - 1.0))
+    }
+}
+
+/// A phrase match at `anchors`, sorted.
+fn phrase_match(doc_id: u64, anchors: Vec<u64>) -> PhraseMatch {
+    PhraseMatch {
+        doc_id,
+        phrase_freq: u32::try_from(anchors.len()).unwrap_or(u32::MAX),
+        positions: anchors,
+    }
+}
+
+/// Per matching document, sorted by document ID, its anchors where a path
+/// completes, sorted, each with the weight `W` of the paths completing there.
+type AnchorsByDoc<W> = Vec<(u64, Vec<(u64, W)>)>;
+
+/// A weighted graph phrase's matches, and each matching document's weighted
+/// phrase frequency, both sorted by document ID.
+type WeightedMatches = (Vec<PhraseMatch>, Vec<(u64, f32)>);
+
+/// What a path carries through [`complete_anchors`]: nothing for an
+/// unweighted graph, so its walk is the plain one, or the product of its
+/// arcs' boosts for a weighted one (Issue #1704).
+trait PathWeight: Copy {
+    /// The weight of a path of no arcs.
+    const ONE: Self;
+    /// The weight after one more arc of `boost`.
+    fn through(self, boost: f32) -> Self;
+    /// The weight to keep of two paths that reach the same state.
+    fn larger(self, other: Self) -> Self;
+}
+
+impl PathWeight for () {
+    const ONE: Self = ();
+    fn through(self, _boost: f32) -> Self {}
+    fn larger(self, _other: Self) -> Self {}
+}
+
+impl PathWeight for f32 {
+    const ONE: Self = 1.0;
+    fn through(self, boost: f32) -> Self {
+        self * boost
+    }
+    fn larger(self, other: Self) -> Self {
+        self.max(other)
     }
 }
 
 /// The anchors (positions of a first term) from which some path through
-/// `arcs` completes in one document, sorted.
+/// `arcs` completes in one document, sorted, each with the weight of the
+/// heaviest path completing there.
 ///
 /// `occurrences` holds, per arc, the sorted positions of its terms. A path
 /// anchors on any occurrence of its first arc, and each next arc must occur
@@ -306,20 +483,34 @@ impl GraphPhraseQuery {
 /// `PhraseMatcher` checks one phrase. That step depends only on the previous
 /// position, so the (anchor, previous position) pairs some path brings to a
 /// node are enough to go on from it, whichever path brought them.
-fn complete_anchors<O: AsRef<[u64]>>(
+///
+/// A weight `W` rides along with each pair ([`PathWeight`]): for `f32`, the
+/// product of the path's arc boosts, `boosts` in the order of `arcs` (Issue
+/// #1704). When two paths bring the same pair, the larger product is kept:
+/// what follows depends only on the pair, and a boost of 0 or more keeps
+/// the order of the products (max(a, b) × c = max(a × c, b × c)), so the
+/// kept product is the largest of every path through the pair. For `()`,
+/// nothing rides along and `boosts` is not read.
+fn complete_anchors<O: AsRef<[u64]>, W: PathWeight>(
     arcs: &[PhraseArc],
+    boosts: &[f32],
     last: u32,
     occurrences: &[O],
     slop: u32,
-) -> Vec<u64> {
-    let mut states: Vec<Vec<(u64, u64)>> = vec![Vec::new(); last as usize + 1];
+) -> Vec<(u64, W)> {
+    let mut states: Vec<Vec<(u64, u64, W)>> = vec![Vec::new(); last as usize + 1];
     let mut settled = 0;
-    for (arc, occurrences) in arcs.iter().zip(occurrences) {
+    for (i, (arc, occurrences)) in arcs.iter().zip(occurrences).enumerate() {
+        let through = |weight: W| weight.through(boosts.get(i).copied().unwrap_or(1.0));
         let occurrences = occurrences.as_ref();
         let (before, after) = states.split_at_mut(arc.to as usize);
         let reached = &mut after[0];
         if arc.from == 0 {
-            reached.extend(occurrences.iter().map(|&position| (position, position)));
+            reached.extend(
+                occurrences
+                    .iter()
+                    .map(|&position| (position, position, through(W::ONE))),
+            );
             continue;
         }
 
@@ -327,22 +518,34 @@ fn complete_anchors<O: AsRef<[u64]>>(
         let states_at = &mut before[arc.from as usize];
         if arc.from != settled {
             settled = arc.from;
-            states_at.sort_unstable();
-            states_at.dedup();
+            states_at.sort_unstable_by_key(|&(anchor, previous, _)| (anchor, previous));
+            states_at.dedup_by(|later, kept| {
+                let same = (later.0, later.1) == (kept.0, kept.1);
+                if same {
+                    kept.2 = kept.2.larger(later.2);
+                }
+                same
+            });
         }
-        for &(anchor, previous) in states_at.iter() {
+        for &(anchor, previous, weight) in states_at.iter() {
             if let Some(position) = next_in_window(occurrences, previous, slop) {
-                reached.push((anchor, position));
+                reached.push((anchor, position, through(weight)));
             }
         }
     }
 
-    let mut anchors: Vec<u64> = states[last as usize]
+    let mut anchors: Vec<(u64, W)> = states[last as usize]
         .iter()
-        .map(|&(anchor, _)| anchor)
+        .map(|&(anchor, _, weight)| (anchor, weight))
         .collect();
-    anchors.sort_unstable();
-    anchors.dedup();
+    anchors.sort_unstable_by_key(|&(anchor, _)| anchor);
+    anchors.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 = kept.1.larger(later.1);
+        }
+        same
+    });
     anchors
 }
 
@@ -354,6 +557,10 @@ impl Query for GraphPhraseQuery {
     }
 
     fn scorer(&self, reader: &dyn LexicalIndexReader) -> Result<Box<dyn Scorer>> {
+        if self.arc_boosts.is_some() {
+            let (_, freqs) = self.weighted_matches(reader)?;
+            return self.weighted_scorer_for(reader, freqs);
+        }
         let matches = self.find_matches(reader)?;
         self.scorer_for(reader, &matches)
     }
@@ -362,9 +569,35 @@ impl Query for GraphPhraseQuery {
         &self,
         reader: &dyn LexicalIndexReader,
     ) -> Result<(Box<dyn Matcher>, Box<dyn Scorer>)> {
+        if self.arc_boosts.is_some() {
+            let (matches, freqs) = self.weighted_matches(reader)?;
+            let scorer = self.weighted_scorer_for(reader, freqs)?;
+            return Ok((Box::new(PhraseMatcher::from_matches(matches)), scorer));
+        }
         let matches = self.find_matches(reader)?;
         let scorer = self.scorer_for(reader, &matches)?;
         Ok((Box::new(PhraseMatcher::from_matches(matches)), scorer))
+    }
+
+    /// Check the query's boost (Issue #1550), each arc's token boost, which
+    /// must be finite and 0 or more, and the largest path product times the
+    /// boost, which must stay finite (Issue #1704).
+    fn validate_boosts(&self) -> Result<()> {
+        check_query_boost(self.boost, || self.description())?;
+        let Some(boosts) = &self.arc_boosts else {
+            return Ok(());
+        };
+        for (arc, &boost) in self.arcs.iter().zip(boosts) {
+            if !is_valid_boost(boost) {
+                return Err(LaurusError::invalid_argument(format!(
+                    "a graph phrase's token boost must be finite and at least 0, got {boost} \
+                     for {:?}: {}",
+                    arc.terms,
+                    self.description()
+                )));
+            }
+        }
+        check_query_boost(self.boost * self.path_factor, || self.description())
     }
 
     fn boost(&self) -> f32 {
@@ -376,11 +609,29 @@ impl Query for GraphPhraseQuery {
     }
 
     fn description(&self) -> String {
+        // An arc boost shows only when it is not 1, so an unweighted
+        // query's description is the same as before arc boosts existed.
+        let arcs = match &self.arc_boosts {
+            None => describe_arcs(&self.arcs),
+            Some(boosts) => {
+                let arcs: Vec<String> = self
+                    .arcs
+                    .iter()
+                    .zip(boosts)
+                    .map(|(arc, &boost)| {
+                        if boost == 1.0 {
+                            describe_arc(arc)
+                        } else {
+                            format!("{}^{boost}", describe_arc(arc))
+                        }
+                    })
+                    .collect();
+                format!("[{}]", arcs.join(", "))
+            }
+        };
         format!(
             "GraphPhraseQuery(field:{}, arcs:{}, slop:{})",
-            self.field,
-            describe_arcs(&self.arcs),
-            self.slop
+            self.field, arcs, self.slop
         )
     }
 
@@ -420,8 +671,8 @@ impl Query for GraphPhraseQuery {
     }
 
     fn cache_key(&self) -> Option<String> {
-        // Field + arcs + slop determine the matched set; boost is
-        // score-only and excluded.
+        // Field + arcs + slop determine the matched set; the boost and the
+        // arc boosts are score-only and excluded.
         Some(format!(
             "graph_phrase|{:?}|{}|{}",
             self.field,
@@ -433,11 +684,13 @@ impl Query for GraphPhraseQuery {
 
 /// `arcs` as `[0-1 ["machine"], 0-2 ["ml"], ...]`.
 fn describe_arcs(arcs: &[PhraseArc]) -> String {
-    let arcs: Vec<String> = arcs
-        .iter()
-        .map(|arc| format!("{}-{} {:?}", arc.from, arc.to, arc.terms))
-        .collect();
+    let arcs: Vec<String> = arcs.iter().map(describe_arc).collect();
     format!("[{}]", arcs.join(", "))
+}
+
+/// `arc` as `0-2 ["ml"]`.
+fn describe_arc(arc: &PhraseArc) -> String {
+    format!("{}-{} {:?}", arc.from, arc.to, arc.terms)
 }
 
 /// Graphs and paths for tests comparing a graph phrase with its paths.
@@ -829,5 +1082,275 @@ mod tests {
             matcher.next().unwrap();
         }
         assert_eq!(docs, vec![0, 1]);
+    }
+
+    /// Every path from node 0 through `arcs`, as the indices of its arcs.
+    fn path_arcs(arcs: &[PhraseArc]) -> Vec<Vec<usize>> {
+        fn walk(
+            node: u32,
+            last: u32,
+            arcs: &[PhraseArc],
+            path: &mut Vec<usize>,
+            paths: &mut Vec<Vec<usize>>,
+        ) {
+            if node == last {
+                paths.push(path.clone());
+                return;
+            }
+            for (i, arc) in arcs.iter().enumerate().filter(|(_, arc)| arc.from == node) {
+                path.push(i);
+                walk(arc.to, last, arcs, path, paths);
+                path.pop();
+            }
+        }
+        let last = arcs.iter().map(|arc| arc.to).max().unwrap();
+        let mut paths = Vec::new();
+        walk(0, last, arcs, &mut Vec::new(), &mut paths);
+        paths
+    }
+
+    /// The product of a path's arc boosts, multiplied in path order as the
+    /// walk does.
+    fn path_product(path: &[usize], boosts: &[f32]) -> f32 {
+        path.iter().fold(1.0, |product, &i| product * boosts[i])
+    }
+
+    /// Issue #1704: the weighted walk keeps, per anchor, exactly the largest
+    /// product of the paths whose own phrase matches at that anchor, at every
+    /// slop, and the query's factor is the largest product over the graph's
+    /// paths, as listing every path would give them.
+    #[test]
+    fn the_weighted_walk_keeps_the_heaviest_path_at_each_anchor() {
+        const BOOSTS: &[f32] = &[0.0, 0.5, 0.8, 1.0, 2.0];
+        let mut rng = Lcg(1704);
+        let analyzers: [Arc<dyn Analyzer>; 2] = [
+            Arc::new(whitespace_analyzer()),
+            Arc::new(stacking_analyzer(&[&["a", "b c"], &["d", "c"]])),
+        ];
+        let mut compared = 0;
+        let mut weighed = 0;
+        for round in 0..30 {
+            let texts = random_texts(&mut rng, 12);
+            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            for analyzer in &analyzers {
+                let reader = index(analyzer.clone(), &texts);
+                for _ in 0..15 {
+                    let Some(arcs) = random_graph(&mut rng) else {
+                        continue;
+                    };
+                    let boosts: Vec<f32> = arcs
+                        .iter()
+                        .map(|_| BOOSTS[rng.below(BOOSTS.len() as u64) as usize])
+                        .collect();
+                    let paths = path_arcs(&arcs);
+                    let factor = paths
+                        .iter()
+                        .map(|path| path_product(path, &boosts))
+                        .fold(0.0, f32::max);
+                    for slop in 0..3 {
+                        let mut expected: BTreeMap<u64, BTreeMap<u64, f32>> = BTreeMap::new();
+                        for path in &paths {
+                            let positions: Vec<Vec<String>> =
+                                path.iter().map(|&i| arcs[i].terms.clone()).collect();
+                            let product = path_product(path, &boosts);
+                            for found in PhraseMatcher::find_phrase_matches(
+                                reader.as_ref(),
+                                "body",
+                                &positions,
+                                slop,
+                            )
+                            .unwrap()
+                            {
+                                let anchors = expected.entry(found.doc_id).or_default();
+                                for anchor in found.positions {
+                                    let kept = anchors.entry(anchor).or_insert(product);
+                                    *kept = kept.max(product);
+                                }
+                            }
+                        }
+                        let expected: Vec<(u64, Vec<(u64, f32)>)> = expected
+                            .into_iter()
+                            .map(|(doc_id, anchors)| (doc_id, anchors.into_iter().collect()))
+                            .collect();
+
+                        let query = GraphPhraseQuery::from_arcs("body", arcs.clone())
+                            .with_slop(slop)
+                            .with_arc_boosts(boosts.clone());
+                        if query.arc_boosts().is_some() {
+                            assert_eq!(query.path_factor, factor, "arcs {arcs:?} {boosts:?}");
+                            weighed += 1;
+                        }
+                        let actual = query.match_anchors::<f32>(reader.as_ref()).unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "round {round}, slop {slop}, arcs {arcs:?}, boosts {boosts:?}, \
+                             texts {texts:?}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 1000, "only {compared} comparisons");
+        assert!(
+            weighed > compared / 2,
+            "only {weighed} of {compared} weighted"
+        );
+    }
+
+    /// Issue #1704: with query-time synonyms weighed by `with_boost`, the
+    /// document matching the original words' path scores above the one
+    /// matching only the synonym's lighter path, which an unweighted graph
+    /// phrase scores the same.
+    #[test]
+    fn a_weighted_graph_phrase_ranks_the_heavier_path_first() {
+        use crate::lexical::query::parser::LexicalQueryParser;
+
+        let reader = index(
+            Arc::new(whitespace_analyzer()),
+            &["ml is fun", "machine learning is fun"],
+        );
+        let scores = |boost: Option<f32>| {
+            let mut dict = SynonymDictionary::new(None).unwrap();
+            dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
+            let mut filter = SynonymGraphFilter::new(dict, true);
+            if let Some(boost) = boost {
+                filter = filter.with_boost(boost);
+            }
+            let analyzer = whitespace_analyzer().add_filter(Arc::new(filter));
+            let query = LexicalQueryParser::new(Arc::new(analyzer))
+                .with_default_field("body")
+                .parse("\"ml is\"")
+                .unwrap();
+            let graph = query
+                .as_any()
+                .downcast_ref::<GraphPhraseQuery>()
+                .unwrap_or_else(|| panic!("a graph phrase: {}", query.description()));
+            assert_eq!(graph.arc_boosts().is_some(), boost.is_some());
+            graph_scores(graph, reader.as_ref())
+        };
+        let unweighted = scores(None);
+        assert_eq!(unweighted.len(), 2, "{unweighted:?}");
+        assert_eq!(unweighted[0].1, unweighted[1].1, "{unweighted:?}");
+        let weighted = scores(Some(0.8));
+        assert_eq!(weighted.len(), 2, "{weighted:?}");
+        assert!(
+            weighted[1].1 < weighted[0].1,
+            "machine learning is < ml is: {weighted:?}"
+        );
+        // The heaviest path, `ml is`, weighs 1, so its document's score
+        // does not move.
+        assert_eq!(
+            weighted[0].1, unweighted[0].1,
+            "{weighted:?} {unweighted:?}"
+        );
+    }
+
+    /// Each matching document's score, from `matcher_scorer`, checked to
+    /// equal `scorer`'s.
+    fn graph_scores(graph: &GraphPhraseQuery, reader: &dyn LexicalIndexReader) -> Vec<(u64, f32)> {
+        let (mut matcher, scorer) = graph.matcher_scorer(reader).unwrap();
+        let alone = graph.scorer(reader).unwrap();
+        let mut scores = Vec::new();
+        while !matcher.is_exhausted() {
+            let doc_id = matcher.doc_id();
+            let score = scorer.score(doc_id, 1.0, None);
+            assert_eq!(alone.score(doc_id, 1.0, None), score, "doc {doc_id}");
+            scores.push((doc_id, score));
+            matcher.next().unwrap();
+        }
+        scores
+    }
+
+    /// The `ml is` / `machine learning is` graph.
+    fn ml_is_arcs() -> Vec<PhraseArc> {
+        vec![
+            arc(0, 1, &["machine"]),
+            arc(0, 2, &["ml"]),
+            arc(1, 2, &["learning"]),
+            arc(2, 3, &["is"]),
+        ]
+    }
+
+    /// Issue #1704: a uniform boost (a `boost` filter of 2) multiplies the
+    /// score by the heaviest path's product, 8 for `machine learning is`,
+    /// and weighs `ml is`, of product 4, at half.
+    #[test]
+    fn a_uniform_boost_multiplies_the_score_by_the_heaviest_path_product() {
+        let reader = index(
+            Arc::new(whitespace_analyzer()),
+            &["ml is fun", "machine learning is fun"],
+        );
+        let unweighted = graph_scores(
+            &GraphPhraseQuery::from_arcs("body", ml_is_arcs()),
+            reader.as_ref(),
+        );
+        let weighted = graph_scores(
+            &GraphPhraseQuery::from_arcs("body", ml_is_arcs()).with_arc_boosts(vec![2.0; 4]),
+            reader.as_ref(),
+        );
+        assert_eq!(unweighted.len(), 2, "{unweighted:?}");
+        assert_eq!(weighted.len(), 2, "{weighted:?}");
+        assert_eq!(
+            weighted[1].1,
+            8.0 * unweighted[1].1,
+            "{weighted:?} {unweighted:?}"
+        );
+        assert!(
+            weighted[0].1 < 8.0 * unweighted[0].1,
+            "ml is weighs half: {weighted:?} {unweighted:?}"
+        );
+        assert!(
+            weighted[0].1 > unweighted[0].1,
+            "{weighted:?} {unweighted:?}"
+        );
+    }
+
+    /// The description shows the arc boosts that are not 1, and an
+    /// unweighted query's description stays as before arc boosts.
+    #[test]
+    fn the_description_shows_the_arc_boosts_that_are_not_1() {
+        assert_eq!(
+            GraphPhraseQuery::from_arcs("body", ml_is_arcs())
+                .with_arc_boosts(vec![0.72, 1.0, 0.64, 1.0])
+                .description(),
+            "GraphPhraseQuery(field:body, arcs:[0-1 [\"machine\"]^0.72, 0-2 [\"ml\"], \
+             1-2 [\"learning\"]^0.64, 2-3 [\"is\"]], slop:0)"
+        );
+        assert_eq!(
+            GraphPhraseQuery::from_arcs("body", ml_is_arcs())
+                .with_arc_boosts(vec![1.0; 4])
+                .description(),
+            "GraphPhraseQuery(field:body, arcs:[0-1 [\"machine\"], 0-2 [\"ml\"], \
+             1-2 [\"learning\"], 2-3 [\"is\"]], slop:0)"
+        );
+    }
+
+    /// Issue #1704: an arc boost must be finite and 0 or more, and the
+    /// largest path product times the boost must stay finite.
+    #[test]
+    fn validate_boosts_checks_the_arc_boosts() {
+        let check = |boosts: [f32; 4]| {
+            GraphPhraseQuery::from_arcs("body", ml_is_arcs())
+                .with_arc_boosts(boosts.to_vec())
+                .validate_boosts()
+        };
+        let mut wrong = Vec::new();
+        for boosts in [
+            [f32::NAN, 1.0, 1.0, 1.0],
+            [1.0, -1.0, 1.0, 1.0],
+            [1.0, 1.0, f32::INFINITY, 1.0],
+            [1e30, 1.0, 1e30, 1.0],
+        ] {
+            if check(boosts).is_ok() {
+                wrong.push(format!("accepted {boosts:?}"));
+            }
+        }
+        for boosts in [[0.0, 0.5, 0.8, 1.0], [2.0, 2.0, 2.0, 2.0], [1.0; 4]] {
+            if let Err(e) = check(boosts) {
+                wrong.push(format!("rejected {boosts:?}: {e}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 }
