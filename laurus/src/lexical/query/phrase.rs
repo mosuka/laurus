@@ -272,8 +272,10 @@ impl Matcher for PhraseMatcher {
 /// A scorer specialized for phrase queries.
 #[derive(Debug, Clone)]
 pub struct PhraseScorer {
-    /// Document frequencies for phrase matches.
-    phrase_doc_freq: HashMap<u64, u32>,
+    /// Each matching document's phrase frequency: its number of phrase
+    /// matches, or for a weighted graph phrase the sum of their weights
+    /// (Issue #1704).
+    phrase_doc_freq: HashMap<u64, f32>,
     /// Total number of documents.
     total_docs: u64,
     /// Average field length.
@@ -293,15 +295,27 @@ impl PhraseScorer {
         avg_field_length: f64,
         boost: f32,
     ) -> Self {
-        let mut phrase_doc_freq = HashMap::new();
+        Self::from_phrase_freqs(
+            phrase_matches
+                .iter()
+                .map(|phrase_match| (phrase_match.doc_id, phrase_match.phrase_freq as f32)),
+            total_docs,
+            avg_field_length,
+            boost,
+        )
+    }
 
-        // Calculate phrase frequency for each document
-        for phrase_match in phrase_matches {
-            phrase_doc_freq.insert(phrase_match.doc_id, phrase_match.phrase_freq);
-        }
-
+    /// Create a phrase scorer over each matching document's phrase
+    /// frequency, which may be fractional: a weighted graph phrase weighs
+    /// each of its matches by its path's token boosts (Issue #1704).
+    pub(crate) fn from_phrase_freqs(
+        phrase_freqs: impl IntoIterator<Item = (u64, f32)>,
+        total_docs: u64,
+        avg_field_length: f64,
+        boost: f32,
+    ) -> Self {
         PhraseScorer {
-            phrase_doc_freq,
+            phrase_doc_freq: phrase_freqs.into_iter().collect(),
             total_docs,
             avg_field_length,
             boost,
@@ -363,11 +377,7 @@ impl PhraseScorer {
 impl Scorer for PhraseScorer {
     fn score(&self, doc_id: u64, _term_freq: f32, _field_length: Option<f32>) -> f32 {
         // Use phrase frequency instead of term frequency
-        let phrase_freq = self
-            .phrase_doc_freq
-            .get(&doc_id)
-            .map(|&f| f as f32)
-            .unwrap_or(0.0);
+        let phrase_freq = self.phrase_doc_freq.get(&doc_id).copied().unwrap_or(0.0);
 
         if phrase_freq == 0.0 {
             return 0.0;

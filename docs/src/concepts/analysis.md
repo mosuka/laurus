@@ -390,7 +390,7 @@ let filter = SynonymGraphFilter::new(dict, true)
 
 The `boost` parameter weights the synonym tokens. A one-word synonym of one word gets `0.8 × boost`, a one-word synonym of several words and the first word of a multi-word synonym `0.9 × boost`, and the other words of a multi-word synonym `0.8 × boost`. The matched words keep their own boost, 1 unless an earlier filter set it. Without `with_boost`, every synonym token has a boost of 1.
 
-Indexing ignores token boosts. The query parser applies them as [Boost](query_dsl.md#boost) describes (Issues #1701 and #1704): the synonyms stacked on a word weigh their occurrences by their boost relative to the word's, so with `with_boost(0.8)` an occurrence of a one-word synonym of one word counts as `0.64` of an occurrence of the word.
+Indexing ignores token boosts. The query parser applies them as [Boost](query_dsl.md#boost) describes (Issues #1701 and #1704): the synonyms stacked on a word weigh their occurrences by their boost relative to the word's, so with `with_boost(0.8)` an occurrence of a one-word synonym of one word counts as `0.64` of an occurrence of the word. A quoted value through multi-word synonyms weighs each path by the product of its tokens' boosts, as [Boost](query_dsl.md#boost) describes.
 
 - The weights rank documents only when the field's index holds no synonyms, as with a query-time analyzer. When the index expands the synonyms too (see [Searching with synonyms](#searching-with-synonyms) below), every matching document holds every alternative, so the weights lower all their scores alike.
 - Place a `boost` token filter after the synonym filter. Placed before it, the filter boosts the matched words only, and their synonyms weigh relatively less.
