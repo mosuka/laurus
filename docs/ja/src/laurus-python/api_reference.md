@@ -236,8 +236,8 @@ class Schema:
 | `add_float_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 64 ビット浮動小数点フィールド。`multi_valued=True` で浮動小数点配列を受け付け（範囲クエリは "any match"）。`doc_values` は上記を参照。 |
 | `add_boolean_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | ブールフィールド。`multi_valued=True` で `list[bool]` を受け付け（`flags:true` のような term クエリはいずれかの要素が値と等しければマッチ。値は `list[bool]` として読み戻されます）。`doc_values` は上記を参照。 |
 | `add_bytes_field(name, *, stored=True, multi_valued=False)` | 生バイトフィールド。`doc_values` オプションはありません —— `Bytes` の値は設定にかかわらず DocValues に一切書き込まれないためです。`multi_valued=True` で `list[bytes]` を受け付けます（Issue #1176）。`Bytes` はそもそもインデックスされないため、他の `multi_valued` オプションと異なりクエリ一致の意味論はなく、保存時の形と取り込み時の許容個数を変えるだけです。値は `list[bytes]` として読み戻されます（MIME は保持されません）。 |
-| `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 地理座標フィールド（緯度/経度）。`multi_valued=True` で `(lat, lon)` タプルのリストを受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。`doc_values` は上記を参照。 |
-| `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。`multi_valued=True` で `(x, y, z)` タプルのリストを受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ。値はタプルのリストとして読み戻されます）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values` は上記を参照。 |
+| `add_geo_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 地理座標フィールド（緯度/経度）。値は dict `{"lat": ..., "lon": ...}` です。`multi_valued=True` でそのリストを受け付け（距離 / バウンディングボックスクエリはいずれかのポイントが条件を満たせばマッチ。値は dict のリストとして読み戻されます）。`doc_values` は上記を参照。 |
+| `add_geo3d_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | 3D ECEF カルテシアン座標フィールド（x, y, z はメートル）。値は dict `{"x": ..., "y": ..., "z": ...}` です。`multi_valued=True` でそのリストを受け付け（距離 / バウンディングボックス / nearest クエリはいずれかのポイントが条件を満たせばマッチ。値は dict のリストとして読み戻されます）。詳細は [Geo3d の概念](../concepts/geo3d.md)。`doc_values` は上記を参照。 |
 | `add_datetime_field(name, *, stored=True, indexed=True, multi_valued=False, doc_values=True)` | UTC 日時フィールド。`multi_valued=True` で `datetime.datetime` / `str` のリストを受け付け（範囲クエリはいずれかの時刻が条件を満たせばマッチ。値は UTC の RFC 3339 文字列の `list[str]` として読み戻されます）。`doc_values` は上記を参照。 |
 | `add_hnsw_field(name, dimension, *, distance="cosine", m=16, ef_construction=200, quantizer=None, subvector_count=None, rerank_storage=None, embedder=None, pq_codebook_path=None, base_weight=1.0)` | HNSW 近似最近傍ベクトルフィールド。`base_weight` は他の vector フィールドと同時に検索されたときの相対的なスコアリング優先度（Issue #1084）。[ウェイト](../concepts/search/vector_search.md#ウェイト)を参照。 |
 | `add_flat_field(name, dimension, *, distance="cosine", quantizer=None, embedder=None, base_weight=1.0)` | Flat（総当たり）ベクトルフィールド。 |
@@ -933,10 +933,11 @@ Python の値は自動的に Laurus の `DataValue` 型に変換されます：
 | `list[int]` | `Int64Array` | 多値整数フィールド（`bool` のリストは代わりに `BoolArray` になり、多値の Float / Integer フィールドではコアが 0/1 に拡張する）。ベクトルフィールドではリストを `f32` にキャスト。空リストは空の `Int64Array` |
 | `list[float \| int]` | `Float64Array` | 多値浮動小数点フィールド（整数は拡張）。ベクトルフィールドではリストを `f32` にキャスト |
 | `list[list[float \| int]]` | `VectorArray` | MultiVector フィールドのトークンベクトル（Issue #1351）。内側のリストが 1 トークンに対応する（例: `{"tokens": [[0.1, 0.2], [0.3, 0.4]]}`）。整数は拡張し、`bool` や `str` の要素は `TypeError`。ベクトルの本数と次元はドキュメントの書き込み時にフィールドと照合する（長さの揃わないリストなどは `ValueError`）。`get_documents` や検索結果には含まれない |
-| `(lat, lon)` タプル | `Geo` | 2 つの `float` 値 |
-| `(x, y, z)` タプル | `Geo3d` | 3 つの `float` 値（ECEF 直交座標系、メートル単位） |
-| `list[(lat, lon)]` | `GeoArray` | `(lat, lon)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
-| `list[(x, y, z)]` | `GeoEcefArray` | `(x, y, z)` タプルのリスト。フィールドに `multi_valued=True` が必要 |
+| `{"lat": float, "lon": float}` | `Geo` | ほかのバインディングと同じく、鍵 `"lat"` と `"lon"` を持つ dict（Issue #1771）。ほかの鍵は読まない。同じ dict として読み戻される |
+| `{"x": float, "y": float, "z": float}` | `Geo3d` | 鍵 `"x"`・`"y"`・`"z"` を持つ dict（ECEF 直交座標系、メートル単位）。`"lat"` と `"lon"` の両方がないときに使う。同じ dict として読み戻される |
+| `list[{"lat", "lon"}]` | `GeoArray` | `Geo` の dict のリスト。フィールドに `multi_valued=True` が必要 |
+| `list[{"x", "y", "z"}]` | `GeoEcefArray` | `Geo3d` の dict のリスト。フィールドに `multi_valued=True` が必要。`Geo` と `Geo3d` の dict が混ざったリストは `ValueError` |
+| `(lat, lon)`・`(x, y, z)` タプル | — | 点ではない。dict での書き方を示す `ValueError` を送出する。例: `a geo point is a dict: write {"lat": 35.68, "lon": 139.76}, not the tuple (35.68, 139.76) (Issue #1771)` |
 | `datetime.datetime` | `DateTime` | `isoformat()` 経由で変換 |
 | `list[datetime.datetime \| str]`（`datetime` を 1 つ以上含む） | `DateTimeArray` | 各要素を単一の日時と同じ規則でパース（オフセット付き RFC 3339 / ISO 8601、または naive な `YYYY-MM-DDTHH:MM:SS` を UTC として扱う。`isoformat()` を持つオブジェクトは先に変換）。日時でない要素は `ValueError`。フィールドに `multi_valued=True` が必要 |
 | `list[str]` | `DateTimeArray` または `TextArray` | 全要素が日時としてパースできれば（上記と同じ形式）`DateTimeArray`、そうでなければ `TextArray`（Issue #1175。`list[str]` として読み戻される）。フィールドに `multi_valued=True` が必要 |

@@ -61,11 +61,11 @@ def index():
     schema.add_geo_field("location")
     schema.add_geo3d_field("position")
     idx = laurus.Index(schema=schema)
-    for doc_id, point in POINTS.items():
+    for doc_id, (lat, lon) in POINTS.items():
         kind = "bar" if doc_id == "inside_east" else "cafe"
-        idx.put_document(doc_id, {"kind": kind, "location": point})
-    for doc_id, position in POSITIONS.items():
-        idx.put_document(doc_id, {"kind": "cafe", "position": position})
+        idx.put_document(doc_id, {"kind": kind, "location": {"lat": lat, "lon": lon}})
+    for doc_id, (x, y, z) in POSITIONS.items():
+        idx.put_document(doc_id, {"kind": "cafe", "position": {"x": x, "y": y, "z": z}})
     idx.commit()
     return idx
 

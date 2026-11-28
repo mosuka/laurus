@@ -48,7 +48,7 @@ def main() -> None:
                 "in_print": True,
                 "price": 4.8,
                 "year": 2005,
-                "location": (52.3676, 4.9041),  # Amsterdam
+                "location": {"lat": 52.3676, "lon": 4.9041},  # Amsterdam
             },
         ),
         (
@@ -61,7 +61,7 @@ def main() -> None:
                 "in_print": True,
                 "price": 4.5,
                 "year": 2010,
-                "location": (47.3769, 8.5417),  # Zurich
+                "location": {"lat": 47.3769, "lon": 8.5417},  # Zurich
             },
         ),
         (
@@ -74,7 +74,7 @@ def main() -> None:
                 "in_print": True,
                 "price": 4.9,
                 "year": 2006,
-                "location": (37.7749, -122.4194),  # San Francisco
+                "location": {"lat": 37.7749, "lon": -122.4194},  # San Francisco
             },
         ),
         (
@@ -87,7 +87,7 @@ def main() -> None:
                 "in_print": True,
                 "price": 4.7,
                 "year": 2008,
-                "location": (37.4419, -122.1430),  # Palo Alto
+                "location": {"lat": 37.4419, "lon": -122.1430},  # Palo Alto
             },
         ),
         (
@@ -100,7 +100,7 @@ def main() -> None:
                 "in_print": False,
                 "price": 4.6,
                 "year": 2004,
-                "location": (52.5200, 13.4050),  # Berlin
+                "location": {"lat": 52.5200, "lon": 13.4050},  # Berlin
             },
         ),
         (
@@ -113,7 +113,7 @@ def main() -> None:
                 "in_print": False,
                 "price": 3.5,
                 "year": 2023,
-                "location": (34.0522, -118.2437),  # Los Angeles
+                "location": {"lat": 34.0522, "lon": -118.2437},  # Los Angeles
             },
         ),
     ]

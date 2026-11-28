@@ -2,7 +2,7 @@
 
 Covers:
 - Schema declaration via `add_geo3d_field`.
-- Document round-trip with `(x, y, z)` 3-tuple values.
+- Document round-trip with `{"x", "y", "z"}` dict values (Issue #1771).
 - All three 3D query classes: `Geo3dDistanceQuery`, `Geo3dBoundingBoxQuery`,
   `Geo3dNearestQuery`.
 
@@ -17,10 +17,10 @@ import laurus
 
 # Precomputed ECEF coordinates (meters) for landmarks. Produced offline via
 # `wgs84_to_ecef(lat, lon, height)`.
-TOKYO_TOWER = (-3955182.0, 3350553.0, 3700276.0)
-TOKYO_SKYTREE = (-3961178.0, 3346187.0, 3702490.0)
-MT_FUJI = (-3916073.0, 3437037.0, 3672751.0)
-SYDNEY = (-4646847.0, 2553022.0, -3534121.0)
+TOKYO_TOWER = {"x": -3955182.0, "y": 3350553.0, "z": 3700276.0}
+TOKYO_SKYTREE = {"x": -3961178.0, "y": 3346187.0, "z": 3702490.0}
+MT_FUJI = {"x": -3916073.0, "y": 3437037.0, "z": 3672751.0}
+SYDNEY = {"x": -4646847.0, "y": 2553022.0, "z": -3534121.0}
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def test_geo3d_field_round_trip(geo3d_index):
 
 def test_geo3d_distance_query_small_radius(geo3d_index):
     """A 50 km sphere around Tokyo Tower should return Tower + Skytree only."""
-    cx, cy, cz = TOKYO_TOWER
+    cx, cy, cz = TOKYO_TOWER.values()
     query = laurus.Geo3dDistanceQuery.within_sphere("position", cx, cy, cz, 50_000.0)
     results = geo3d_index.search(query, limit=10).results
     ids = {r.id for r in results}
@@ -66,7 +66,7 @@ def test_geo3d_distance_query_small_radius(geo3d_index):
 
 def test_geo3d_distance_query_wide_radius(geo3d_index):
     """A 200 km sphere additionally pulls in Mt. Fuji."""
-    cx, cy, cz = TOKYO_TOWER
+    cx, cy, cz = TOKYO_TOWER.values()
     query = laurus.Geo3dDistanceQuery.within_sphere("position", cx, cy, cz, 200_000.0)
     results = geo3d_index.search(query, limit=10).results
     ids = {r.id for r in results}
@@ -106,7 +106,7 @@ def test_geo3d_nearest_query(geo3d_index):
     """k = 3 around Mt. Fuji returns Fuji, then Tower / Skytree (in distance
     order — exact ordering of the close-pair is implementation defined, so
     only check membership)."""
-    cx, cy, cz = MT_FUJI
+    cx, cy, cz = MT_FUJI.values()
     query = laurus.Geo3dNearestQuery.k_nearest("position", cx, cy, cz, 3)
     results = geo3d_index.search(query, limit=3).results
     assert len(results) == 3
@@ -118,7 +118,7 @@ def test_geo3d_nearest_query(geo3d_index):
 
 def test_geo3d_nearest_query_with_radius_options(geo3d_index):
     """Verify the optional initial / max radius parameters are accepted."""
-    cx, cy, cz = TOKYO_TOWER
+    cx, cy, cz = TOKYO_TOWER.values()
     query = laurus.Geo3dNearestQuery.k_nearest(
         "position", cx, cy, cz, 2,
         initial_radius_m=10_000.0,
@@ -135,7 +135,7 @@ def test_geo3d_nearest_query_with_radius_options(geo3d_index):
 
 
 def test_geo3d_query_reprs():
-    cx, cy, cz = TOKYO_TOWER
+    cx, cy, cz = TOKYO_TOWER.values()
     assert "Geo3dDistanceQuery" in repr(
         laurus.Geo3dDistanceQuery.within_sphere("position", cx, cy, cz, 1000.0)
     )

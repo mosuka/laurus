@@ -29,15 +29,21 @@ pub fn dict_to_document(py: Python, dict: &Bound<PyDict>) -> PyResult<Document> 
 /// - `list[int]`           → `DataValue::Int64Array`
 /// - `list[float|int]`     → `DataValue::Float64Array` (vector fields cast
 ///   either array to `Vector` downstream; an empty list is an empty `Int64Array`)
-/// - `list[(lat, lon)]`    → `DataValue::GeoArray` (multi-valued geo, #1174)
-/// - `list[(x, y, z)]`     → `DataValue::GeoEcefArray`
+/// - `list[{"lat", "lon"}]` → `DataValue::GeoArray` (multi-valued geo, #1174)
+/// - `list[{"x", "y", "z"}]` → `DataValue::GeoEcefArray`
 /// - `list[datetime | str]` → `DataValue::DateTimeArray` (multi-valued datetime, #1184)
 /// - `list[bool]`          → `DataValue::BoolArray` (multi-valued boolean, #1180)
 /// - `list[bytes]`         → `DataValue::BytesArray` (multi-valued bytes, #1176)
 /// - `list[str]`           → `DataValue::TextArray` (multi-valued text, #1175) —
 ///   or `DateTimeArray` when every element parses as a datetime
-/// - `(lat, lon)` tuple    → `DataValue::Geo`
-/// - `(x, y, z)` tuple     → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
+/// - `{"lat", "lon"}` dict → `DataValue::Geo`
+/// - `{"x", "y", "z"}` dict → `DataValue::GeoEcef` (3D ECEF Cartesian, meters)
+///
+/// A geo point is keyed, as in the other bindings (Issue #1771): a dict
+/// with `"lat"` and `"lon"` is a `Geo` point, otherwise one with `"x"`,
+/// `"y"` and `"z"` a `GeoEcef` point, and other keys are not read. A tuple
+/// of 2 or 3 numbers, which was a point before, raises a `ValueError` that
+/// says how to write it as a dict.
 pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
     if obj.is_none() {
         return Ok(DataValue::Null);
@@ -78,12 +84,16 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
         if list.is_empty() {
             return Ok(DataValue::Int64Array(Vec::new()));
         }
-        // A list of tuples is a multi-valued geo field (#1174). Each tuple
-        // goes through the same 2-/3-tuple checks as a single point below,
-        // so key semantics and range validation are shared; lists of lists
-        // are not treated as geo.
-        if list.iter().all(|item| item.is_instance_of::<PyTuple>()) {
-            return py_tuple_list_to_geo_array(py, list);
+        // A list of dicts is a multi-valued geo field (#1174). Each dict
+        // goes through the same key checks as a single point below, so key
+        // semantics and range validation are shared.
+        if list.iter().all(|item| item.is_instance_of::<PyDict>()) {
+            return py_dict_list_to_geo_array(py, list);
+        }
+        // A tuple in a list was a point before Issue #1771: its own error
+        // says how to write it.
+        if let Some(tuple) = list.iter().find(|item| item.is_instance_of::<PyTuple>()) {
+            return py_to_data_value(py, &tuple);
         }
         // A list of lists is the token vectors of a multi-vector field
         // (#1351). Their count and dimension are checked against the field
@@ -147,29 +157,17 @@ pub fn py_to_data_value(py: Python, obj: &Bound<PyAny>) -> PyResult<DataValue> {
             .collect::<PyResult<_>>()?;
         return Ok(DataValue::Float64Array(floats));
     }
-    // Try tuple (lat, lon) for Geo
-    if let Ok(tup) = obj.cast::<pyo3::types::PyTuple>()
-        && tup.len() == 2
-        && let (Ok(lat), Ok(lon)) = (
-            tup.get_item(0)?.extract::<f64>(),
-            tup.get_item(1)?.extract::<f64>(),
-        )
-    {
-        let point = laurus::lexical::GeoPoint::try_new(lat, lon)
-            .map_err(|e| PyValueError::new_err(format!("invalid geo point: {e}")))?;
-        return Ok(DataValue::Geo(point));
+    // A dict is a geo point: {"lat", "lon"} for Geo, otherwise
+    // {"x", "y", "z"} for Geo3d (ECEF Cartesian, meters), as in the other
+    // bindings.
+    if let Ok(dict) = obj.cast::<PyDict>() {
+        return py_dict_to_geo_point(dict);
     }
-    // Try tuple (x, y, z) for Geo3d (ECEF Cartesian, meters). Must come
-    // after the 2-tuple Geo check so existing semantics are preserved.
-    if let Ok(tup) = obj.cast::<pyo3::types::PyTuple>()
-        && tup.len() == 3
-        && let (Ok(x), Ok(y), Ok(z)) = (
-            tup.get_item(0)?.extract::<f64>(),
-            tup.get_item(1)?.extract::<f64>(),
-            tup.get_item(2)?.extract::<f64>(),
-        )
+    // A tuple of 2 or 3 numbers was a point before Issue #1771.
+    if let Ok(tuple) = obj.cast::<PyTuple>()
+        && let Some(message) = tuple_point_message(tuple)?
     {
-        return Ok(DataValue::GeoEcef(laurus::GeoEcefPoint::new(x, y, z)));
+        return Err(PyValueError::new_err(message));
     }
     // Try Python datetime.datetime (anything exposing `isoformat()`).
     if let Ok(dt_str) = obj.call_method0("isoformat")
@@ -217,9 +215,6 @@ fn py_datetime_list_to_datetime_array(list: &Bound<PyList>) -> PyResult<DataValu
     Ok(DataValue::DateTimeArray(out))
 }
 
-/// Convert a non-empty list whose elements are all tuples into a
-/// [`DataValue::GeoArray`] (all `(lat, lon)`) or [`DataValue::GeoEcefArray`]
-/// (all `(x, y, z)`), rejecting a mix or a tuple of any other arity.
 /// Convert a non-empty list of `str` into a [`DataValue::DateTimeArray`]
 /// when every element parses as a datetime (the same grammar the single
 /// value and the datetime-object list use), and into a
@@ -260,9 +255,86 @@ pub fn py_token_vectors(list: &Bound<PyList>) -> PyResult<Vec<Vec<f32>>> {
         .collect()
 }
 
-fn py_tuple_list_to_geo_array(py: Python, list: &Bound<PyList>) -> PyResult<DataValue> {
+/// Read a dict as a geo point: `"lat"` and `"lon"` give a `Geo` point, the
+/// range checked; otherwise `"x"`, `"y"` and `"z"` a `GeoEcef` point. Other
+/// keys are not read. This is the order of the other bindings' keyed
+/// points (Issue #1771).
+fn py_dict_to_geo_point(dict: &Bound<PyDict>) -> PyResult<DataValue> {
+    if let Some([lat, lon]) = dict_coordinates(dict, ["lat", "lon"])? {
+        let point = laurus::lexical::GeoPoint::try_new(lat, lon)
+            .map_err(|e| PyValueError::new_err(format!("invalid geo point: {e}")))?;
+        return Ok(DataValue::Geo(point));
+    }
+    if let Some([x, y, z]) = dict_coordinates(dict, ["x", "y", "z"])? {
+        return Ok(DataValue::GeoEcef(laurus::GeoEcefPoint::new(x, y, z)));
+    }
+    Err(PyValueError::new_err(
+        "a geo point is a dict with the keys \"lat\" and \"lon\" for Geo, \
+         or \"x\", \"y\" and \"z\" for Geo3d",
+    ))
+}
+
+/// The values of `keys` in `dict` as numbers, or `None` if a key is
+/// missing. A value that is not a number raises a `ValueError`.
+fn dict_coordinates<const N: usize>(
+    dict: &Bound<PyDict>,
+    keys: [&str; N],
+) -> PyResult<Option<[f64; N]>> {
+    let mut values = Vec::with_capacity(N);
+    for key in keys {
+        match dict.get_item(key)? {
+            Some(value) => values.push((key, value)),
+            None => return Ok(None),
+        }
+    }
+    let mut coordinates = [0.0; N];
+    for (coordinate, (key, value)) in coordinates.iter_mut().zip(values) {
+        *coordinate = value.extract::<f64>().map_err(|_| {
+            PyValueError::new_err(format!(
+                "the \"{key}\" of a geo point must be a number, got {}",
+                value
+                    .get_type()
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            ))
+        })?;
+    }
+    Ok(Some(coordinates))
+}
+
+/// The message for a tuple of 2 or 3 numbers, which was a `Geo` or a
+/// `GeoEcef` point before Issue #1771: how to write it as a dict, its
+/// numbers in Python's `repr`. `None` for any other tuple, which keeps the
+/// error any unsupported value gets.
+fn tuple_point_message(tuple: &Bound<PyTuple>) -> PyResult<Option<String>> {
+    let keys: &[&str] = match tuple.len() {
+        2 => &["lat", "lon"],
+        3 => &["x", "y", "z"],
+        _ => return Ok(None),
+    };
+    let mut fields = Vec::with_capacity(keys.len());
+    for (key, item) in keys.iter().zip(tuple.iter()) {
+        if item.extract::<f64>().is_err() {
+            return Ok(None);
+        }
+        fields.push(format!("\"{key}\": {}", item.repr()?));
+    }
+    Ok(Some(format!(
+        "a geo point is a dict: write {{{}}}, not the tuple {} (Issue #1771)",
+        fields.join(", "),
+        tuple.repr()?
+    )))
+}
+
+/// Convert a non-empty list whose elements are all dicts into a
+/// [`DataValue::GeoArray`] (all `{"lat", "lon"}`) or a
+/// [`DataValue::GeoEcefArray`] (all `{"x", "y", "z"}`), rejecting a mix.
+fn py_dict_list_to_geo_array(py: Python, list: &Bound<PyList>) -> PyResult<DataValue> {
     let mixed = || {
-        PyValueError::new_err("a list of tuples must be all (lat, lon) or all (x, y, z) geo points")
+        PyValueError::new_err(
+            "a list of geo points must be all {\"lat\", \"lon\"} or all {\"x\", \"y\", \"z\"} points",
+        )
     };
     let mut geo = Vec::with_capacity(list.len());
     let mut ecef = Vec::with_capacity(list.len());
@@ -278,6 +350,15 @@ fn py_tuple_list_to_geo_array(py: Python, list: &Bound<PyList>) -> PyResult<Data
         (true, false) => Ok(DataValue::GeoEcefArray(ecef)),
         _ => Err(mixed()),
     }
+}
+
+/// A geo point as a dict of its coordinates, in the order given.
+fn keyed_point<'py>(py: Python<'py>, coordinates: &[(&str, f64)]) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    for (key, value) in coordinates {
+        dict.set_item(key, value)?;
+    }
+    Ok(dict)
 }
 
 /// Convert a [`Document`] to a Python `dict`.
@@ -301,29 +382,28 @@ pub fn data_value_to_py(py: Python, value: &DataValue) -> PyResult<Py<PyAny>> {
         DataValue::Bytes(b, _mime) => Ok(PyBytes::new(py, b).unbind().into_any()),
         DataValue::Vector(v) => Ok(v.clone().into_pyobject(py)?.unbind().into_any()),
         DataValue::DateTime(dt) => Ok(dt.to_rfc3339().into_pyobject(py)?.unbind().into_any()),
-        DataValue::Geo(p) => {
-            let tup = pyo3::types::PyTuple::new(py, [p.lat, p.lon])?;
-            Ok(tup.unbind().into_any())
-        }
-        DataValue::GeoEcef(p) => {
-            let tup = pyo3::types::PyTuple::new(py, [p.x, p.y, p.z])?;
-            Ok(tup.unbind().into_any())
-        }
+        // A geo point as the dict it was written as (Issue #1771).
+        DataValue::Geo(p) => Ok(keyed_point(py, &[("lat", p.lat), ("lon", p.lon)])?
+            .unbind()
+            .into_any()),
+        DataValue::GeoEcef(p) => Ok(keyed_point(py, &[("x", p.x), ("y", p.y), ("z", p.z)])?
+            .unbind()
+            .into_any()),
         DataValue::Int64Array(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
         DataValue::Float64Array(arr) => Ok(arr.clone().into_pyobject(py)?.unbind().into_any()),
-        // Lists of the same tuples the single-valued arms produce, so the
+        // Lists of the same dicts the single-valued arms produce, so the
         // output feeds back into `py_to_data_value` unchanged.
         DataValue::GeoArray(arr) => {
             let items = arr
                 .iter()
-                .map(|p| PyTuple::new(py, [p.lat, p.lon]))
+                .map(|p| keyed_point(py, &[("lat", p.lat), ("lon", p.lon)]))
                 .collect::<PyResult<Vec<_>>>()?;
             Ok(PyList::new(py, items)?.unbind().into_any())
         }
         DataValue::GeoEcefArray(arr) => {
             let items = arr
                 .iter()
-                .map(|p| PyTuple::new(py, [p.x, p.y, p.z]))
+                .map(|p| keyed_point(py, &[("x", p.x), ("y", p.y), ("z", p.z)]))
                 .collect::<PyResult<Vec<_>>>()?;
             Ok(PyList::new(py, items)?.unbind().into_any())
         }
