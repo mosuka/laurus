@@ -177,9 +177,11 @@ impl SpanKind {
 /// ## Example
 ///
 /// ```javascript
-/// const { TermQuery } = require("laurus-nodejs");
+/// const { SearchRequest, TermQuery } = require("laurus-nodejs");
 /// const q = new TermQuery("body", "rust");
-/// const { results } = await index.search(q, { limit: 5 });
+/// const req = new SearchRequest({ limit: 5 });
+/// req.setLexicalTerm(q);
+/// const { results } = await index.searchWithRequest(req);
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "TermQuery")]
@@ -1018,13 +1020,15 @@ impl JsGeo3dPolylineQuery {
 /// ## Example
 ///
 /// ```javascript
-/// const { BooleanQuery, TermQuery } = require("laurus-nodejs");
+/// const { BooleanQuery, SearchRequest, TermQuery } = require("laurus-nodejs");
 ///
 /// const bq = new BooleanQuery();
-/// bq.must(new TermQuery("body", "programming"));
-/// bq.mustNot(new TermQuery("body", "python"));
-/// bq.should(new TermQuery("category", "data-science"));
-/// const { results } = await index.search(bq, { limit: 5 });
+/// bq.mustTerm(new TermQuery("body", "programming"));
+/// bq.mustNotTerm(new TermQuery("body", "python"));
+/// bq.shouldTerm(new TermQuery("category", "data-science"));
+/// const req = new SearchRequest({ limit: 5 });
+/// req.setLexicalBoolean(bq);
+/// const { results } = await index.searchWithRequest(req);
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "BooleanQuery")]
@@ -1530,8 +1534,10 @@ impl JsSpanQuery {
 /// ## Example
 ///
 /// ```javascript
-/// const { VectorQuery } = require("laurus-nodejs");
-/// const { results } = await index.search(new VectorQuery("text_vec", [0.1, 0.2, ...]));
+/// const { SearchRequest, VectorQuery } = require("laurus-nodejs");
+/// const req = new SearchRequest();
+/// req.setVectorQuery(new VectorQuery("text_vec", [0.1, 0.2, ...]));
+/// const { results } = await index.searchWithRequest(req);
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "VectorQuery")]
@@ -1566,8 +1572,10 @@ impl JsVectorQueryInner {
 /// ## Example
 ///
 /// ```javascript
-/// const { VectorTextQuery } = require("laurus-nodejs");
-/// const { results } = await index.search(new VectorTextQuery("text_vec", "memory safety"));
+/// const { SearchRequest, VectorTextQuery } = require("laurus-nodejs");
+/// const req = new SearchRequest();
+/// req.setVectorTextQuery(new VectorTextQuery("text_vec", "memory safety"));
+/// const { results } = await index.searchWithRequest(req);
 /// ```
 #[derive(Clone)]
 #[napi(js_name = "VectorTextQuery")]
