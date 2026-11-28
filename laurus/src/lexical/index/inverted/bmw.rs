@@ -169,7 +169,7 @@ impl BlockMaxOrExecutor {
                     // Every pivot-side clause sits on the pivot document.
                     let mut total_score = 0.0_f32;
                     for &i in pivot_side {
-                        let tf = self.clauses[i].matcher.term_freq() as f32;
+                        let tf = self.clauses[i].matcher.weighted_term_freq();
                         // Each leaf looks up its own document's field
                         // length (#1287).
                         total_score += self.clauses[i].scorer.score(pivot_doc, tf, None);

@@ -382,6 +382,100 @@ async fn a_stacked_synonym_or_scores_like_the_repeated_word() -> Result<()> {
     Ok(())
 }
 
+// ---- Weighted synonyms (Issue #1704) ----
+
+/// `syn_analyzer` whose synonyms weigh their occurrences less: the builder
+/// gives a one-word synonym of one word 0.8 × `boost`.
+fn weighted_syn_analyzer(boost: f32) -> Arc<dyn Analyzer> {
+    let mut dict = SynonymDictionary::new(None).unwrap();
+    dict.add_synonym_group(vec!["big".to_string(), "large".to_string()]);
+    Arc::new(plain_analyzer().add_filter(Arc::new(
+        SynonymGraphFilter::new(dict, true).with_boost(boost),
+    )))
+}
+
+/// Each hit's id and score for `dsl` parsed with `analyzer`.
+async fn scores(
+    engine: &Engine,
+    analyzer: Arc<dyn Analyzer>,
+    dsl: &str,
+) -> Result<Vec<(String, f32)>> {
+    let query = LexicalQueryParser::new(analyzer).parse(dsl)?;
+    let request = SearchRequestBuilder::new()
+        .lexical_query(LexicalSearchQuery::Obj(query))
+        .limit(10)
+        .build();
+    let mut hits: Vec<(String, f32)> = engine
+        .search(request)
+        .await?
+        .results
+        .into_iter()
+        .map(|hit| (hit.id, hit.score))
+        .collect();
+    hits.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(hits)
+}
+
+fn score_in(hits: &[(String, f32)], id: &str) -> f32 {
+    hits.iter()
+        .find(|(hit, _)| hit == id)
+        .unwrap_or_else(|| panic!("missing hit {id}: {hits:?}"))
+        .1
+}
+
+/// With query-time-only synonyms (`plain` holds no stacked token), a
+/// weighted synonym ranks the document with the original word above the
+/// one with its synonym, which an unweighted synonym scores the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_weighted_query_time_synonym_ranks_the_original_word_first() -> Result<()> {
+    let engine = engine().await?;
+
+    let unweighted = scores(&engine, syn_analyzer(), "plain:big").await?;
+    assert!(
+        (score_in(&unweighted, "big_dog") - score_in(&unweighted, "large_dog")).abs() < 1e-6,
+        "unweighted, the synonym scores like the original: {unweighted:?}"
+    );
+
+    let weighted = scores(&engine, weighted_syn_analyzer(0.8), "plain:big").await?;
+    let (big, large) = (
+        score_in(&weighted, "big_dog"),
+        score_in(&weighted, "large_dog"),
+    );
+    assert!(
+        large < big,
+        "the synonym scores below the original: {weighted:?}"
+    );
+    // The original keeps its full weight, so its score does not move.
+    assert!(
+        (big - score_in(&unweighted, "big_dog")).abs() < 1e-6,
+        "{weighted:?} {unweighted:?}"
+    );
+    Ok(())
+}
+
+/// With index-time synonyms (`syn` stacks "large" on "big" and the other
+/// way), every matching document holds every alternative, so a weighted
+/// synonym keeps their ranking and lowers their scores alike: each scores a
+/// combined frequency of 1 + 0.64 instead of 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_weighted_synonym_on_an_index_time_synonym_field_keeps_the_ranking() -> Result<()> {
+    let engine = engine().await?;
+    let unweighted = scores(&engine, syn_analyzer(), "syn:big").await?;
+    let weighted = scores(&engine, weighted_syn_analyzer(0.8), "syn:big").await?;
+    let ids = |hits: &[(String, f32)]| hits.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&weighted), ids(&unweighted));
+    let (big, large) = (
+        score_in(&weighted, "big_dog"),
+        score_in(&weighted, "large_dog"),
+    );
+    assert!((big - large).abs() < 1e-6, "{weighted:?}");
+    assert!(
+        big < score_in(&unweighted, "big_dog"),
+        "{weighted:?} {unweighted:?}"
+    );
+    Ok(())
+}
+
 // ---- Groups with several multi-word members (#1262) ----
 
 const MEMBERS_SCHEMA_TOML: &str = r#"

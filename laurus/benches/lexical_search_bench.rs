@@ -922,6 +922,33 @@ fn bench_topk_or_skewed_tf(c: &mut Criterion) {
                 });
             },
         );
+
+        // The same OR with the synonym's second alternative weighted
+        // (Issue #1704): `WeightedSynonymMatcher` in place of
+        // `DisjunctionMatcher`.
+        group.bench_with_input(
+            BenchmarkId::new("should_or_weighted_synonym_topk10", n),
+            &n,
+            |b, _| {
+                b.to_async(&rt).iter(|| {
+                    let engine = &engine;
+                    async move {
+                        let mut bq = BooleanQuery::new();
+                        bq.add_should(Box::new(TermQuery::new("body", "search")));
+                        bq.add_should(Box::new(TermQuery::new("body", "system")));
+                        bq.add_should(Box::new(SynonymQuery::weighted(
+                            "body",
+                            vec![("data", 1.0), ("query", 0.8)],
+                        )));
+                        let request = SearchRequestBuilder::new()
+                            .lexical_query(LexicalSearchQuery::Obj(Box::new(bq)))
+                            .limit(10)
+                            .build();
+                        black_box(engine.search(request).await.unwrap().results)
+                    }
+                });
+            },
+        );
     }
     group.finish();
 }

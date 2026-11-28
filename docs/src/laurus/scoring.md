@@ -22,7 +22,7 @@ Where:
 
 The `(k1, b)` parameters are fixed at the implementation defaults today. The values match Lucene / Elasticsearch defaults, so BM25 scores from Laurus are directly comparable to those engines for tuning intuition.
 
-A quoted or bare value whose analyzer stacks several alternatives at one position (synonyms) is scored as one blended term rather than as a sum of independent term scores, so a document is not rewarded for holding every alternative — see [Searching with synonyms](../concepts/analysis.md#searching-with-synonyms).
+A quoted or bare value whose analyzer stacks several alternatives at one position (synonyms) is scored as one blended term rather than as a sum of independent term scores, so a document is not rewarded for holding every alternative — see [Searching with synonyms](../concepts/analysis.md#searching-with-synonyms). Each alternative weighs its occurrences by its token boost relative to the largest at the position, as in Lucene's `SynonymQuery` (Issue #1704, [Synonym Expansion](../concepts/analysis.md#synonym-expansion)).
 
 A wildcard, prefix or regexp query is not scored with BM25: every match receives the query's boost. A fuzzy query scores its closest terms, and a closer term higher. See [Matches and scores of wildcard, prefix and regexp queries](../concepts/search/lexical_search.md#matches-and-scores-of-wildcard-prefix-and-regexp-queries) and [FuzzyQuery](../concepts/search/lexical_search.md#fuzzyquery).
 

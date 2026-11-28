@@ -54,12 +54,20 @@ impl SynonymGraphBuilder {
 
     /// Set the boost multiplier for synonym tokens.
     ///
-    /// Search does not apply this weight yet: the query parser puts a
-    /// position's largest token boost on its `SynonymQuery` as a whole
-    /// (Issue #1701), so a synonym scores like the term it expands.
+    /// Each synonym token gets `boost` times a base: 0.8 for a one-word
+    /// synonym of one word, 0.9 for a one-word synonym of several words and
+    /// for the first word of a multi-word synonym, and 0.8 for the other
+    /// words. The matched words keep their own boost. Without this call,
+    /// every synonym token has a boost of 1.
+    ///
+    /// The query parser weighs a synonym's occurrences by its token's boost
+    /// relative to the largest at its position (Issue #1704), so with 0.8
+    /// an occurrence of a one-word synonym of one word counts as 0.64 of
+    /// the original's.
     ///
     /// # Arguments
-    /// * `boost` - Boost multiplier (e.g., 0.8 to reduce synonym weight to 80%)
+    /// * `boost` - Boost multiplier, finite and 0 or more (e.g. 0.8, which
+    ///   gives a one-word synonym of one word 0.64)
     ///
     /// # Example
     /// ```
@@ -70,7 +78,7 @@ impl SynonymGraphBuilder {
     /// dict.add_synonym_group(vec!["ml".to_string(), "machine learning".to_string()]);
     ///
     /// let builder = SynonymGraphBuilder::new(dict, true)
-    ///     .with_boost(0.8); // Synonyms get 80% of original weight
+    ///     .with_boost(0.8); // "machine" gets 0.72 and "learning" 0.64
     /// ```
     pub fn with_boost(mut self, boost: f32) -> Self {
         self.synonym_boost = Some(boost);
