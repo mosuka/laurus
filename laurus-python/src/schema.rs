@@ -453,9 +453,12 @@ impl PySchema {
 
     /// Add a geographic coordinate field (latitude, longitude).
     ///
+    /// Values are submitted as a dict ``{"lat": ..., "lon": ...}`` and are
+    /// read back as the same dict.
+    ///
     /// Args:
     ///     multi_valued: When True, the field accepts a list of
-    ///         ``(lat, lon)`` tuples and distance / bounding-box queries
+    ///         ``{"lat", "lon"}`` dicts and distance / bounding-box queries
     ///         match if any point satisfies the predicate (Lucene-style
     ///         "any match"), scoring the document by its closest point.
     ///         Default False.
@@ -488,14 +491,15 @@ impl PySchema {
 
     /// Add a 3D ECEF Cartesian point field (x, y, z in meters).
     ///
-    /// Values are submitted as a 3-tuple `(x, y, z)` of floats and are
-    /// queryable via `Geo3dDistanceQuery`, `Geo3dBoundingBoxQuery`, and
-    /// `Geo3dNearestQuery`. See the conceptual docs at
+    /// Values are submitted as a dict ``{"x": ..., "y": ..., "z": ...}`` of
+    /// floats, read back as the same dict, and are queryable via
+    /// `Geo3dDistanceQuery`, `Geo3dBoundingBoxQuery`, `Geo3dNearestQuery`
+    /// and `Geo3dPolylineQuery`. See the conceptual docs at
     /// `docs/src/concepts/geo3d.md` for the coordinate system.
     ///
     /// Args:
     ///     multi_valued: When True, the field accepts a list of
-    ///         ``(x, y, z)`` tuples and the geo3d queries match if any
+    ///         ``{"x", "y", "z"}`` dicts and the geo3d queries match if any
     ///         point satisfies the predicate (Lucene-style "any match"),
     ///         scoring the document by its closest point. Default False.
     ///     doc_values: Whether the value is also copied into DocValues
