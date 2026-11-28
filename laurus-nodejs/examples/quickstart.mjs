@@ -28,14 +28,14 @@ await index.commit();
 
 // 4. Search with DSL string
 console.log("=== DSL search: 'framework' ===");
-const dslResults = await index.search("framework", 5);
+const dslResults = (await index.search("framework", 5)).results;
 for (const r of dslResults) {
   console.log(`  ${r.id}  score=${r.score.toFixed(4)}  name="${r.document.name}"`);
 }
 
 // 5. Search with term query
 console.log("\n=== Term search: description='minimalist' ===");
-const termResults = await index.searchTerm("description", "minimalist", 5);
+const termResults = (await index.searchTerm("description", "minimalist", 5)).results;
 for (const r of termResults) {
   console.log(`  ${r.id}  score=${r.score.toFixed(4)}  name="${r.document.name}"`);
 }

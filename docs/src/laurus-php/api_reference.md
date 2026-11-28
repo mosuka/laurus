@@ -33,8 +33,8 @@ new \Laurus\Index(?string $path = null, ?Schema $schema = null, ?WalSyncPolicy $
 | `deleteDocuments(string $id): void` | Delete all versions for the given ID. |
 | `commit(): void` | Flush buffered writes and make all pending changes searchable. |
 | `flushWal(): void` | Force a durable WAL barrier on demand. Synchronously fsyncs any unsynced WAL records. Useful when running under a group-commit policy (see below). |
-| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null): array` | Execute a search query. Returns an array of `SearchResult`. `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. `$groupBy` groups the results by a field's value (Issue #1297), and `$limit`/`$offset` then count groups; see [GroupBy](#groupby). When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy` are used and the other arguments are ignored, though they are still checked. A negative `$limit` or `$offset` throws `\ValueError` (Issue #1609). |
-| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Returns an array of arrays of `SearchResult`. Empty input returns `[]`. `$highlight` and `$groupBy` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. A negative `$limit` or `$offset` throws `\ValueError`, even when `$queries` is empty (Issue #1609). A query that cannot be converted or that the engine rejects throws the exception `search` throws for it, of the same class and code, with the query's position among the elements (whatever the array's keys) in front of the message: `queries[1]: ...` (Issue #1627). |
+| `search(mixed $query, int $limit = 10, int $offset = 0, ?array $highlight = null, ?LateInteractionRescore $rescore = null, ?GroupBy $groupBy = null, int\|bool\|null $trackTotalHits = null): SearchResponse` | Execute a search query. Returns a [`SearchResponse`](#searchresponse) whose `getResults()` is the page of `SearchResult`. `$trackTotalHits` asks for the total hit count (Issue #1472); see [Total hits](#total-hits). `$rescore` reorders the top results by late-interaction MaxSim against a multi-vector field (Issue #1351); see [LateInteractionRescore](#lateinteractionrescore). Any other object as `$rescore` throws `\TypeError`. `$groupBy` groups the results by a field's value (Issue #1297), and `$limit`/`$offset` then count groups; see [GroupBy](#groupby). When `$query` is a `SearchRequest`, the request's own `$limit`/`$offset`/`$highlight`/`$rescore`/`$groupBy`/`$trackTotalHits` are used and the other arguments are ignored, though they are still checked. A negative `$limit` or `$offset` throws `\ValueError` (Issue #1609). |
+| `searchBatch(array $queries, int $limit = 10, int $offset = 0, ?array $highlight = null, ?GroupBy $groupBy = null, int\|bool\|null $trackTotalHits = null): array` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. Returns an array of [`SearchResponse`](#searchresponse): `responses[i]` is the response of `queries[i]`, with its own `getTotalHits()`. Empty input returns `[]`. `$highlight`, `$groupBy` and `$trackTotalHits` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `$rescore` parameter; a `SearchRequest` element is rescored by its own `$rescore`. A negative `$limit` or `$offset` throws `\ValueError`, even when `$queries` is empty (Issue #1609). A query that cannot be converted or that the engine rejects throws the exception `search` throws for it, of the same class and code, with the query's position among the elements (whatever the array's keys) in front of the message: `queries[1]: ...` (Issue #1627). |
 | `stats(): array` | Return index statistics (`"documentCount"`, `"vectorFields"`). |
 
 ### `search` query argument
@@ -48,6 +48,31 @@ The `$query` parameter accepts any of the following:
 
 The same value kinds are accepted as the elements of `searchBatch`'s `$queries` array — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
 
+### Total hits
+
+`search`, `searchBatch` and `new \Laurus\SearchRequest(...)` take `$trackTotalHits` (Issue #1472), which asks for the number of matching documents in the response's `getTotalHits()`, as the HTTP gateway's `"track_total_hits"` does:
+
+| Value | Counts |
+| :--- | :--- |
+| `null` or `false` (the default) | Nothing: `getTotalHits()` is `null`. |
+| An int from 1 up | Exactly while fewer match. Once the count reaches it, the total is that number with the relation `"gte"`. |
+| `true` | Every match. |
+
+Counting has a cost: until the count reaches the threshold, a search cannot skip the documents block-max pruning would skip. What a total counts for vector, hybrid and grouped searches is the engine's; see [Total hits](../laurus/engine.md#total-hits). `0` throws `\ValueError` from the engine (`track_total_hits must count at least 1 match, got UpTo(0)`), a negative int throws `\ValueError` (`Index::search: trackTotalHits must be at least 0, got -1`), and a value of another type throws `\TypeError` (`Index::search: trackTotalHits must be true, false, null or an int from 0 up, got a value of type String`). The value is read without PHP's type juggling: `"1000"` and `1.5` are not ints. Name the argument (`trackTotalHits: 3`) to leave out the ones before it.
+
+Over five documents that match `body:rust`:
+
+```php
+$response = $index->search("body:rust", 2, trackTotalHits: 3);
+echo count($response->getResults()), "\n"; // 2
+echo $response->getTotalHits(), "\n";      // TotalHits(value=3, relation='gte')
+
+$response = $index->search("body:rust", 2, trackTotalHits: true);
+echo $response->getTotalHits(), "\n";      // TotalHits(value=5, relation='eq')
+
+var_dump($index->search("body:rust", 2)->getTotalHits()); // NULL
+```
+
 ### Highlighting
 
 `search`/`searchBatch`'s `$highlight` parameter (Issue #1134) requests highlighted fragments per field on each hit's `SearchResult::getHighlights()`. It accepts:
@@ -58,7 +83,7 @@ The same value kinds are accepted as the elements of `searchBatch`'s `$queries` 
 A negative `max_fragments`, `fragment_size` or `max_analyzed_chars` throws `\ValueError` (Issue #1609).
 
 ```php
-$results = $index->search("body:rust", 10, 0, ["body"]);
+$results = $index->search("body:rust", 10, 0, ["body"])->getResults();
 $results[0]->getHighlights(); // ["body" => ["<mark>Rust</mark> is a systems programming language."]]
 ```
 
@@ -513,6 +538,7 @@ new \Laurus\SearchRequest(
     ?array $highlight = null,
     ?LateInteractionRescore $rescore = null,
     ?GroupBy $groupBy = null,
+    int|bool|null $trackTotalHits = null,
 )
 ```
 
@@ -528,8 +554,9 @@ new \Laurus\SearchRequest(
 | `$highlight` | Same list-or-associative-array shape as `Index->search()`'s `$highlight` (Issue #1134). See [Highlighting](#highlighting). Only `$limit`/`$offset` have PHP-level defaults today, so a call that names `$highlight` must still pass every earlier parameter positionally or by name. |
 | `$rescore` | A `LateInteractionRescore` that reorders the top results (Issue #1351); any other object throws `\TypeError`. See [LateInteractionRescore](#lateinteractionrescore). As with `$highlight`, pass every earlier parameter too. |
 | `$groupBy` | A `GroupBy` that groups the results (Issue #1297); any other value throws `\TypeError`. See [GroupBy](#groupby). As with `$highlight`, pass every earlier parameter too. |
+| `$trackTotalHits` | How many matches to count for the response's `getTotalHits()` (Issue #1472), read as `Index->search()`'s; see [Total hits](#total-hits). Another value throws `\TypeError` or `\ValueError` when the request is constructed. |
 
-When a `SearchRequest` is passed to `Index->search()`, its own `$limit`, `$offset`, `$highlight`, `$rescore` and `$groupBy` are used; `search`'s other arguments are ignored.
+When a `SearchRequest` is passed to `Index->search()`, its own `$limit`, `$offset`, `$highlight`, `$rescore`, `$groupBy` and `$trackTotalHits` are used; `search`'s other arguments are ignored.
 
 ---
 
@@ -577,12 +604,12 @@ $index->putDocument("b", ["title" => "rust language", "tokens" => [[0.9, 0.2]]])
 $index->commit();
 
 $rescore = new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], 50);
-$results = $index->search("title:rust", 10, 0, null, $rescore);
+$results = $index->search("title:rust", 10, 0, null, $rescore)->getResults();
 $results[0]->getId();    // "b"
 $results[0]->getScore(); // ≈ 1.1 = 0.9 + 0.2 (MaxSim)
 
 // The same rescore through a SearchRequest (9th argument)
-$results = $index->search(new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $rescore));
+$results = $index->search(new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $rescore))->getResults();
 
 // A text query needs a token-level embedder on the field (see "Embedder types")
 $rescore = new Laurus\LateInteractionRescore("body_colbert", "how do lifetimes work");
@@ -630,21 +657,43 @@ $index->addDocument("manual", ["body" => "Elided lifetimes follow three rules."]
 $index->addDocument("faq", ["body" => "Why do lifetimes appear in signatures?"]);
 $index->commit();
 
-$results = $index->search("body:lifetimes", groupBy: new Laurus\GroupBy("_id", groupSize: 2));
+$results = $index->search("body:lifetimes", groupBy: new Laurus\GroupBy("_id", groupSize: 2))->getResults();
 $results[0]->getGroupKey();                            // "faq"
 $results[1]->getGroupKey();                            // "manual"
 $results[1]->getInnerHits()[0]->getDocument()["body"]; // "Elided lifetimes follow three rules."
 
 // The same grouping through a SearchRequest (10th argument)
 $request = new Laurus\SearchRequest("body:lifetimes", null, null, null, null, 10, 0, null, null, new Laurus\GroupBy("_id", groupSize: 2));
-$results = $index->search($request);
+$results = $index->search($request)->getResults();
 ```
+
+---
+
+## SearchResponse
+
+Returned by `Index->search()`, and for each query by `Index->searchBatch()` (Issue #1472).
+
+| Method | Description |
+| :--- | :--- |
+| `getResults(): array` | The page of results, an array of `SearchResult`. |
+| `getTotalHits(): ?TotalHits` | With `$trackTotalHits`, the total hit count; `null` otherwise. |
+
+Cast to a string, it gives `SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))`.
+
+### TotalHits
+
+| Method | Description |
+| :--- | :--- |
+| `getValue(): int` | The number of matching documents counted. |
+| `getRelation(): string` | `"eq"` when the value is exact, `"gte"` when it is a lower bound. |
+
+The relation is written as the HTTP gateway, MCP and the CLI write it. See [Total hits](#total-hits).
 
 ---
 
 ## SearchResult
 
-Returned by `Index->search()`.
+One result of a search, an element of `SearchResponse->getResults()`.
 
 ```php
 $result->getId()          // string   -- External document identifier

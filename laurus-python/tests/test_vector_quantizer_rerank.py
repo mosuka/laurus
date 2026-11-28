@@ -85,7 +85,7 @@ def test_product_quantization_builds_and_searches():
         idx.put_document(f"far{i}", {"embedding": [b + o for b, o in zip(far_base, off)]})
     idx.commit()
 
-    results = idx.search(laurus.VectorQuery("embedding", near_base), limit=3)
+    results = idx.search(laurus.VectorQuery("embedding", near_base), limit=3).results
     assert len(results) == 3
     assert all(r.id.startswith("near") for r in results)
 
@@ -120,7 +120,7 @@ def _assert_float16_ranks_exact_match_first(add_field):
     idx.put_document("b", {"embedding": [0.25, 0.0]})
     idx.commit()
 
-    results = idx.search(laurus.VectorQuery("embedding", [0.25, 0.0]), limit=2)
+    results = idx.search(laurus.VectorQuery("embedding", [0.25, 0.0]), limit=2).results
     assert [r.id for r in results] == ["b", "a"]
 
 

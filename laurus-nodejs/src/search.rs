@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::convert::{data_value_to_json, optional_unsigned_param};
+use crate::convert::{data_value_to_json, optional_unsigned_param, track_total_hits_param};
 use crate::query::{
     JsBooleanQuery, JsDateTimeRangeQuery, JsFuzzyQuery, JsGeo3dBoundingBoxQuery,
     JsGeo3dDistanceQuery, JsGeo3dNearestQuery, JsGeoBoundingBoxQuery, JsGeoDistanceQuery,
@@ -13,7 +13,7 @@ use crate::query::{
 use laurus::vector::Vector;
 use laurus::{
     FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions, LexicalSearchQuery,
-    RescoreOptions, SearchRequestBuilder, SearchResult,
+    RescoreOptions, SearchRequestBuilder, SearchResult, TotalHitsRelation, TrackTotalHits,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -283,7 +283,8 @@ impl JsWeightedSum {
 // SearchResult
 // ---------------------------------------------------------------------------
 
-/// A single search result returned by `Index.search()`.
+/// A single search result, an element of a `SearchResponse`'s `results`
+/// (Issue #1472).
 ///
 /// Properties:
 ///   - `id` (string): External document identifier.
@@ -342,6 +343,60 @@ pub fn to_js_search_result(r: SearchResult) -> JsSearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// SearchResponse and TotalHits (Issue #1472)
+// ---------------------------------------------------------------------------
+
+/// The total hit count of a search, returned when `trackTotalHits` asks
+/// for one (Issue #1472).
+///
+/// What a total counts for vector, hybrid and grouped searches is the
+/// engine's (`laurus/engine.md`, "Total hits").
+#[napi(object)]
+pub struct JsTotalHits {
+    /// The number of matching documents counted.
+    pub value: f64,
+    /// `"eq"` when `value` is the number of matching documents, `"gte"`
+    /// when counting stopped at the threshold and `value` is a lower bound.
+    #[napi(ts_type = "'eq' | 'gte'")]
+    pub relation: String,
+}
+
+/// The value every search method resolves to, and each element of
+/// `searchBatch`'s array (Issue #1472).
+#[napi(object)]
+pub struct JsSearchResponse {
+    /// The page of results.
+    pub results: Vec<JsSearchResult>,
+    /// The total hit count, when `trackTotalHits` asked for one; absent
+    /// otherwise.
+    pub total_hits: Option<JsTotalHits>,
+}
+
+/// Convert the engine's [`laurus::SearchResponse`] into a
+/// [`JsSearchResponse`].
+///
+/// The relation is written as the HTTP gateway, MCP and the CLI write it:
+/// `"eq"` for an exact total, `"gte"` for a lower bound. The value, a
+/// `u64`, is a JavaScript number, exact up to 2^53.
+pub fn to_js_search_response(response: laurus::SearchResponse) -> JsSearchResponse {
+    JsSearchResponse {
+        results: response
+            .results
+            .into_iter()
+            .map(to_js_search_result)
+            .collect(),
+        total_hits: response.total_hits.map(|t| JsTotalHits {
+            value: t.value as f64,
+            relation: match t.relation {
+                TotalHitsRelation::Exact => "eq",
+                TotalHitsRelation::AtLeast => "gte",
+            }
+            .to_string(),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchRequest
 // ---------------------------------------------------------------------------
 
@@ -360,7 +415,7 @@ pub fn to_js_search_result(r: SearchResult) -> JsSearchResult {
 /// request.setVectorTextQuery(new VectorTextQuery("text_vec", "type system"));
 /// request.setFilterTerm(new TermQuery("category", "type-system"));
 /// request.setRrfFusion(new RRF(60.0));
-/// const results = await index.searchWithRequest(request);
+/// const { results } = await index.searchWithRequest(request);
 /// ```
 #[napi(js_name = "SearchRequest")]
 pub struct JsSearchRequest {
@@ -382,6 +437,9 @@ pub struct JsSearchRequest {
     pub(crate) rescore: Option<JsRescoreOptions>,
     /// Grouping of the results by a field's value (Issue #1297).
     pub(crate) group_by: Option<JsGroupByOptions>,
+    /// How many matches to count for the response's `totalHits` (Issue
+    /// #1472).
+    pub(crate) track_total_hits: TrackTotalHits,
 }
 
 pub enum FusionChoice {
@@ -420,6 +478,12 @@ pub struct JsSearchRequestOptions {
     /// Grouping of the results by a field's value (Issue #1297). Plain
     /// data, like `highlight`.
     pub group_by: Option<JsGroupByOptions>,
+    /// How many matches to count for the response's `totalHits` (Issue
+    /// #1472): an integer from 0 to 4294967295 counts exactly up to it,
+    /// `true` counts every match, and `false` or `null` (the default)
+    /// counts nothing.
+    #[napi(ts_type = "number | boolean | null")]
+    pub track_total_hits: Option<serde_json::Value>,
 }
 
 #[napi]
@@ -446,9 +510,10 @@ impl JsSearchRequest {
     /// # Errors
     ///
     /// Throws an `InvalidArg` error if `limit` or `offset` is not an
-    /// integer from 0 to 4294967295 (Issue #1612). The integers of
-    /// `highlight`, `rescore` and `groupBy` are checked when the request is
-    /// searched, like the rest of those options.
+    /// integer from 0 to 4294967295 (Issue #1612), or if `trackTotalHits`
+    /// is not `true`, `false`, `null` or such an integer (Issue #1472). The
+    /// integers of `highlight`, `rescore` and `groupBy` are checked when the
+    /// request is searched, like the rest of those options.
     #[napi(constructor)]
     pub fn new(options: Option<JsSearchRequestOptions>) -> Result<Self> {
         let options = options.unwrap_or(JsSearchRequestOptions {
@@ -458,8 +523,11 @@ impl JsSearchRequest {
             highlight: None,
             rescore: None,
             group_by: None,
+            track_total_hits: None,
         });
         let (limit, offset) = limit_and_offset("SearchRequest", options.limit, options.offset)?;
+        let track_total_hits =
+            track_total_hits_param("SearchRequest", options.track_total_hits.as_ref())?;
         Ok(Self {
             query_dsl: options.query_dsl,
             lexical_query: None,
@@ -471,6 +539,7 @@ impl JsSearchRequest {
             highlight: options.highlight,
             rescore: options.rescore,
             group_by: options.group_by,
+            track_total_hits,
         })
     }
 
@@ -688,7 +757,8 @@ impl JsSearchRequest {
     pub fn build(&self) -> Result<laurus::SearchRequest> {
         let mut builder = SearchRequestBuilder::new()
             .limit(self.limit)
-            .offset(self.offset);
+            .offset(self.offset)
+            .track_total_hits(self.track_total_hits);
 
         // Fusion algorithm
         if let Some(fusion) = &self.fusion {

@@ -83,7 +83,7 @@ await index.putDocument("fastify", {
 await index.commit();
 
 // Search
-const results = await index.search("framework", 5);
+const { results } = await index.search("framework", 5);
 for (const r of results) {
   console.log(`[${r.id}] score=${r.score.toFixed(4)}  ${r.document.name}`);
 }

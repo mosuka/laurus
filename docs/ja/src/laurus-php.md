@@ -54,7 +54,7 @@ $index->putDocument("doc2", ["title" => "PHP for Web Development", "body" => "We
 $index->commit();
 
 // 検索
-$results = $index->search("title:rust", 5);
+$results = $index->search("title:rust", 5)->getResults();
 foreach ($results as $r) {
     printf("[%s] score=%.4f  %s\n", $r->getId(), $r->getScore(), $r->getDocument()["title"]);
 }

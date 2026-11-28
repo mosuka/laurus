@@ -138,16 +138,16 @@ echo "PART 1: TermQuery" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[1a] Search for 'php' in body:" . PHP_EOL;
-print_results($index->search(new TermQuery("body", "php"), 5));
+print_results($index->search(new TermQuery("body", "php"), 5)->getResults());
 
 echo PHP_EOL . "[1b] Search for 'framework' in category (exact):" . PHP_EOL;
-print_results($index->search(new TermQuery("category", "framework"), 5));
+print_results($index->search(new TermQuery("category", "framework"), 5)->getResults());
 
 echo PHP_EOL . "[1c] Search for maintained=true (boolean field):" . PHP_EOL;
-print_results($index->search(new TermQuery("maintained", "true"), 5));
+print_results($index->search(new TermQuery("maintained", "true"), 5)->getResults());
 
 echo PHP_EOL . "[1d] DSL: 'body:php':" . PHP_EOL;
-print_results($index->search("body:php", 5));
+print_results($index->search("body:php", 5)->getResults());
 
 // =====================================================================
 // PART 2: PhraseQuery — exact word sequence
@@ -157,13 +157,13 @@ echo "PART 2: PhraseQuery" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[2a] Phrase 'web application framework' in body:" . PHP_EOL;
-print_results($index->search(new PhraseQuery("body", ["web", "application", "framework"]), 5));
+print_results($index->search(new PhraseQuery("body", ["web", "application", "framework"]), 5)->getResults());
 
 echo PHP_EOL . "[2b] Phrase 'dependency management' in body:" . PHP_EOL;
-print_results($index->search(new PhraseQuery("body", ["dependency", "management"]), 5));
+print_results($index->search(new PhraseQuery("body", ["dependency", "management"]), 5)->getResults());
 
 echo PHP_EOL . "[2c] DSL: 'body:\"web application framework\"':" . PHP_EOL;
-print_results($index->search('body:"web application framework"', 5));
+print_results($index->search('body:"web application framework"', 5)->getResults());
 
 // =====================================================================
 // PART 3: FuzzyQuery — approximate matching (typo tolerance)
@@ -173,13 +173,13 @@ echo "PART 3: FuzzyQuery" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[3a] Fuzzy 'laravl' (missing 'e', max_edits=2):" . PHP_EOL;
-print_results($index->search(new FuzzyQuery("body", "laravl", 2), 5));
+print_results($index->search(new FuzzyQuery("body", "laravl", 2), 5)->getResults());
 
 echo PHP_EOL . "[3b] Fuzzy 'sympfony' (extra 'p', max_edits=1):" . PHP_EOL;
-print_results($index->search(new FuzzyQuery("body", "sympfony", 1), 5));
+print_results($index->search(new FuzzyQuery("body", "sympfony", 1), 5)->getResults());
 
 echo PHP_EOL . "[3c] DSL: 'laravl~2':" . PHP_EOL;
-print_results($index->search("laravl~2", 5));
+print_results($index->search("laravl~2", 5)->getResults());
 
 // =====================================================================
 // PART 4: WildcardQuery — pattern matching with * and ?
@@ -189,13 +189,13 @@ echo "PART 4: WildcardQuery" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[4a] Wildcard '*.pdf' in filename:" . PHP_EOL;
-print_results($index->search(new WildcardQuery("filename", "*.pdf"), 5));
+print_results($index->search(new WildcardQuery("filename", "*.pdf"), 5)->getResults());
 
 echo PHP_EOL . "[4b] Wildcard 'php*' in body:" . PHP_EOL;
-print_results($index->search(new WildcardQuery("body", "php*"), 5));
+print_results($index->search(new WildcardQuery("body", "php*"), 5)->getResults());
 
 echo PHP_EOL . "[4c] DSL: 'body:php*':" . PHP_EOL;
-print_results($index->search("body:php*", 5));
+print_results($index->search("body:php*", 5)->getResults());
 
 // =====================================================================
 // PART 5: NumericRangeQuery — numeric range filtering
@@ -205,13 +205,13 @@ echo "PART 5: NumericRangeQuery" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[5a] Rating 4.5-5.0 (float range):" . PHP_EOL;
-print_results($index->search(new NumericRangeQuery("rating", 4.5, 5.0, "float"), 5));
+print_results($index->search(new NumericRangeQuery("rating", 4.5, 5.0, "float"), 5)->getResults());
 
 echo PHP_EOL . "[5b] Projects started from 2010 onwards (integer range):" . PHP_EOL;
-print_results($index->search(new NumericRangeQuery("year", 2010, null), 5));
+print_results($index->search(new NumericRangeQuery("year", 2010, null), 5)->getResults());
 
 echo PHP_EOL . "[5c] DSL: 'rating:[4.5 TO 5.0]':" . PHP_EOL;
-print_results($index->search("rating:[4.5 TO 5.0]", 5));
+print_results($index->search("rating:[4.5 TO 5.0]", 5)->getResults());
 
 // =====================================================================
 // PART 6: GeoDistanceQuery / GeoBoundingBoxQuery — geographic search
@@ -221,10 +221,10 @@ echo "PART 6: GeoDistanceQuery / GeoBoundingBoxQuery" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[6a] Within 100 km of Paris (48.86, 2.35):" . PHP_EOL;
-print_results($index->search(GeoDistanceQuery::withinRadius("location", 48.8566, 2.3522, 100_000.0), 5));
+print_results($index->search(GeoDistanceQuery::withinRadius("location", 48.8566, 2.3522, 100_000.0), 5)->getResults());
 
 echo PHP_EOL . "[6b] Bounding box — Europe (47, -1) to (53, 14):" . PHP_EOL;
-print_results($index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 47.0, -1.0, 53.0, 14.0), 5));
+print_results($index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 47.0, -1.0, 53.0, 14.0), 5)->getResults());
 
 // =====================================================================
 // PART 7: BooleanQuery — AND / OR / NOT combinations
@@ -237,22 +237,22 @@ echo PHP_EOL . "[7a] AND: 'php' in body AND category='framework':" . PHP_EOL;
 $bq = new BooleanQuery();
 $bq->must(new TermQuery("body", "php"));
 $bq->must(new TermQuery("category", "framework"));
-print_results($index->search($bq, 5));
+print_results($index->search($bq, 5)->getResults());
 
 echo PHP_EOL . "[7b] OR: category='framework' OR category='cms':" . PHP_EOL;
 $bq = new BooleanQuery();
 $bq->should(new TermQuery("category", "framework"));
 $bq->should(new TermQuery("category", "cms"));
-print_results($index->search($bq, 5));
+print_results($index->search($bq, 5)->getResults());
 
 echo PHP_EOL . "[7c] NOT: 'php' in body, NOT 'composer':" . PHP_EOL;
 $bq = new BooleanQuery();
 $bq->must(new TermQuery("body", "php"));
 $bq->mustNot(new TermQuery("body", "composer"));
-print_results($index->search($bq, 5));
+print_results($index->search($bq, 5)->getResults());
 
 echo PHP_EOL . "[7d] DSL: '+body:php -body:composer':" . PHP_EOL;
-print_results($index->search("+body:php -body:composer", 5));
+print_results($index->search("+body:php -body:composer", 5)->getResults());
 
 // =====================================================================
 // PART 8: SpanQuery — positional / proximity search
@@ -263,12 +263,12 @@ echo str_repeat("=", 60) . PHP_EOL;
 
 echo PHP_EOL . "[8a] SpanNear: 'plugin' near 'theme' (slop=2, ordered):" . PHP_EOL;
 $spanQ = SpanQuery::near("body", ["plugin", "theme"], 2, true);
-print_results($index->search($spanQ, 5));
+print_results($index->search($spanQ, 5)->getResults());
 
 echo PHP_EOL . "[8b] SpanContaining: 'web..framework' containing 'application':" . PHP_EOL;
 $big = SpanQuery::near("body", ["web", "framework"], 2, true);
 $little = SpanQuery::term("body", "application");
 $containing = SpanQuery::containing("body", $big, $little);
-print_results($index->search($containing, 5));
+print_results($index->search($containing, 5)->getResults());
 
 echo PHP_EOL . "Lexical search example completed!" . PHP_EOL;

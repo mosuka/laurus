@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit()` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal()` | WAL の永続性バリアを強制します。[WAL 同期ポリシー / 永続性](#wal-同期ポリシー--永続性)を参照してください。 |
-| `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None) -> list[SearchResult]` | 検索クエリを実行します。`rescore` には、MultiVector フィールドに対する late interaction で上位の結果を並べ替える [`LateInteractionRescore`](#lateinteractionrescore) を渡します（Issue #1351）。`group_by` には、結果をフィールドの値でグループ化する [`GroupBy`](#groupby) を渡します（Issue #1297）。このとき `limit` と `offset` はグループの数を数えます。`query` が `SearchRequest` の場合はリクエスト自身の `rescore` と `group_by` を使い、これらのキーワードは無視されます。 |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空のリストの場合は `[]` を返します。`highlight` と `group_by` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリに送出するのと同じ例外を送出し、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
+| `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None, track_total_hits=None) -> SearchResponse` | 検索クエリを実行し、結果のページを `results` に持つ [`SearchResponse`](#searchresponse) を返します。`track_total_hits` で総ヒット数を求められます（Issue #1472、[総ヒット数](#総ヒット数)を参照）。`rescore` には、MultiVector フィールドに対する late interaction で上位の結果を並べ替える [`LateInteractionRescore`](#lateinteractionrescore) を渡します（Issue #1351）。`group_by` には、結果をフィールドの値でグループ化する [`GroupBy`](#groupby) を渡します（Issue #1297）。このとき `limit` と `offset` はグループの数を数えます。`query` が `SearchRequest` の場合はリクエスト自身の `rescore`・`group_by`・`track_total_hits` を使い、これらのキーワードは無視されます。 |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None, track_total_hits=None) -> list[SearchResponse]` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`responses[i]` は `queries[i]` の [`SearchResponse`](#searchresponse) で、自分の `total_hits` を持ちます。入力が空のリストの場合は `[]` を返します。`highlight`・`group_by`・`track_total_hits` はバッチ内のすべてのクエリに同一に適用されます。ただし `SearchRequest` の要素には、その要素自身の値を使います。`rescore` キーワードはありません。再採点が必要なクエリには、`rescore=` を指定した `SearchRequest` を渡してください。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリに送出するのと同じ例外を送出し、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats() -> dict` | インデックス統計（`document_count`、`vector_fields`）を返します。 |
 
 ### `search` の query 引数
@@ -53,6 +53,31 @@ class Index:
 
 `search_batch` の `queries` リストの各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
 
+### 総ヒット数
+
+`search`・`search_batch`・`SearchRequest` は `track_total_hits` を受けます（Issue #1472）。一致する文書の数を、レスポンスの `total_hits` に入れるよう求める引数で、HTTP gateway の `"track_total_hits"` と同じ値を受けます。
+
+| 値 | 数えるもの |
+| :--- | :--- |
+| `None` または `False`（既定） | 何も数えません。`total_hits` は `None` です。 |
+| 1 以上の `int` | 一致がその数より少なければ正確に数えます。数がその数に届くと、`total_hits` はその数で、relation は `"gte"` です。 |
+| `True` | すべての一致を数えます。 |
+
+数えるにはコストがかかります。数が上限に届くまで、block-max pruning が飛ばすはずの文書を飛ばせないためです。ベクトル・ハイブリッド・グループ化の検索で総数が何を数えるかは、エンジンが決めます。[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。`0` はエンジンが `ValueError`（`track_total_hits must count at least 1 match, got UpTo(0)`）で断ります。負の `int` と `u64::MAX` を超える `int` は `ValueError`、ほかの型の値（`"1000"`、`1.5`）は `TypeError`（`track_total_hits must be True, False or an integer from 0 to 18446744073709551615, got '1000'`）を送出します。`True` は `int` の 1 ではなく、すべての一致として読みます。
+
+`body:rust` に一致する 5 つの文書に対して実行すると、次のようになります。
+
+```python
+response = index.search("body:rust", limit=2, track_total_hits=3)
+print(len(response.results))  # 2
+print(response.total_hits)    # TotalHits(value=3, relation='gte')
+
+response = index.search("body:rust", limit=2, track_total_hits=True)
+print(response.total_hits)    # TotalHits(value=5, relation='eq')
+
+print(index.search("body:rust", limit=2).total_hits)  # None
+```
+
 ### ハイライト
 
 `search`/`search_batch` の `highlight` パラメータ（Issue #1134）は、各ヒットの `SearchResult.highlights` にフィールドごとのハイライト済みフラグメントを要求します。以下のいずれかを受け付けます。
@@ -61,7 +86,7 @@ class Index:
 - **辞書**: 必須の `"fields"` キーに加えて、`HighlightConfig` の任意の設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`）を指定 — 例: `highlight={"fields": ["body"], "tag": "em", "max_fragments": 2}`
 
 ```python
-results = index.search("body:rust", highlight=["body"])
+results = index.search("body:rust", highlight=["body"]).results
 print(results[0].highlights)  # {"body": ["<mark>Rust</mark> is a systems programming language."]}
 ```
 
@@ -561,6 +586,7 @@ class SearchRequest:
         highlight=None,
         rescore: LateInteractionRescore | None = None,
         group_by: GroupBy | None = None,
+        track_total_hits: int | bool | None = None,
     ) -> None: ...
 ```
 
@@ -576,6 +602,7 @@ class SearchRequest:
 | `highlight` | `Index.search` の `highlight` パラメータと同じリストまたは辞書の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
 | `rescore` | このリクエストの上位の結果に適用する [`LateInteractionRescore`](#lateinteractionrescore)（Issue #1351）。どのクエリの形を指定した場合でも適用されます。`SearchRequest` を渡すと `Index.search` の `rescore` キーワードは無視され、こちらが使われます。 |
 | `group_by` | このリクエストの結果をグループ化する [`GroupBy`](#groupby)（Issue #1297）。`SearchRequest` を渡すと `Index.search` と `Index.search_batch` の `group_by` キーワードは無視され、こちらが使われます。 |
+| `track_total_hits` | レスポンスの `total_hits` のために数える一致の数（Issue #1472）。`Index.search` と同じように読みます（[総ヒット数](#総ヒット数)を参照）。`SearchRequest` を渡すと `Index.search` と `Index.search_batch` の `track_total_hits` キーワードは無視され、こちらが使われます。ほかの型の値は、リクエストを作るときに `TypeError` か `ValueError` になります。 |
 
 ---
 
@@ -625,11 +652,11 @@ index.put_document("b", {"title": "rust language", "tokens": [[0.9, 0.2]]})
 index.commit()
 
 rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size=50)
-results = index.search("title:rust", rescore=rescore)  # "b"（MaxSim 1.1）が "a"（0.1）より先
+results = index.search("title:rust", rescore=rescore).results  # "b"（MaxSim 1.1）が "a"（0.1）より先
 
 # 同じ再採点を SearchRequest で指定する（search_batch でも使える）
 request = laurus.SearchRequest(query="title:rust", rescore=rescore, limit=5)
-results = index.search(request)
+results = index.search(request).results
 ```
 
 フィールドに `"candle_colbert"` のエンベダーがあれば、文書はフィールドにテキストを与えられ、クエリもテキストで渡せます: `laurus.LateInteractionRescore("body_colbert", "how do lifetimes work")`。
@@ -674,7 +701,7 @@ index.add_document("manual", {"body": "Elided lifetimes follow three rules."})
 index.add_document("faq", {"body": "Why do lifetimes appear in signatures?"})
 index.commit()
 
-for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", group_size=2)):
+for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", group_size=2)).results:
     print(result.group_key, [hit.document["body"] for hit in result.inner_hits])
 # faq []
 # manual ['Elided lifetimes follow three rules.']
@@ -682,9 +709,33 @@ for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", grou
 
 ---
 
+## SearchResponse
+
+`Index.search()` が返すクラスです。`Index.search_batch()` は、クエリごとにこれを返します（Issue #1472）。
+
+```python
+class SearchResponse:
+    results: list[SearchResult]    # 結果のページ
+    total_hits: TotalHits | None   # track_total_hits を指定したときの総ヒット数
+```
+
+`repr` は `SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))` です。
+
+### TotalHits
+
+```python
+class TotalHits:
+    value: int     # 数えた一致する文書の数
+    relation: str  # value が正確な数なら "eq"、下限なら "gte"
+```
+
+relation は、HTTP gateway・MCP・CLI と同じ値です。[総ヒット数](#総ヒット数)を参照してください。
+
+---
+
 ## SearchResult
 
-`Index.search()` が返すクラスです。
+検索の 1 件の結果で、`SearchResponse.results` の要素です。
 
 ```python
 class SearchResult:

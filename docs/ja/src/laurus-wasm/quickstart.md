@@ -29,7 +29,7 @@ await index.putDocument("doc2", {
 await index.commit();
 
 // 検索
-const results = await index.search("rust");
+const { results } = await index.search("rust");
 for (const result of results) {
   console.log(`${result.id}: ${result.score}`);
   console.log(result.document);
@@ -121,7 +121,7 @@ await index.putDocument("doc1", {
 });
 await index.commit();
 
-const results = await index.search("形態素");
+const { results } = await index.search("形態素");
 console.log(results[0].document.title); // "形態素解析"
 ```
 
@@ -152,7 +152,7 @@ await index.putDocument("doc2", {
 await index.commit();
 
 // ベクトル類似度で検索
-const results = await index.searchVector("embedding", [0.9, 0.1, 0.0]);
+const { results } = await index.searchVector("embedding", [0.9, 0.1, 0.0]);
 console.log(results[0].document.title); // "Rust"
 ```
 
@@ -184,7 +184,7 @@ await index.putDocument("doc2", {
 await index.commit();
 
 // lexical 検索の上位を、クエリのトークンベクトルで再採点
-const results = await index.search("title:rust", 10, 0, undefined, {
+const { results } = await index.search("title:rust", 10, 0, undefined, {
   field: "tokens",
   vectors: [[1, 0], [0, 1]]
 });

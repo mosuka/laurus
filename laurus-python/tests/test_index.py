@@ -193,38 +193,38 @@ def test_stats_vector_fields(vector_index):
 
 
 def test_search_dsl(index):
-    results = index.search("title:rust", limit=5)
+    results = index.search("title:rust", limit=5).results
     assert len(results) >= 1
     assert results[0].id == "doc1"
 
 
 def test_search_term_query(index):
-    results = index.search(laurus.TermQuery("body", "python"), limit=5)
+    results = index.search(laurus.TermQuery("body", "python"), limit=5).results
     assert len(results) >= 1
     assert results[0].id == "doc2"
 
 
 def test_search_result_has_id_and_score(index):
-    results = index.search("title:rust", limit=1)
+    results = index.search("title:rust", limit=1).results
     r = results[0]
     assert r.id == "doc1"
     assert r.score > 0
 
 
 def test_search_limit(index):
-    results = index.search("body:programming OR body:python", limit=1)
+    results = index.search("body:programming OR body:python", limit=1).results
     assert len(results) <= 1
 
 
 def test_search_offset(index):
-    all_results = index.search("body:programming OR body:data", limit=10)
-    offset_results = index.search("body:programming OR body:data", limit=10, offset=1)
+    all_results = index.search("body:programming OR body:data", limit=10).results
+    offset_results = index.search("body:programming OR body:data", limit=10, offset=1).results
     if len(all_results) > 1:
         assert offset_results[0].id == all_results[1].id
 
 
 def test_search_no_results(index):
-    results = index.search("title:nonexistent_xyz", limit=5)
+    results = index.search("title:nonexistent_xyz", limit=5).results
     assert results == []
 
 
@@ -240,7 +240,9 @@ def test_search_unknown_field_raises_value_error(index):
 
 
 def test_vector_query(vector_index):
-    results = vector_index.search(laurus.VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), limit=2)
+    results = vector_index.search(
+        laurus.VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]), limit=2
+    ).results
     assert len(results) >= 1
     assert results[0].id == "doc1"
 
@@ -257,7 +259,7 @@ def test_vector_query_repr():
 
 def test_search_request_lexical_only(index):
     req = laurus.SearchRequest(lexical_query=laurus.TermQuery("title", "rust"), limit=5)
-    results = index.search(req)
+    results = index.search(req).results
     assert len(results) >= 1
 
 
@@ -268,7 +270,7 @@ def test_search_request_hybrid(vector_index):
         fusion=laurus.RRF(k=60.0),
         limit=5,
     )
-    results = vector_index.search(req)
+    results = vector_index.search(req).results
     assert len(results) >= 1
 
 
@@ -288,7 +290,7 @@ def test_search_request_dsl_with_vector_query():
         vector_query=laurus.VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]),
         limit=5,
     )
-    assert sorted(r.id for r in idx.search(req)) == ["lexical", "vector"]
+    assert sorted(r.id for r in idx.search(req).results) == ["lexical", "vector"]
 
 
 def test_search_request_rejects_query_that_would_be_dropped(vector_index):
@@ -324,12 +326,12 @@ def test_search_request_rejects_empty_dsl_with_vector_query(vector_index):
 
 
 def test_phrase_query(index):
-    results = index.search(laurus.PhraseQuery("title", ["introduction", "rust"]), limit=5)
+    results = index.search(laurus.PhraseQuery("title", ["introduction", "rust"]), limit=5).results
     assert any(r.id == "doc1" for r in results)
 
 
 def test_fuzzy_query(index):
-    results = index.search(laurus.FuzzyQuery("title", "pythn", max_edits=1), limit=5)
+    results = index.search(laurus.FuzzyQuery("title", "pythn", max_edits=1), limit=5).results
     assert any(r.id == "doc2" for r in results)
 
 
@@ -340,7 +342,7 @@ def test_numeric_range_query():
     idx.put_document("doc1", {"year": 2020})
     idx.put_document("doc2", {"year": 2023})
     idx.commit()
-    results = idx.search(laurus.NumericRangeQuery("year", min=2022, max=2024), limit=5)
+    results = idx.search(laurus.NumericRangeQuery("year", min=2022, max=2024), limit=5).results
     assert len(results) == 1
     assert results[0].id == "doc2"
 
@@ -367,7 +369,9 @@ def test_numeric_range_query_rejects_a_nan_bound(kwargs):
 def test_numeric_range_query_infinite_bound_is_an_open_side():
     """Issue #1601: an infinite bound compares as a number."""
     idx = _price_index()
-    unbounded = idx.search(laurus.NumericRangeQuery("price", min=0.0, max=float("inf")), limit=5)
+    unbounded = idx.search(
+        laurus.NumericRangeQuery("price", min=0.0, max=float("inf")), limit=5
+    ).results
     assert _ids(unbounded) == ["big", "small"]
 
 
@@ -393,9 +397,11 @@ def test_numeric_range_query_still_reads_numbers():
     """Issue #1605: valid bounds search as before, an int in a float range
     included, and the largest and smallest 64-bit integers are bounds."""
     idx = _price_index()
-    found = idx.search(laurus.NumericRangeQuery("price", min=0, max=5.0), limit=5)
+    found = idx.search(laurus.NumericRangeQuery("price", min=0, max=5.0), limit=5).results
     assert _ids(found) == ["small"]
-    widest = idx.search(laurus.NumericRangeQuery("price", min=-(2**63), max=2**63 - 1), limit=5)
+    widest = idx.search(
+        laurus.NumericRangeQuery("price", min=-(2**63), max=2**63 - 1), limit=5
+    ).results
     assert _ids(widest) == ["big", "neg", "small"]
 
 
@@ -418,7 +424,7 @@ def test_datetime_range_query_with_date_only_bounds():
     """Issue #1179: date-only bounds are midnight UTC, inclusive on both ends."""
     idx = _datetime_index()
     q = laurus.DateTimeRangeQuery("created_at", min="2024-01-01", max="2024-12-31")
-    assert _ids(idx.search(q, limit=5)) == ["jan", "jun"]
+    assert _ids(idx.search(q, limit=5).results) == ["jan", "jun"]
     assert "DateTimeRangeQuery" in repr(q)
 
 
@@ -430,16 +436,16 @@ def test_datetime_range_query_accepts_datetime_objects_and_open_bounds():
     tokyo = timezone(timedelta(hours=9))
     lower = datetime(2024, 6, 15, 21, 0, 0, tzinfo=tokyo)
     q = laurus.DateTimeRangeQuery("created_at", min=lower)
-    assert _ids(idx.search(q, limit=5)) == ["jun", "next"]
+    assert _ids(idx.search(q, limit=5).results) == ["jun", "next"]
     # A naive datetime is interpreted as UTC.
     q = laurus.DateTimeRangeQuery("created_at", max=datetime(2024, 6, 15, 12, 0, 0))
-    assert _ids(idx.search(q, limit=5)) == ["jan", "jun"]
+    assert _ids(idx.search(q, limit=5).results) == ["jan", "jun"]
 
 
 def test_datetime_range_query_dsl_form_reaches_the_index():
     idx = _datetime_index()
     # The documented DSL form (exclusive braces).
-    assert _ids(idx.search("created_at:{2024-01-01 TO 2024-12-31}", limit=5)) == ["jun"]
+    assert _ids(idx.search("created_at:{2024-01-01 TO 2024-12-31}", limit=5).results) == ["jun"]
 
 
 def test_datetime_range_query_rejects_malformed_bound():
@@ -455,12 +461,12 @@ def test_boolean_query(index):
     q = laurus.BooleanQuery()
     q.must(laurus.TermQuery("body", "programming"))
     q.must_not(laurus.TermQuery("title", "python"))
-    results = index.search(q, limit=5)
+    results = index.search(q, limit=5).results
     assert all(r.id != "doc2" for r in results)
 
 
 def test_wildcard_query(index):
-    results = index.search(laurus.WildcardQuery("title", "py*"), limit=5)
+    results = index.search(laurus.WildcardQuery("title", "py*"), limit=5).results
     assert any(r.id == "doc2" for r in results)
 
 

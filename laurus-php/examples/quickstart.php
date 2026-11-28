@@ -27,7 +27,7 @@ $index->commit();
 
 // Search with a DSL string.
 echo "=== DSL search ===" . PHP_EOL;
-$results = $index->search("php", 5);
+$results = $index->search("php", 5)->getResults();
 foreach ($results as $r) {
     $doc = $r->getDocument();
     printf("  %s (score: %.4f): %s\n", $r->getId(), $r->getScore(), $doc["title"] ?? "");
@@ -35,7 +35,7 @@ foreach ($results as $r) {
 
 // Search with a TermQuery object.
 echo PHP_EOL . "=== TermQuery search ===" . PHP_EOL;
-$results = $index->search(new TermQuery("body", "framework"), 5);
+$results = $index->search(new TermQuery("body", "framework"), 5)->getResults();
 foreach ($results as $r) {
     $doc = $r->getDocument();
     printf("  %s (score: %.4f): %s\n", $r->getId(), $r->getScore(), $doc["title"] ?? "");

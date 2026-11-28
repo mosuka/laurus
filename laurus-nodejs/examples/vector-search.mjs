@@ -31,7 +31,7 @@ await index.commit();
 
 // Search with a query vector close to "express"
 console.log("=== Vector search (close to express) ===");
-const results = await index.searchVector(
+const { results } = await index.searchVector(
   "embedding", [0.85, 0.15, 0.2, 0.3], 3,
 );
 for (const r of results) {
@@ -40,7 +40,7 @@ for (const r of results) {
 
 // Search with a query vector close to "pg"
 console.log("\n=== Vector search (close to pg) ===");
-const results2 = await index.searchVector(
+const { results: results2 } = await index.searchVector(
   "embedding", [0.15, 0.85, 0.2, 0.3], 3,
 );
 for (const r of results2) {

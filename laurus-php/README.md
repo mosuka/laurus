@@ -63,14 +63,14 @@ $index->putDocument("doc2", ["title" => "PHP for Web Development", "body" => "We
 $index->commit();
 
 // Search with a DSL string
-$results = $index->search("title:rust", 5);
+$results = $index->search("title:rust", 5)->getResults();
 foreach ($results as $r) {
     $doc = $r->getDocument();
     printf("[%s] score=%.4f  %s\n", $r->getId(), $r->getScore(), $doc["title"]);
 }
 
 // Search with a query object
-$results = $index->search(new TermQuery("body", "php"), 5);
+$results = $index->search(new TermQuery("body", "php"), 5)->getResults();
 ```
 
 ## Index Types
@@ -190,7 +190,7 @@ $bq->must(new TermQuery("body", "rust"));
 $bq->should(new TermQuery("title", "introduction"));
 $bq->mustNot(new TermQuery("body", "deprecated"));
 
-$results = $index->search($bq, 10);
+$results = $index->search($bq, 10)->getResults();
 ```
 
 ### Geo Query
@@ -200,10 +200,10 @@ use Laurus\GeoBoundingBoxQuery;
 use Laurus\GeoDistanceQuery;
 
 // Radius search
-$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10.0), 10);
+$results = $index->search(GeoDistanceQuery::withinRadius("location", 35.6895, 139.6917, 10.0), 10)->getResults();
 
 // Bounding box search
-$results = $index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 35.0, 139.0, 36.0, 140.0), 10);
+$results = $index->search(GeoBoundingBoxQuery::withinBoundingBox("location", 35.0, 139.0, 36.0, 140.0), 10)->getResults();
 ```
 
 ## Hybrid Search
@@ -223,7 +223,7 @@ $request = new SearchRequest(
     limit: 10,
     offset: 0,
 );
-$results = $index->search($request);
+$results = $index->search($request)->getResults();
 ```
 
 ### Fusion Algorithms
@@ -240,7 +240,7 @@ $results = $index->search($request);
 ```php
 use Laurus\LateInteractionRescore;
 
-$results = $index->search("title:rust", 10, 0, null, new LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+$results = $index->search("title:rust", 10, 0, null, new LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]))->getResults();
 ```
 
 ## Text Analysis

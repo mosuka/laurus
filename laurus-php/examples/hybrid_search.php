@@ -89,7 +89,7 @@ echo "Indexed " . count($chunks) . " chunks." . PHP_EOL . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 echo "[A] Lexical-only: term 'eloquent' in text" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
-print_results($index->search(new TermQuery("text", "eloquent"), 3));
+print_results($index->search(new TermQuery("text", "eloquent"), 3)->getResults());
 
 // =====================================================================
 // [B] Vector-only search (baseline)
@@ -97,7 +97,7 @@ print_results($index->search(new TermQuery("text", "eloquent"), 3));
 echo PHP_EOL . str_repeat("=", 60) . PHP_EOL;
 echo "[B] Vector-only: 'database query builder'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
-print_results($index->search(new VectorTextQuery("text_vec", "database query builder"), 3));
+print_results($index->search(new VectorTextQuery("text_vec", "database query builder"), 3)->getResults());
 
 // =====================================================================
 // [C] Hybrid search — RRF Fusion
@@ -113,7 +113,7 @@ $request = new SearchRequest(
     new RRF(60.0),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [D] Hybrid search — WeightedSum Fusion
@@ -129,7 +129,7 @@ $request = new SearchRequest(
     new WeightedSum(0.3, 0.7),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [E] Hybrid search with filter query
@@ -145,7 +145,7 @@ $request = new SearchRequest(
     new RRF(60.0),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [F] DSL string query
@@ -153,6 +153,6 @@ print_results($index->search($request));
 echo PHP_EOL . str_repeat("=", 60) . PHP_EOL;
 echo "[F] DSL query string: 'text:hooks'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
-print_results($index->search("text:hooks", 3));
+print_results($index->search("text:hooks", 3)->getResults());
 
 echo PHP_EOL . "Hybrid search example completed!" . PHP_EOL;

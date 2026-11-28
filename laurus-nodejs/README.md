@@ -49,7 +49,7 @@ await index.putDocument("doc2", {
 await index.commit();
 
 // Search with DSL string
-const results = await index.search("programming", 5);
+const { results } = await index.search("programming", 5);
 for (const r of results) {
   console.log(r.id, r.score, r.document.title);
 }
@@ -73,11 +73,11 @@ await index.deleteDocuments("id");
 await index.commit();
 
 // Search
-const results = await index.search("query DSL", limit, offset);
-const results = await index.searchTerm("field", "term", limit);
-const results = await index.searchVector("field", [0.1, ...], limit);
-const results = await index.searchVectorText("field", "text", limit);
-const results = await index.searchWithRequest(searchRequest);
+const { results } = await index.search("query DSL", limit, offset);
+const { results } = await index.searchTerm("field", "term", limit);
+const { results } = await index.searchVector("field", [0.1, ...], limit);
+const { results } = await index.searchVectorText("field", "text", limit);
+const { results } = await index.searchWithRequest(searchRequest);
 
 // Stats
 const stats = index.stats();
@@ -180,13 +180,13 @@ req.setLexicalTerm(new TermQuery("body", "programming"));
 req.setVectorQuery(new VectorQuery("embedding", [0.1, 0.2, ...]));
 req.setFilterTerm(new TermQuery("category", "tech"));
 req.setRrfFusion(new RRF(60.0));
-const results = await index.searchWithRequest(req);
+const { results } = await index.searchWithRequest(req);
 
 // A DSL can be combined with a vector query, and both are searched.
 // A DSL with a `setLexicalX` setter throws: write the lexical clauses in the DSL.
 const req2 = new SearchRequest({ queryDsl: "title:hello", limit: 10 });
 req2.setVectorTextQuery(new VectorTextQuery("embedding", "query text"));
-const results2 = await index.searchWithRequest(req2);
+const results2 = (await index.searchWithRequest(req2)).results;
 ```
 
 ### Late-Interaction Rescore
@@ -204,8 +204,8 @@ await index.putDocument("doc1", { title: "rust", tokens: [[0.9, 0.2], [0.0, 0.5]
 await index.commit();
 
 const rescore = { field: "tokens", vectors: [[1, 0], [0, 1]], windowSize: 100 };
-const results = await index.search("title:rust", 10, 0, undefined, rescore);
-const results2 = await index.searchWithRequest(new SearchRequest({ queryDsl: "title:rust", rescore }));
+const { results } = await index.search("title:rust", 10, 0, undefined, rescore);
+const results2 = (await index.searchWithRequest(new SearchRequest({ queryDsl: "title:rust", rescore }))).results;
 ```
 
 Set exactly one of `vectors` and `text`; a `text` query needs a

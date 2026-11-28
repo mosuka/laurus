@@ -83,7 +83,7 @@ def main() -> None:
     print("=" * 60)
     print("[A] Lexical-only: term 'fixtures' in text")
     print("=" * 60)
-    _print_results(index.search(laurus.TermQuery("text", "fixtures"), limit=3))
+    _print_results(index.search(laurus.TermQuery("text", "fixtures"), limit=3).results)
 
     # =====================================================================
     # [B] Vector-only search (baseline)
@@ -92,7 +92,7 @@ def main() -> None:
     print("[B] Vector-only: 'database query builder'")
     print("=" * 60)
     _print_results(
-        index.search(laurus.VectorTextQuery("text_vec", "database query builder"), limit=3)
+        index.search(laurus.VectorTextQuery("text_vec", "database query builder"), limit=3).results
     )
 
     # =====================================================================
@@ -107,7 +107,7 @@ def main() -> None:
         fusion=laurus.RRF(k=60.0),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [D] Hybrid search — WeightedSum Fusion
@@ -121,7 +121,7 @@ def main() -> None:
         fusion=laurus.WeightedSum(lexical_weight=0.3, vector_weight=0.7),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [E] Hybrid search with filter query
@@ -136,7 +136,7 @@ def main() -> None:
         fusion=laurus.RRF(k=60.0),
         limit=3,
     )
-    _print_results(index.search(request))
+    _print_results(index.search(request).results)
 
     # =====================================================================
     # [F] Hybrid search via SearchRequest with DSL string query
@@ -144,7 +144,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("[F] DSL query string: 'text:middleware'")
     print("=" * 60)
-    _print_results(index.search("text:middleware", limit=3))
+    _print_results(index.search("text:middleware", limit=3).results)
 
     print("\nHybrid search example completed!")
 

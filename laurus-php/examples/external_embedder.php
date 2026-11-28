@@ -128,7 +128,7 @@ echo "Indexed " . count($chunks) . " chunks." . PHP_EOL . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
 echo "[A] Vector-only: 'database ORM queries'" . PHP_EOL;
 echo str_repeat("=", 60) . PHP_EOL;
-print_results($index->search(new VectorQuery("text_vec", embed("database ORM queries")), 3));
+print_results($index->search(new VectorQuery("text_vec", embed("database ORM queries")), 3)->getResults());
 
 // =====================================================================
 // [B] Filtered Vector Search -- category filter
@@ -144,7 +144,7 @@ $request = new SearchRequest(
     null,
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [C] Hybrid search -- RRF Fusion
@@ -160,7 +160,7 @@ $request = new SearchRequest(
     new RRF(60.0),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [D] Hybrid search -- WeightedSum Fusion
@@ -176,7 +176,7 @@ $request = new SearchRequest(
     new WeightedSum(0.3, 0.7),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 // =====================================================================
 // [E] Hybrid search with filter
@@ -192,6 +192,6 @@ $request = new SearchRequest(
     new RRF(60.0),
     3,
 );
-print_results($index->search($request));
+print_results($index->search($request)->getResults());
 
 echo PHP_EOL . "External embedder example completed!" . PHP_EOL;

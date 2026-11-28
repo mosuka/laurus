@@ -30,7 +30,7 @@ def index():
 
 
 def test_highlight_list_shorthand_returns_fragments(index):
-    results = index.search("body:rust", highlight=["body"])
+    results = index.search("body:rust", highlight=["body"]).results
     assert len(results) == 1
     fragments = results[0].highlights["body"]
     assert len(fragments) == 1
@@ -38,13 +38,13 @@ def test_highlight_list_shorthand_returns_fragments(index):
 
 
 def test_highlight_omitted_leaves_highlights_empty(index):
-    results = index.search("body:rust")
+    results = index.search("body:rust").results
     assert len(results) == 1
     assert results[0].highlights == {}
 
 
 def test_highlight_unrequested_field_is_absent(index):
-    results = index.search("body:rust", highlight=["body"])
+    results = index.search("body:rust", highlight=["body"]).results
     assert "title" not in results[0].highlights
 
 
@@ -52,7 +52,7 @@ def test_highlight_dict_form_applies_config(index):
     results = index.search(
         "body:rust",
         highlight={"fields": ["body"], "tag": "em", "max_fragments": 2},
-    )
+    ).results
     fragment = results[0].highlights["body"][0]
     assert "<em>Rust</em>" in fragment
     assert "<mark>" not in fragment
@@ -73,14 +73,14 @@ def test_search_batch_applies_highlight_to_every_query(index):
     # to both under the default require_field_match=True.
     batch = index.search_batch(["body:rust", "body:programming"], highlight=["body"])
     assert len(batch) == 2
-    for results in batch:
-        assert len(results) == 1
-        assert "<mark>" in results[0].highlights["body"][0]
+    for response in batch:
+        assert len(response.results) == 1
+        assert "<mark>" in response.results[0].highlights["body"][0]
 
 
 def test_search_request_highlight_matches_search_kwarg(index):
-    via_kwarg = index.search("body:rust", highlight=["body"])
+    via_kwarg = index.search("body:rust", highlight=["body"]).results
     request = laurus.SearchRequest(query="body:rust", highlight=["body"])
-    via_request = index.search(request)
+    via_request = index.search(request).results
 
     assert via_kwarg[0].highlights == via_request[0].highlights

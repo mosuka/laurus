@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::commit::WasmCommitPolicy;
 use crate::convert::unsigned_param;
-use crate::convert::{data_value_to_json, json_to_document};
+use crate::convert::{data_value_to_json, json_to_document, track_total_hits_param};
 use crate::errors::laurus_err;
 use crate::query::{
     JsDateTimeRangeQuery, JsGeo3dBoundingBoxQuery, JsGeo3dDistanceQuery, JsGeo3dNearestQuery,
@@ -30,7 +30,7 @@ use wasm_bindgen::prelude::*;
 // ---------------------------------------------------------------------------
 
 /// Convert one search result, and its group's inner hits (Issue #1297),
-/// into the JSON shape `search_results_to_js` returns.
+/// into the JSON shape of a result in `search_response_to_js`.
 fn search_result_to_json(r: laurus::SearchResult) -> serde_json::Value {
     let document = r.document.map(|doc| {
         let mut map = serde_json::Map::new();
@@ -54,16 +54,32 @@ fn search_result_to_json(r: laurus::SearchResult) -> serde_json::Value {
     })
 }
 
-/// Serialize search results to JS via JSON.parse(JSON string).
+/// Serialize a search response to JS via JSON.parse(JSON string): an
+/// object `{ results, totalHits }` (Issue #1472), where `totalHits` is
+/// `{ value, relation }` and is left out unless the request asked for a
+/// total, as the HTTP gateway leaves out `"total_hits"`. The relation is
+/// written as the HTTP gateway, MCP and the CLI write it: `"eq"` for an
+/// exact total, `"gte"` for a lower bound.
 ///
 /// This avoids issues with `serde_wasm_bindgen` not correctly handling
 /// nested `serde_json::Value` types. Instead, we serialize the entire
-/// result to a JSON string and then parse it in JS.
-fn search_results_to_js(results: Vec<laurus::SearchResult>) -> Result<JsValue, JsValue> {
-    let json_results: Vec<serde_json::Value> =
-        results.into_iter().map(search_result_to_json).collect();
+/// response to a JSON string and then parse it in JS.
+fn search_response_to_js(response: laurus::SearchResponse) -> Result<JsValue, JsValue> {
+    let results: Vec<serde_json::Value> = response
+        .results
+        .into_iter()
+        .map(search_result_to_json)
+        .collect();
+    let mut json = serde_json::json!({ "results": results });
+    if let Some(total) = response.total_hits {
+        let relation = match total.relation {
+            laurus::TotalHitsRelation::Exact => "eq",
+            laurus::TotalHitsRelation::AtLeast => "gte",
+        };
+        json["totalHits"] = serde_json::json!({ "value": total.value, "relation": relation });
+    }
 
-    let json_str = serde_json::to_string(&json_results)
+    let json_str = serde_json::to_string(&json)
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {e}")))?;
     js_sys::JSON::parse(&json_str)
 }
@@ -211,7 +227,7 @@ fn build_per_field_embedder(
 /// await index.putDocument("doc1", { title: "Hello", body: "World" });
 /// await index.commit(); // also persists to OPFS if opened with open()
 ///
-/// const results = await index.search("title:hello");
+/// const { results } = await index.search("title:hello");
 /// ```
 #[wasm_bindgen(js_name = "Index")]
 pub struct WasmIndex {
@@ -548,15 +564,24 @@ impl WasmIndex {
     ///   `{ weightedSum: { lexicalWeight?, vectorWeight? } }` (each weight
     ///   default 0.5, between 0 and 1, at least one greater than 0). Without
     ///   it, a hybrid query fuses with RRF and `k` 60.
+    /// * `track_total_hits` - How many matches to count for the response's
+    ///   `totalHits` (Issue #1472): an integer from 0 to 4294967295 counts
+    ///   exactly up to it, `true` counts every match, and `false`, `null` or
+    ///   `undefined` (the default) counts nothing. Counting has a cost, and
+    ///   what a total means for vector, hybrid and grouped searches is the
+    ///   engine's (`laurus/engine.md`, "Total hits").
     ///
     /// # Returns
     ///
-    /// A JS array of SearchResult objects
+    /// A response `{ results, totalHits }`. `results` is an array of
+    /// SearchResult objects
     /// `{ id, score, document, highlights, groupKey, innerHits }`. With
     /// `group_by`, `groupKey` is the value the result's group shares (`null`
     /// for a hit without a value) and `innerHits` holds the group's next
     /// best hits in ranking order; otherwise `groupKey` is `null` and
-    /// `innerHits` is empty.
+    /// `innerHits` is empty. `totalHits` is `{ value, relation }`, with
+    /// `relation` `"eq"` or `"gte"`, when `trackTotalHits` asked for a
+    /// total, and absent otherwise.
     ///
     /// # Errors
     ///
@@ -564,7 +589,9 @@ impl WasmIndex {
     /// or `groupBy` is not an integer from 0 to 4294967295 (Issue #1612),
     /// if `fusion` does not set exactly one of `rrf` and `weightedSum`, or
     /// if its values are out of range, whether or not the query is hybrid
-    /// (Issue #1540).
+    /// (Issue #1540), and if `trackTotalHits` is not `true`, `false`, `null`
+    /// or an integer from 0 to 4294967295, or, from the engine, is 0 (Issue
+    /// #1472).
     #[wasm_bindgen]
     #[allow(clippy::too_many_arguments)]
     pub async fn search(
@@ -576,21 +603,20 @@ impl WasmIndex {
         rescore: Option<js_sys::Object>,
         group_by: Option<js_sys::Object>,
         fusion: Option<js_sys::Object>,
+        #[wasm_bindgen(unchecked_optional_param_type = "number | boolean | null")]
+        track_total_hits: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
         const CONTEXT: &str = "Index.search";
         let (limit, offset) = limit_and_offset(CONTEXT, limit, offset)?;
+        let track_total_hits = track_total_hits_param(CONTEXT, track_total_hits.as_ref())?;
         let mut request = build_dsl_request(query, limit, offset);
+        request.track_total_hits = track_total_hits;
         request.lexical_options.highlight = parse_highlight_options(highlight, CONTEXT)?;
         request.rescore = parse_rescore_options(rescore, CONTEXT)?;
         request.group_by = parse_group_by_options(group_by, CONTEXT)?;
         request.fusion_algorithm = parse_fusion_options(fusion)?;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search using a term query.
@@ -603,6 +629,11 @@ impl WasmIndex {
     /// * `offset` - Pagination offset (default 0).
     /// * `highlight` - Optional highlight request; same shape as `search`'s
     ///   `highlight` argument (Issue #1134).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     ///
     /// # Errors
     ///
@@ -623,13 +654,8 @@ impl WasmIndex {
         let query = JsQuery::TermQuery(JsTermQuery { field, term });
         let mut request = build_lexical_request(&query, limit, offset)?;
         request.lexical_options.highlight = highlight;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search a DateTime field for values within an inclusive range
@@ -652,6 +678,11 @@ impl WasmIndex {
     /// Rejects with an error when a bound is not a recognized literal, or
     /// when `limit`, `offset` or an integer of `highlight` is not an
     /// integer from 0 to 4294967295 (Issue #1612).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     #[wasm_bindgen(js_name = "searchDateTimeRange")]
     pub async fn search_date_time_range(
         &self,
@@ -668,13 +699,8 @@ impl WasmIndex {
         let query = JsQuery::DateTimeRangeQuery(JsDateTimeRangeQuery { field, min, max });
         let mut request = build_lexical_request(&query, limit, offset)?;
         request.lexical_options.highlight = highlight;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search using a 3D ECEF distance (sphere) query.
@@ -687,6 +713,11 @@ impl WasmIndex {
     ///   (i.e. the search sphere's radius).
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     ///
     /// # Errors
     ///
@@ -713,13 +744,8 @@ impl WasmIndex {
             distance_m,
         });
         let request = build_lexical_request(&query, limit, offset)?;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search using a 3D ECEF axis-aligned bounding-box query.
@@ -731,6 +757,11 @@ impl WasmIndex {
     /// * `max_x`, `max_y`, `max_z` - Upper corner of the box.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     ///
     /// # Errors
     ///
@@ -761,13 +792,8 @@ impl WasmIndex {
             max_z,
         });
         let request = build_lexical_request(&query, limit, offset)?;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search using a 3D ECEF k-nearest-neighbours query.
@@ -779,6 +805,11 @@ impl WasmIndex {
     /// * `k` - Number of nearest neighbours to return.
     /// * `limit` - Maximum number of results (default 10).
     /// * `offset` - Pagination offset (default 0).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     ///
     /// # Errors
     ///
@@ -811,13 +842,8 @@ impl WasmIndex {
             max_radius_m,
         });
         let request = build_lexical_request(&query, limit, offset)?;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search using a pre-computed embedding vector.
@@ -832,6 +858,11 @@ impl WasmIndex {
     ///   `search`'s `rescore` argument (Issue #1351).
     /// * `group_by` - Optional grouping of the results; same shape as
     ///   `search`'s `group_by` argument (Issue #1297).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     ///
     /// # Errors
     ///
@@ -858,13 +889,8 @@ impl WasmIndex {
         let mut request = build_vector_request(&query, limit, offset);
         request.rescore = rescore;
         request.group_by = group_by;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     /// Search using a text-based vector query (embedded by the registered embedder).
@@ -879,6 +905,11 @@ impl WasmIndex {
     ///   `search`'s `rescore` argument (Issue #1351).
     /// * `group_by` - Optional grouping of the results; same shape as
     ///   `search`'s `group_by` argument (Issue #1297).
+    ///
+    /// # Returns
+    ///
+    /// A response `{ results }` as `search` returns, without `totalHits`:
+    /// only `search` can ask for a total (Issue #1472).
     ///
     /// # Errors
     ///
@@ -902,13 +933,8 @@ impl WasmIndex {
         let mut request = build_vector_request(&query, limit, offset);
         request.rescore = rescore;
         request.group_by = group_by;
-        let results = self
-            .engine
-            .search(request)
-            .await
-            .map_err(laurus_err)?
-            .results;
-        search_results_to_js(results)
+        let response = self.engine.search(request).await.map_err(laurus_err)?;
+        search_response_to_js(response)
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────
@@ -1008,6 +1034,13 @@ mod tests {
     use super::WasmIndex;
     use crate::schema::WasmSchema;
 
+    /// The `results` of a search response `{ results, totalHits }` (Issue
+    /// #1472), as JSON.
+    fn results_json(js_response: JsValue) -> serde_json::Value {
+        let response: serde_json::Value = serde_wasm_bindgen::from_value(js_response).unwrap();
+        response["results"].clone()
+    }
+
     /// Build an in-memory index with one stored `body` text field and one
     /// document, ready to commit and search.
     async fn text_index() -> WasmIndex {
@@ -1035,7 +1068,7 @@ mod tests {
     /// `serde_wasm_bindgen::to_value` on a JSON object serializes to a JS
     /// `Map` by default, which `serde_wasm_bindgen::from_value` cannot
     /// deserialize into a plain struct the way `parse_highlight_options`
-    /// expects; going through `JSON.parse` (as `search_results_to_js` does
+    /// expects; going through `JSON.parse` (as `search_response_to_js` does
     /// for its own output) sidesteps that entirely.
     fn highlight_object(value: serde_json::Value) -> js_sys::Object {
         let json = serde_json::to_string(&value).unwrap();
@@ -1059,10 +1092,11 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("search must succeed");
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        let results: serde_json::Value = results_json(js_results);
 
         let fragments = results[0]["highlights"]["body"]
             .as_array()
@@ -1078,10 +1112,19 @@ mod tests {
         let index = text_index().await;
 
         let js_results = index
-            .search("body:rust".to_string(), None, None, None, None, None, None)
+            .search(
+                "body:rust".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("search must succeed");
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        let results: serde_json::Value = results_json(js_results);
 
         assert_eq!(results[0]["highlights"], serde_json::json!({}));
     }
@@ -1104,7 +1147,7 @@ mod tests {
             )
             .await
             .expect("searchTerm must succeed");
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        let results: serde_json::Value = results_json(js_results);
 
         let fragment = results[0]["highlights"]["body"][0].as_str().unwrap();
         assert!(fragment.contains("<em>Rust</em>"), "{fragment}");
@@ -1163,17 +1206,35 @@ mod tests {
 
         // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
         let title_hits = index
-            .search("title:ell".to_string(), None, None, None, None, None, None)
+            .search(
+                "title:ell".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("search must succeed");
-        let title_hits: serde_json::Value = serde_wasm_bindgen::from_value(title_hits).unwrap();
+        let title_hits: serde_json::Value = results_json(title_hits);
         assert_eq!(title_hits.as_array().unwrap().len(), 1);
 
         let plain_hits = index
-            .search("plain:ell".to_string(), None, None, None, None, None, None)
+            .search(
+                "plain:ell".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("search must succeed");
-        let plain_hits: serde_json::Value = serde_wasm_bindgen::from_value(plain_hits).unwrap();
+        let plain_hits: serde_json::Value = results_json(plain_hits);
         assert_eq!(plain_hits.as_array().unwrap().len(), 0);
     }
 
@@ -1220,10 +1281,19 @@ mod tests {
         index.commit().await.expect("commit must succeed");
 
         let hits = index
-            .search("title:ell".to_string(), None, None, None, None, None, None)
+            .search(
+                "title:ell".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("search must succeed");
-        let hits: serde_json::Value = serde_wasm_bindgen::from_value(hits).unwrap();
+        let hits: serde_json::Value = results_json(hits);
         assert_eq!(hits.as_array().unwrap().len(), 1);
     }
 
@@ -1510,7 +1580,7 @@ mod tests {
     }
 
     fn ids(js_results: JsValue) -> Vec<String> {
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        let results: serde_json::Value = results_json(js_results);
         results
             .as_array()
             .unwrap()
@@ -1530,7 +1600,16 @@ mod tests {
     async fn search_is_reordered_by_late_interaction() {
         let index = rescore_index(None).await;
         let baseline = index
-            .search("title:rust".to_string(), None, None, None, None, None, None)
+            .search(
+                "title:rust".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_ne!(ids(baseline), EXPECTED);
@@ -1544,10 +1623,11 @@ mod tests {
                 Some(vectors_rescore()),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(results).unwrap();
+        let results: serde_json::Value = results_json(results);
         let scores: Vec<(String, f64)> = results
             .as_array()
             .unwrap()
@@ -1599,6 +1679,7 @@ mod tests {
                     None,
                     None,
                     Some(rescore),
+                    None,
                     None,
                     None,
                 )
@@ -1705,6 +1786,7 @@ mod tests {
                     None,
                     None,
                     Some(highlight_object(rescore)),
+                    None,
                     None,
                     None,
                 )
@@ -1853,7 +1935,7 @@ mod tests {
     /// The groups as `(id, titles of its hits)`, after checking that every
     /// hit carries its group's key and only the leader has inner hits.
     fn groups(js_results: JsValue) -> Vec<(String, Vec<String>)> {
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        let results: serde_json::Value = results_json(js_results);
         results
             .as_array()
             .unwrap()
@@ -1923,6 +2005,7 @@ mod tests {
                     serde_json::json!({ "field": "_id", "groupSize": 2 }),
                 )),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1945,8 +2028,7 @@ mod tests {
     #[wasm_bindgen_test]
     async fn ungrouped_results_have_no_group() {
         let index = group_index().await;
-        let results: serde_json::Value =
-            serde_wasm_bindgen::from_value(search_vector_grouped(&index, None).await).unwrap();
+        let results: serde_json::Value = results_json(search_vector_grouped(&index, None).await);
         let results = results.as_array().unwrap();
         assert_eq!(results.len(), GROUP_CHUNKS.len());
         for r in results {
@@ -2050,7 +2132,7 @@ mod tests {
 
     /// `(id, score)` of each result, in ranking order.
     fn id_scores(js_results: JsValue) -> Vec<(String, f64)> {
-        let results: serde_json::Value = serde_wasm_bindgen::from_value(js_results).unwrap();
+        let results: serde_json::Value = results_json(js_results);
         results
             .as_array()
             .unwrap()
@@ -2078,6 +2160,7 @@ mod tests {
                 None,
                 None,
                 fusion.map(highlight_object),
+                None,
             )
             .await
             .map(id_scores)
@@ -2119,7 +2202,16 @@ mod tests {
         let index = fusion_index().await;
         let lexical = id_scores(
             index
-                .search("title:rust".to_string(), None, None, None, None, None, None)
+                .search(
+                    "title:rust".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await
                 .unwrap(),
         );
@@ -2280,6 +2372,7 @@ mod tests {
                     None,
                     None,
                     Some(fusion),
+                    None,
                 )
                 .await
             {
@@ -2446,11 +2539,20 @@ mod tests {
         for case in BAD {
             let v = case.0;
             let result = index
-                .search(n("title:rust"), Some(v), None, None, None, None, None)
+                .search(n("title:rust"), Some(v), None, None, None, None, None, None)
                 .await;
             check(&mut m, "Index.search", "limit", case, result);
             let result = index
-                .search(n("title:rust"), Some(10.0), Some(v), None, None, None, None)
+                .search(
+                    n("title:rust"),
+                    Some(10.0),
+                    Some(v),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await;
             check(&mut m, "Index.search", "offset", case, result);
             let result = index
@@ -2551,7 +2653,16 @@ mod tests {
             let v = case.0;
             let options = object_with(highlight(), "fragmentSize", v);
             let result = index
-                .search(n("title:rust"), None, None, Some(options), None, None, None)
+                .search(
+                    n("title:rust"),
+                    None,
+                    None,
+                    Some(options),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await;
             check(
                 &mut m,
@@ -2562,7 +2673,16 @@ mod tests {
             );
             let options = object_with(highlight(), "maxFragments", v);
             let result = index
-                .search(n("title:rust"), None, None, Some(options), None, None, None)
+                .search(
+                    n("title:rust"),
+                    None,
+                    None,
+                    Some(options),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .await;
             check(
                 &mut m,
@@ -2573,12 +2693,30 @@ mod tests {
             );
             let options = object_with(rescore(), "windowSize", v);
             let result = index
-                .search(n("title:rust"), None, None, None, Some(options), None, None)
+                .search(
+                    n("title:rust"),
+                    None,
+                    None,
+                    None,
+                    Some(options),
+                    None,
+                    None,
+                    None,
+                )
                 .await;
             check(&mut m, "Index.search", "rescore.windowSize", case, result);
             let options = object_with(group_by(), "groupSize", v);
             let result = index
-                .search(n("title:rust"), None, None, None, None, Some(options), None)
+                .search(
+                    n("title:rust"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(options),
+                    None,
+                    None,
+                )
                 .await;
             check(&mut m, "Index.search", "groupBy.groupSize", case, result);
         }
@@ -2673,6 +2811,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
         };
         let default = ids(search(None).await.unwrap());
@@ -2681,5 +2820,150 @@ mod tests {
         assert!(ids(search(Some(0.0)).await.unwrap()).is_empty());
         assert!(WasmCommitPolicy::every_docs(0.0).is_ok());
         assert!(WasmWalSyncPolicy::group(Some(4_294_967_295.0), Some(0.0), None).is_ok());
+    }
+
+    // ── Total hits (Issue #1472) ────────────────────────────────────────────
+
+    /// An index where five documents match `body:rust` and one matches
+    /// `body:python`.
+    async fn total_hits_index() -> WasmIndex {
+        let mut schema = WasmSchema::new();
+        schema
+            .add_text_field("body".to_string(), None, None, None, None, None, None, None)
+            .expect("addTextField must succeed");
+        let index = WasmIndex::create(Some(schema), None, None)
+            .await
+            .expect("index creation must succeed");
+        let bodies = (0..5)
+            .map(|i| (format!("rust{i}"), format!("rust {i}")))
+            .chain([("python".to_string(), "python".to_string())]);
+        for (id, body) in bodies {
+            let doc = serde_wasm_bindgen::to_value(&serde_json::json!({ "body": body })).unwrap();
+            index
+                .put_document(id, doc)
+                .await
+                .expect("put_document must succeed");
+        }
+        index.commit().await.expect("commit must succeed");
+        index
+    }
+
+    /// The whole response `{ results, totalHits }` of a search, as JSON.
+    fn response_json(js_response: JsValue) -> serde_json::Value {
+        serde_wasm_bindgen::from_value(js_response).unwrap()
+    }
+
+    /// `body:rust`, a page of two, with `trackTotalHits`.
+    async fn search_counting(
+        index: &WasmIndex,
+        track: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        index
+            .search(
+                "body:rust".to_string(),
+                Some(2.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                track,
+            )
+            .await
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_counts_the_matches_as_asked() {
+        let index = total_hits_index().await;
+        for (track, expected) in [
+            (
+                JsValue::from_f64(1000.0),
+                serde_json::json!({ "value": 5, "relation": "eq" }),
+            ),
+            (
+                JsValue::from_f64(3.0),
+                serde_json::json!({ "value": 3, "relation": "gte" }),
+            ),
+            (
+                JsValue::TRUE,
+                serde_json::json!({ "value": 5, "relation": "eq" }),
+            ),
+        ] {
+            let response = response_json(search_counting(&index, Some(track)).await.unwrap());
+            assert_eq!(response["results"].as_array().unwrap().len(), 2);
+            assert_eq!(response["totalHits"], expected);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_counts_nothing_unless_asked() {
+        let index = total_hits_index().await;
+        for track in [
+            None,
+            Some(JsValue::FALSE),
+            Some(JsValue::NULL),
+            Some(JsValue::UNDEFINED),
+        ] {
+            let response = response_json(search_counting(&index, track).await.unwrap());
+            assert_eq!(response["results"].as_array().unwrap().len(), 2);
+            assert!(response.get("totalHits").is_none(), "{response}");
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_rejects_zero_through_the_engine() {
+        let index = total_hits_index().await;
+        let error = search_counting(&index, Some(JsValue::from_f64(0.0)))
+            .await
+            .unwrap_err();
+        let message = error.as_string().unwrap();
+        assert!(
+            message.contains("track_total_hits must count at least 1 match"),
+            "{message}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn search_rejects_another_track_total_hits() {
+        let index = total_hits_index().await;
+        let prefix = "Index.search: trackTotalHits must be true, false or an integer from 0 to \
+                      4294967295, got ";
+        for (value, shown) in [
+            (JsValue::from_str("1000"), "\"1000\""),
+            (JsValue::from_f64(1.5), "1.5"),
+            (JsValue::from_f64(-1.0), "-1"),
+            (JsValue::from_f64(4_294_967_296.0), "4294967296"),
+            (JsValue::from_f64(f64::NAN), "NaN"),
+            (
+                highlight_object(serde_json::json!({ "upTo": 3 })).into(),
+                "{\"upTo\":3}",
+            ),
+        ] {
+            let error = search_counting(&index, Some(value)).await.unwrap_err();
+            assert_eq!(error.as_string().unwrap(), format!("{prefix}{shown}"));
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn the_searches_for_one_kind_of_query_return_a_response_without_a_total() {
+        let index = total_hits_index().await;
+        let term = response_json(
+            index
+                .search_term(
+                    "body".to_string(),
+                    "rust".to_string(),
+                    Some(2.0),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(term["results"].as_array().unwrap().len(), 2);
+        assert!(term.get("totalHits").is_none(), "{term}");
+
+        let vector = response_json(search_vector_grouped(&group_index().await, None).await);
+        assert!(!vector["results"].as_array().unwrap().is_empty());
+        assert!(vector.get("totalHits").is_none(), "{vector}");
     }
 }

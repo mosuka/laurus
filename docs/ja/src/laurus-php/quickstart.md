@@ -43,10 +43,10 @@ $index->commit();
 
 ```php
 // DSL 文字列
-$results = $index->search("title:rust", 5);
+$results = $index->search("title:rust", 5)->getResults();
 
 // クエリオブジェクト
-$results = $index->search(new \Laurus\TermQuery("body", "php"), 5);
+$results = $index->search(new \Laurus\TermQuery("body", "php"), 5)->getResults();
 
 // 結果を表示
 foreach ($results as $r) {
@@ -75,7 +75,7 @@ $index->putDocument("doc2", ["title" => "PHP", "embedding" => [0.9, 0.8, 0.7, 0.
 $index->commit();
 
 $queryVec = [0.1, 0.2, 0.3, 0.4];
-$results = $index->search(new VectorQuery("embedding", $queryVec), 3);
+$results = $index->search(new VectorQuery("embedding", $queryVec), 3)->getResults();
 ```
 
 ## 5. ハイブリッド検索
@@ -94,7 +94,7 @@ $request = new SearchRequest(
     fusion: new RRF(60.0),
     limit: 5,
 );
-$results = $index->search($request);
+$results = $index->search($request)->getResults();
 ```
 
 ## 6. Late interaction による再採点
@@ -117,7 +117,7 @@ $index->putDocument("doc2", ["title" => "Rust language", "tokens" => [[0.9, 0.2]
 $index->commit();
 
 // "title:rust" の上位 100 件（デフォルト）を MaxSim で並べ替える
-$results = $index->search("title:rust", 10, 0, null, new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+$results = $index->search("title:rust", 10, 0, null, new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]))->getResults();
 ```
 
 再採点した結果のスコアは MaxSim の値です。トークンベクトルの代わりにテキストでクエリを渡すには、`candle_colbert` エンベダー（Cargo の feature `embeddings-candle`）を `addEmbedder` で登録し、`addMultiVectorField` の `$embedder` に指定します。詳細は [LateInteractionRescore](api_reference.md#lateinteractionrescore) を参照してください。

@@ -8,8 +8,8 @@ require_relative "test_helper"
 # Covers:
 # - Empty input returns an empty Array without invoking the engine.
 # - Single-query batch matches the single-query #search result.
-# - Multi-query batch preserves input order and returns one result Array
-#   per input query.
+# - Multi-query batch preserves input order and returns one
+#   Laurus::SearchResponse per input query.
 # - DSL strings, Query objects, and SearchRequest are all accepted.
 class TestSearchBatch < Minitest::Test
   def create_index
@@ -29,12 +29,12 @@ class TestSearchBatch < Minitest::Test
 
   def test_search_batch_single_query_matches_search
     idx = create_index
-    serial = idx.search("title:rust", limit: 5)
+    serial = idx.search("title:rust", limit: 5).results
     batch = idx.search_batch(["title:rust"], limit: 5)
 
     assert_equal 1, batch.length
-    assert_equal serial.length, batch[0].length
-    batch[0].each_with_index do |result, i|
+    assert_equal serial.length, batch[0].results.length
+    batch[0].results.each_with_index do |result, i|
       assert_equal serial[i].id, result.id
     end
   end
@@ -47,9 +47,9 @@ class TestSearchBatch < Minitest::Test
     batch = idx.search_batch(queries, limit: 5)
     assert_equal queries.length, batch.length
 
-    batch.each_with_index do |results, i|
-      assert results.length >= 1, "expected at least 1 hit for query #{queries[i]}"
-      assert_equal expected_top_ids[i], results[0].id
+    batch.each_with_index do |response, i|
+      assert response.results.length >= 1, "expected at least 1 hit for query #{queries[i]}"
+      assert_equal expected_top_ids[i], response.results[0].id
     end
   end
 
@@ -62,8 +62,8 @@ class TestSearchBatch < Minitest::Test
     batch = idx.search_batch(queries, limit: 5)
 
     assert_equal 2, batch.length
-    assert_equal "doc1", batch[0][0].id
-    assert_equal "doc2", batch[1][0].id
+    assert_equal "doc1", batch[0].results[0].id
+    assert_equal "doc2", batch[1].results[0].id
   end
 
   def test_search_batch_with_search_requests
@@ -75,8 +75,8 @@ class TestSearchBatch < Minitest::Test
     batch = idx.search_batch(requests)
 
     assert_equal 2, batch.length
-    assert_equal "doc1", batch[0][0].id
-    assert_equal "doc2", batch[1][0].id
+    assert_equal "doc1", batch[0].results[0].id
+    assert_equal "doc2", batch[1].results[0].id
   end
 
   def test_search_batch_no_match_returns_empty_inner_array
@@ -85,8 +85,8 @@ class TestSearchBatch < Minitest::Test
     batch = idx.search_batch(queries, limit: 5)
 
     assert_equal 2, batch.length
-    assert batch[0].length >= 1
-    assert_equal [], batch[1]
+    assert batch[0].results.length >= 1
+    assert_equal [], batch[1].results
   end
 
   def test_search_batch_limit_per_query
@@ -95,8 +95,8 @@ class TestSearchBatch < Minitest::Test
     batch = idx.search_batch(queries, limit: 1)
 
     assert_equal 2, batch.length
-    batch.each do |results|
-      assert results.length <= 1
+    batch.each do |response|
+      assert response.results.length <= 1
     end
   end
 

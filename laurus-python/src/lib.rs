@@ -28,7 +28,8 @@ use query::{
 };
 use schema::PySchema;
 use search::{
-    PyGroupBy, PyLateInteractionRescore, PyRRF, PySearchRequest, PySearchResult, PyWeightedSum,
+    PyGroupBy, PyLateInteractionRescore, PyRRF, PySearchRequest, PySearchResponse, PySearchResult,
+    PyTotalHits, PyWeightedSum,
 };
 
 /// Laurus — unified lexical, vector, and hybrid search for Python.
@@ -49,7 +50,7 @@ use search::{
 /// index.add_document("doc2", {"title": "Python Basics",    "body": "Versatile language."})
 /// index.commit()
 ///
-/// for r in index.search("programming", limit=5):
+/// for r in index.search("programming", limit=5).results:
 ///     print(r.id, r.score, r.document["title"])
 /// ```
 #[pymodule]
@@ -63,6 +64,8 @@ fn laurus(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ── Search result & request ───────────────────────────────────────────
     m.add_class::<PySearchResult>()?;
+    m.add_class::<PySearchResponse>()?;
+    m.add_class::<PyTotalHits>()?;
     m.add_class::<PySearchRequest>()?;
 
     // ── Fusion algorithms ─────────────────────────────────────────────────

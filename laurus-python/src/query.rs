@@ -159,7 +159,7 @@ impl SpanKind {
 ///
 /// ```python
 /// q = laurus.TermQuery("body", "rust")
-/// results = index.search(q, limit=5)
+/// results = index.search(q, limit=5).results
 /// ```
 #[pyclass(name = "TermQuery")]
 pub struct PyTermQuery {
@@ -834,7 +834,7 @@ impl PyGeo3dNearestQuery {
 /// bq.must(laurus.TermQuery("body", "programming"))
 /// bq.must_not(laurus.TermQuery("body", "python"))
 /// bq.should(laurus.TermQuery("category", "data-science"))
-/// results = index.search(bq, limit=5)
+/// results = index.search(bq, limit=5).results
 /// ```
 #[pyclass(name = "BooleanQuery")]
 pub struct PyBooleanQuery {
@@ -1017,7 +1017,7 @@ impl PySpanQuery {
 /// model = SentenceTransformer("all-MiniLM-L6-v2")
 /// vec = model.encode("memory safety").tolist()
 ///
-/// results = index.search(laurus.VectorQuery("text_vec", vec), limit=5)
+/// results = index.search(laurus.VectorQuery("text_vec", vec), limit=5).results
 /// ```
 #[pyclass(name = "VectorQuery")]
 pub struct PyVectorQuery {
@@ -1053,7 +1053,7 @@ impl PyVectorQuery {
 /// ## Example
 ///
 /// ```python
-/// results = index.search(laurus.VectorTextQuery("text_vec", "memory safety"), limit=3)
+/// results = index.search(laurus.VectorTextQuery("text_vec", "memory safety"), limit=3).results
 /// ```
 #[pyclass(name = "VectorTextQuery")]
 pub struct PyVectorTextQuery {

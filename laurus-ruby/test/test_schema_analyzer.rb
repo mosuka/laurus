@@ -30,8 +30,8 @@ class TestSchemaAnalyzer < Minitest::Test
     idx.commit
 
     # "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
-    assert_equal 1, idx.search("title:ell", limit: 5).length
-    assert_equal 0, idx.search("plain:ell", limit: 5).length
+    assert_equal 1, idx.search("title:ell", limit: 5).results.length
+    assert_equal 0, idx.search("plain:ell", limit: 5).results.length
   end
 
   def test_token_filters_apply_lowercase
@@ -45,8 +45,8 @@ class TestSchemaAnalyzer < Minitest::Test
     idx.put_document("doc1", { "raw" => "HELLO World", "lower" => "HELLO World" })
     idx.commit
 
-    assert_equal 0, idx.search("raw:hello", limit: 5).length
-    assert_equal 1, idx.search("lower:hello", limit: 5).length
+    assert_equal 0, idx.search("raw:hello", limit: 5).results.length
+    assert_equal 1, idx.search("lower:hello", limit: 5).results.length
   end
 
   def test_char_filters_apply_pattern_replace
@@ -64,8 +64,8 @@ class TestSchemaAnalyzer < Minitest::Test
     idx.put_document("doc1", { "raw" => "state-of-the-art", "split" => "state-of-the-art" })
     idx.commit
 
-    assert_equal 0, idx.search("raw:art", limit: 5).length
-    assert_equal 1, idx.search("split:art", limit: 5).length
+    assert_equal 0, idx.search("raw:art", limit: 5).results.length
+    assert_equal 1, idx.search("split:art", limit: 5).results.length
   end
 
   def test_add_analyzer_defaults_to_no_filters
@@ -186,7 +186,7 @@ class TestSchemaAnalyzer < Minitest::Test
       idx = Laurus::Index.new(path: dir)
       idx.put_document("doc1", { "body" => "Hello World" })
       idx.commit
-      assert_equal 1, idx.search("body:hello", limit: 5).length
+      assert_equal 1, idx.search("body:hello", limit: 5).results.length
     end
   end
 
@@ -256,7 +256,7 @@ class TestSchemaAnalyzer < Minitest::Test
       idx = Laurus::Index.new(path: dir)
       idx.put_document("doc1", { "body" => "Hello World" })
       idx.commit
-      assert_equal 1, idx.search("body:hello", limit: 5).length
+      assert_equal 1, idx.search("body:hello", limit: 5).results.length
     end
   end
 
@@ -285,7 +285,7 @@ class TestSchemaAnalyzer < Minitest::Test
     idx = Laurus::Index.new(schema: schema)
     idx.put_document("doc1", { "title" => "hello" })
     idx.commit
-    assert_equal 1, idx.search("title:ell", limit: 5).length
+    assert_equal 1, idx.search("title:ell", limit: 5).results.length
   end
 
   def test_from_toml_file_round_trip
@@ -338,7 +338,7 @@ class TestSchemaAnalyzer < Minitest::Test
     idx = Laurus::Index.new(schema: restored)
     idx.put_document("doc1", { "title" => "hello" })
     idx.commit
-    assert_equal 1, idx.search("title:ell", limit: 5).length
+    assert_equal 1, idx.search("title:ell", limit: 5).results.length
   end
 
   def test_to_toml_file_then_from_toml_file_round_trip

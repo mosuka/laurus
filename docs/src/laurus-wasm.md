@@ -106,7 +106,7 @@ await index.commit();
 
 // Search with precomputed query embedding
 const queryVec = await embed("safe systems programming");
-const results = await index.searchVector("embedding", queryVec);
+const { results } = await index.searchVector("embedding", queryVec);
 ```
 
 This approach gives you real semantic search in the browser using the same
@@ -137,7 +137,7 @@ const index = await Index.create(schema);
 await index.putDocument("doc1", { title: "Introduction to Rust" });
 await index.commit();
 
-const results = await index.searchVectorText("embedding", "safe systems programming");
+const { results } = await index.searchVectorText("embedding", "safe systems programming");
 ```
 
 Compared to Option A, the callback approach lets the engine cache embeddings
@@ -175,7 +175,7 @@ await index.putDocument("doc1", { body, body_colbert: body });
 await index.commit();
 
 // Rescore the top lexical hits; the callback embeds the query text with role "query".
-const results = await index.search("body:rust", 10, 0, undefined, {
+const { results } = await index.search("body:rust", 10, 0, undefined, {
   field: "body_colbert",
   text: "how do lifetimes work",
 });

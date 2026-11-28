@@ -51,9 +51,9 @@ const rescore = (extra = {}) => ({ field: "tokens", vectors: QUERY, ...extra });
 describe("late-interaction rescore", () => {
   it("reorders a DSL search by MaxSim", async () => {
     const index = await createIndex();
-    expect(ids(await index.search("title:rust"))).not.toEqual(EXPECTED);
+    expect(ids((await index.search("title:rust")).results)).not.toEqual(EXPECTED);
 
-    const results = await index.search("title:rust", 10, 0, undefined, rescore());
+    const { results } = await index.search("title:rust", 10, 0, undefined, rescore());
 
     expect(ids(results)).toEqual(EXPECTED);
     for (const r of results) {
@@ -64,20 +64,20 @@ describe("late-interaction rescore", () => {
   it("reorders a SearchRequest, including a hybrid one", async () => {
     const index = await createIndex();
     const request = new SearchRequest({ queryDsl: "title:rust", rescore: rescore() });
-    expect(ids(await index.searchWithRequest(request))).toEqual(EXPECTED);
+    expect(ids((await index.searchWithRequest(request)).results)).toEqual(EXPECTED);
 
     const hybrid = new SearchRequest({ rescore: rescore() });
     hybrid.setLexicalTerm(new TermQuery("title", "rust"));
     hybrid.setVectorQuery(new VectorQuery("vec", [1.0, 0.0]));
     hybrid.setRrfFusion(new RRF());
-    expect(ids(await index.searchWithRequest(hybrid))).toEqual(EXPECTED);
+    expect(ids((await index.searchWithRequest(hybrid)).results)).toEqual(EXPECTED);
   });
 
   it("reorders only the window", async () => {
     const index = await createIndex();
-    const baseline = await index.search("title:rust");
+    const baseline = (await index.search("title:rust")).results;
 
-    const results = await index.search("title:rust", 10, 0, undefined, rescore({ windowSize: 1 }));
+    const { results } = await index.search("title:rust", 10, 0, undefined, rescore({ windowSize: 1 }));
 
     expect(ids(results)).toEqual(ids(baseline));
     expect(results[0].score).toBeCloseTo(maxSim(QUERY, CORPUS[results[0].id][2]), 5);
@@ -131,7 +131,7 @@ describe("late-interaction rescore", () => {
     const index = await createIndex();
     await index.putDocument("x", { title: "rust", tokens: [[2, 0]] });
     await index.commit();
-    const results = await index.search("title:rust", 10, 0, undefined, rescore());
+    const { results } = await index.search("title:rust", 10, 0, undefined, rescore());
     expect(results[0].id).toBe("x");
     expect(results[0].score).toBeCloseTo(2.0, 5);
   });

@@ -35,8 +35,8 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 | `delete_documents(id)` | 指定 ID の全バージョンを削除します。 |
 | `commit` | バッファリングされた書き込みをフラッシュし、すべての保留中の変更を検索可能にします。 |
 | `flush_wal` | WAL の耐久バリアをオンデマンドで強制します。未同期の WAL レコードを同期的に fsync し、`nil` を返します。group-commit ポリシー下で実行する場合に有用です（下記参照）。 |
-| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil, group_by: nil) -> Array<SearchResult>` | 検索クエリを実行します。`rescore:` には上位の結果を並べ替える `LateInteractionRescore` を渡します（Issue #1351）。それ以外の値は `TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。`group_by:` には結果をフィールドの値でグループ化する `GroupBy` を渡します（Issue #1297）。このとき `limit:` と `offset:` はグループの数を数えます。それ以外の値は `TypeError` になります。[GroupBy](#groupby) を参照。 |
-| `search_batch(queries, limit: 10, offset: 0, highlight: nil, group_by: nil) -> Array<Array<SearchResult>>` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`results[i]` は `queries[i]` に対応し、入力が空の配列の場合は `[]` を返します。`highlight:` と `group_by:` はバッチ内のすべてのクエリに同一に適用されます。ただし要素の `SearchRequest` には、その要素自身の値を使います。`rescore:` キーワードはありません。要素の `SearchRequest` は、その `rescore:` で再採点されます。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリで発生させるのと同じ例外が発生し、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
+| `search(query, limit: 10, offset: 0, highlight: nil, rescore: nil, group_by: nil, track_total_hits: nil) -> SearchResponse` | 検索クエリを実行し、結果のページを `results` に持つ [`SearchResponse`](#searchresponse) を返します。`track_total_hits:` で総ヒット数を求められます（Issue #1472、[総ヒット数](#総ヒット数)を参照）。`rescore:` には上位の結果を並べ替える `LateInteractionRescore` を渡します（Issue #1351）。それ以外の値は `TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。`group_by:` には結果をフィールドの値でグループ化する `GroupBy` を渡します（Issue #1297）。このとき `limit:` と `offset:` はグループの数を数えます。それ以外の値は `TypeError` になります。[GroupBy](#groupby) を参照。 |
+| `search_batch(queries, limit: 10, offset: 0, highlight: nil, group_by: nil, track_total_hits: nil) -> Array<SearchResponse>` | 独立した複数の検索を 1 回の呼び出しで実行します。各クエリは内部の tokio ランタイム上で並列に dispatch されます。`responses[i]` は `queries[i]` の [`SearchResponse`](#searchresponse) で、自分の `total_hits` を持ちます。入力が空の配列の場合は `[]` を返します。`highlight:`・`group_by:`・`track_total_hits:` はバッチ内のすべてのクエリに同一に適用されます。ただし要素の `SearchRequest` には、その要素自身の値を使います。`rescore:` キーワードはありません。要素の `SearchRequest` は、その `rescore:` で再採点されます。変換できないクエリやエンジンが断ったクエリは、`search` がそのクエリで発生させるのと同じ例外が発生し、メッセージの先頭にクエリの位置が付きます: `queries[1]: ...`（Issue #1627）。 |
 | `stats -> Hash` | インデックス統計（`"document_count"`、`"vector_fields"`）を返します。 |
 
 ### `search` の query 引数
@@ -48,9 +48,34 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 - **Vector クエリオブジェクト**（`VectorQuery`、`VectorTextQuery`）
 - **`SearchRequest`**（完全な制御が必要な場合）
 
-`query` が `SearchRequest` の場合は、その `limit:`・`offset:`・`highlight:`・`rescore:`・`group_by:` が使われ、`search` のキーワード引数は無視されます。
+`query` が `SearchRequest` の場合は、その `limit:`・`offset:`・`highlight:`・`rescore:`・`group_by:`・`track_total_hits:` が使われ、`search` のキーワード引数は無視されます。
 
 `search_batch` の `queries` 配列の各要素も同じ種類の値を受け付けます。DSL 文字列・クエリオブジェクト・`SearchRequest` を 1 つのバッチ内で混在させることもできます。
+
+### 総ヒット数
+
+`search`・`search_batch`・`SearchRequest.new` は `track_total_hits:` を受けます（Issue #1472）。一致する文書の数を、レスポンスの `total_hits` に入れるよう求める引数で、HTTP gateway の `"track_total_hits"` と同じ値を受けます。
+
+| 値 | 数えるもの |
+| :--- | :--- |
+| `nil` または `false`（既定） | 何も数えません。`total_hits` は `nil` です。 |
+| 1 以上の Integer | 一致がその数より少なければ正確に数えます。数がその数に届くと、`total_hits` はその数で、relation は `"gte"` です。 |
+| `true` | すべての一致を数えます。 |
+
+数えるにはコストがかかります。数が上限に届くまで、block-max pruning が飛ばすはずの文書を飛ばせないためです。ベクトル・ハイブリッド・グループ化の検索で総数が何を数えるかは、エンジンが決めます。[総ヒット数](../laurus/engine.md#総ヒット数)を参照してください。`0` はエンジンが `ArgumentError`（`track_total_hits must count at least 1 match, got UpTo(0)`）で断ります。負の Integer と `u64::MAX` を超える Integer は `ArgumentError`、ほかのクラスの値は `TypeError`（`track_total_hits must be true, false or an Integer from 0 to 18446744073709551615, got "1000"`）になります。`"1000"` や `:all` のような真とみなされる値を、`true` としては読みません。
+
+`body:rust` に一致する 5 つの文書に対して実行すると、次のようになります。
+
+```ruby
+response = index.search("body:rust", limit: 2, track_total_hits: 3)
+response.results.length # => 2
+response.total_hits     # => TotalHits(value=3, relation='gte')
+
+response = index.search("body:rust", limit: 2, track_total_hits: true)
+response.total_hits     # => TotalHits(value=5, relation='eq')
+
+index.search("body:rust", limit: 2).total_hits # => nil
+```
 
 ### ハイライト
 
@@ -60,7 +85,7 @@ Laurus::Index.new(path: nil, schema: nil, wal_sync_policy: nil, commit_policy: n
 - **Hash**: 必須の `fields` キー（String または Symbol）に加えて、`HighlightConfig` の任意の設定（`max_fragments`、`fragment_size`、`tag`、`css_class`、`require_field_match`、`max_analyzed_chars`、`return_entire_field_if_no_highlight`。キーは String・Symbol どちらも可）を指定 — 例: `highlight: {fields: ["body"], tag: "em", max_fragments: 2}`
 
 ```ruby
-results = index.search("body:rust", highlight: ["body"])
+results = index.search("body:rust", highlight: ["body"]).results
 results[0].highlights # => {"body" => ["<mark>Rust</mark> is a systems programming language."]}
 ```
 
@@ -489,6 +514,7 @@ Laurus::SearchRequest.new(
   highlight: nil,
   rescore: nil,
   group_by: nil,
+  track_total_hits: nil,
 )
 ```
 
@@ -504,6 +530,7 @@ Laurus::SearchRequest.new(
 | `highlight:` | `Index#search` の `highlight:` と同じ配列または Hash の形式（Issue #1134）。[ハイライト](#ハイライト)を参照。 |
 | `rescore:` | リクエスト（lexical・vector・ハイブリッドのいずれも可）の上位の結果を並べ替える `LateInteractionRescore`（Issue #1351）。それ以外の値は `TypeError` になります。[LateInteractionRescore](#lateinteractionrescore) を参照。 |
 | `group_by:` | リクエストの結果をグループ化する `GroupBy`（Issue #1297）。それ以外の値は `TypeError` になります。[GroupBy](#groupby) を参照。 |
+| `track_total_hits:` | レスポンスの `total_hits` のために数える一致の数（Issue #1472）。`Index#search` と同じように読みます（[総ヒット数](#総ヒット数)を参照）。ほかの値は、リクエストを作るときに `TypeError` か `ArgumentError` になります。 |
 
 ---
 
@@ -541,7 +568,7 @@ index.put_document("b", { "title" => "rust language", "tokens" => [[0.9, 0.2]] }
 index.commit
 
 rescore = Laurus::LateInteractionRescore.new("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size: 50)
-results = index.search("title:rust", rescore: rescore)
+results = index.search("title:rust", rescore: rescore).results
 results.map(&:id) # => ["b", "a"] -- "b" の MaxSim は 1.1、"a" は 0.1
 
 # フィールドに "candle_colbert" のエンベダーがあれば、クエリをテキストで渡せる。
@@ -583,16 +610,38 @@ index.add_document("manual", { "body" => "Elided lifetimes follow three rules." 
 index.add_document("faq", { "body" => "Why do lifetimes appear in signatures?" })
 index.commit
 
-results = index.search("body:lifetimes", group_by: Laurus::GroupBy.new("_id", group_size: 2))
+results = index.search("body:lifetimes", group_by: Laurus::GroupBy.new("_id", group_size: 2)).results
 results.map { |r| [r.group_key, r.inner_hits.map { |hit| hit.document["body"] }] }
 # => [["faq", []], ["manual", ["Elided lifetimes follow three rules."]]]
 ```
 
 ---
 
+## SearchResponse
+
+`Index#search` が返すクラスです。`Index#search_batch` は、クエリごとにこれを返します（Issue #1472）。
+
+```ruby
+response.results    # => Array          -- 結果のページ（SearchResult）
+response.total_hits # => TotalHits|nil  -- track_total_hits: を指定したときの総ヒット数
+```
+
+`inspect` は `SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))` です。
+
+### TotalHits
+
+```ruby
+total.value    # => Integer -- 数えた一致する文書の数
+total.relation # => String  -- value が正確な数なら "eq"、下限なら "gte"
+```
+
+relation は、HTTP gateway・MCP・CLI と同じ値です。[総ヒット数](#総ヒット数)を参照してください。
+
+---
+
 ## SearchResult
 
-`Index#search` が返すクラスです。
+検索の 1 件の結果で、`SearchResponse#results` の要素です。
 
 ```ruby
 result.id         # => String   -- 外部ドキュメント識別子

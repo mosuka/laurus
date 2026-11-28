@@ -49,6 +49,8 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<search::PhpRRF>()
         .class::<search::PhpWeightedSum>()
         .class::<search::PhpSearchResult>()
+        .class::<search::PhpSearchResponse>()
+        .class::<search::PhpTotalHits>()
         .class::<search::PhpSearchRequest>()
         // Rescore (Issue #1351)
         .class::<search::PhpLateInteractionRescore>()

@@ -80,7 +80,7 @@ def main
   puts "=" * 60
   puts "[A] Basic Vector Search: 'database ORM queries'"
   puts "=" * 60
-  print_results(index.search(Laurus::VectorTextQuery.new("text_vec", "database ORM queries"), limit: 3))
+  print_results(index.search(Laurus::VectorTextQuery.new("text_vec", "database ORM queries"), limit: 3).results)
 
   # =====================================================================
   # [B] Filtered Vector Search — category filter
@@ -93,7 +93,7 @@ def main
     filter_query: Laurus::TermQuery.new("category", "testing"),
     limit: 3
   )
-  print_results(index.search(request))
+  print_results(index.search(request).results)
 
   # =====================================================================
   # [C] Filtered Vector Search — numeric range filter (page = 1)
@@ -106,7 +106,7 @@ def main
     filter_query: Laurus::NumericRangeQuery.new("page", min: 1, max: 1),
     limit: 3
   )
-  print_results(index.search(request))
+  print_results(index.search(request).results)
 
   puts "\nVector search example completed!"
 end

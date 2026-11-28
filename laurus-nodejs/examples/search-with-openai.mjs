@@ -161,7 +161,7 @@ console.log("\nSearch with OpenAI example completed!");
 // Helper
 // ---------------------------------------------------------------------------
 
-function printResults(results) {
+function printResults({ results }) {
   if (results.length === 0) {
     console.log("  (no results)");
     return;

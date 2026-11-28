@@ -39,7 +39,7 @@ def test_reload_noop_when_nothing_changed(tmp_path):
     index.commit()
 
     assert index.reload() is False
-    results = index.search("title:hello", limit=5)
+    results = index.search("title:hello", limit=5).results
     assert len(results) == 1
 
 
@@ -58,7 +58,7 @@ def test_reload_picks_up_external_commit(tmp_path):
     b.close()
 
     assert a.reload() is True
-    results = a.search("title:hello", limit=5)
+    results = a.search("title:hello", limit=5).results
     assert len(results) == 2
 
 

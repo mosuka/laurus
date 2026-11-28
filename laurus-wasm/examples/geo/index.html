@@ -535,7 +535,7 @@
 
       try {
         const t0 = performance.now();
-        const results = await index.search(query);
+        const { results } = await index.search(query);
         const elapsed = (performance.now() - t0).toFixed(1);
         logger.log(`"${query}" -> ${results.length} hit(s) in ${elapsed}ms`);
 

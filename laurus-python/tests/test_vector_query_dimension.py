@@ -34,5 +34,5 @@ def test_another_dimension_raises_value_error(with_documents, dimension):
 
 def test_the_field_dimension_searches():
     index = make_index(with_documents=True)
-    results = index.search(laurus.VectorQuery("vec", [1.0, 0.0]))
+    results = index.search(laurus.VectorQuery("vec", [1.0, 0.0])).results
     assert [r.id for r in results] == ["doc1", "doc2"]

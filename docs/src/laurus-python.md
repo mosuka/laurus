@@ -71,7 +71,7 @@ index.put_document("doc2", {"title": "Python for Data Science", "body": "Data an
 index.commit()
 
 # Search
-results = index.search("title:rust", limit=5)
+results = index.search("title:rust", limit=5).results
 for r in results:
     print(f"[{r.id}] score={r.score:.4f}  {r.document['title']}")
 ```

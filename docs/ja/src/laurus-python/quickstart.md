@@ -40,10 +40,10 @@ index.commit()
 
 ```python
 # DSL 文字列
-results = index.search("title:rust", limit=5)
+results = index.search("title:rust", limit=5).results
 
 # クエリオブジェクト
-results = index.search(laurus.TermQuery("body", "python"), limit=5)
+results = index.search(laurus.TermQuery("body", "python"), limit=5).results
 
 # 結果を表示
 for r in results:
@@ -67,7 +67,7 @@ index.put_document("doc2", {"title": "Python", "embedding": [0.9, 0.8, 0.7, 0.6]
 index.commit()
 
 query_vec = [0.1, 0.2, 0.3, 0.4]
-results = index.search(laurus.VectorQuery("embedding", query_vec), limit=3)
+results = index.search(laurus.VectorQuery("embedding", query_vec), limit=3).results
 ```
 
 ## 5. ハイブリッド検索
@@ -79,7 +79,7 @@ request = laurus.SearchRequest(
     fusion=laurus.RRF(k=60.0),
     limit=5,
 )
-results = index.search(request)
+results = index.search(request).results
 ```
 
 ## 6. Late interaction による再採点
@@ -101,7 +101,7 @@ index.commit()
 results = index.search(
     "title:rust",
     rescore=laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]),
-)
+).results
 ```
 
 トークンベクトルの代わりにテキストを渡すには、`"candle_colbert"` のエンベダーを登録し（`schema.add_embedder("colbert", {"type": "candle_colbert", "model": "colbert-ir/colbertv2.0"})`）、MultiVector フィールドに `embedder="colbert"` を指定します。すると文書はフィールドにテキストを与えられ、再採点のクエリも文字列で渡せます。詳細は [API リファレンス → LateInteractionRescore](api_reference.md#lateinteractionrescore) を参照してください。

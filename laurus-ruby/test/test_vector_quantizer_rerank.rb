@@ -81,7 +81,7 @@ class TestVectorQuantizerRerank < Minitest::Test
     end
     idx.commit
 
-    results = idx.search(Laurus::VectorQuery.new("embedding", NEAR_BASE), limit: 3)
+    results = idx.search(Laurus::VectorQuery.new("embedding", NEAR_BASE), limit: 3).results
     assert_equal 3, results.length
     assert(results.all? { |r| r.id.start_with?("near") })
   end
@@ -151,7 +151,7 @@ class TestVectorQuantizerRerank < Minitest::Test
     idx.put_document("b", { "embedding" => [0.25, 0.0] })
     idx.commit
 
-    results = idx.search(Laurus::VectorQuery.new("embedding", [0.25, 0.0]), limit: 2)
+    results = idx.search(Laurus::VectorQuery.new("embedding", [0.25, 0.0]), limit: 2).results
     assert_equal %w[b a], results.map(&:id)
   end
 end

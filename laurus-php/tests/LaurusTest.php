@@ -311,7 +311,7 @@ class LaurusTest extends TestCase
     public function testSearchDsl(): void
     {
         $idx = $this->createIndex();
-        $results = $idx->search("title:rust");
+        $results = $idx->search("title:rust")->getResults();
         $this->assertCount(1, $results);
         $this->assertEquals("doc1", $results[0]->getId());
         $this->assertGreaterThan(0, $results[0]->getScore());
@@ -321,7 +321,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createIndex();
         $q = new Laurus\TermQuery("title", "python");
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
         $this->assertEquals("doc2", $results[0]->getId());
     }
@@ -329,22 +329,22 @@ class LaurusTest extends TestCase
     public function testSearchWithLimit(): void
     {
         $idx = $this->createIndex();
-        $results = $idx->search("title:rust OR title:python", 1);
+        $results = $idx->search("title:rust OR title:python", 1)->getResults();
         $this->assertCount(1, $results);
     }
 
     public function testSearchWithOffset(): void
     {
         $idx = $this->createIndex();
-        $all = $idx->search("title:rust OR title:python", 10);
-        $offset = $idx->search("title:rust OR title:python", 10, 1);
+        $all = $idx->search("title:rust OR title:python", 10)->getResults();
+        $offset = $idx->search("title:rust OR title:python", 10, 1)->getResults();
         $this->assertCount(count($all) - 1, $offset);
     }
 
     public function testSearchNoResults(): void
     {
         $idx = $this->createIndex();
-        $results = $idx->search("title:nonexistent");
+        $results = $idx->search("title:nonexistent")->getResults();
         $this->assertCount(0, $results);
     }
 
@@ -363,7 +363,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createIndex();
         $q = new Laurus\PhraseQuery("body", ["systems", "programming"]);
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
     }
 
@@ -371,7 +371,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createIndex();
         $q = new Laurus\FuzzyQuery("title", "rast");
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
     }
 
@@ -383,9 +383,9 @@ class LaurusTest extends TestCase
         $idx = $this->createIndex();
         // "rast" is one edit away from "rust", so only the default (2) or 1 finds it.
         $exact = new Laurus\FuzzyQuery(field: "title", term: "rast", maxEdits: 0);
-        $this->assertCount(0, $idx->search($exact));
+        $this->assertCount(0, $idx->search($exact)->getResults());
         $oneEdit = new Laurus\FuzzyQuery(field: "title", term: "rast", maxEdits: 1);
-        $this->assertSame(["doc1"], $this->idsOf($idx->search($oneEdit)));
+        $this->assertSame(["doc1"], $this->idsOf($idx->search($oneEdit)->getResults()));
     }
 
     /**
@@ -434,7 +434,7 @@ class LaurusTest extends TestCase
         $bq = new Laurus\BooleanQuery();
         $bq->must(new Laurus\TermQuery("title", "rust"));
         $bq->mustNot(new Laurus\TermQuery("title", "python"));
-        $results = $idx->search($bq);
+        $results = $idx->search($bq)->getResults();
         $this->assertCount(1, $results);
         $this->assertEquals("doc1", $results[0]->getId());
     }
@@ -443,7 +443,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createIndex();
         $q = new Laurus\WildcardQuery("title", "ru*");
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
     }
 
@@ -600,7 +600,7 @@ class LaurusTest extends TestCase
             $idx->getDocuments("doc1")[0]["seen_at"]
         );
         // Any instant matches a range query.
-        $this->assertSame(["doc1"], $this->idsOf($idx->search("seen_at:[2024-06-01 TO 2024-12-31]")));
+        $this->assertSame(["doc1"], $this->idsOf($idx->search("seen_at:[2024-06-01 TO 2024-12-31]")->getResults()));
     }
 
     public function testSingleDatetimeIsWrappedOnMultiValuedDatetimeField(): void
@@ -657,8 +657,8 @@ class LaurusTest extends TestCase
         $idx->commit();
         $this->assertSame([true, false], $idx->getDocuments("doc1")[0]["flags"]);
         // Any element matches a term query.
-        $this->assertSame(["doc1"], $this->idsOf($idx->search("flags:true")));
-        $falses = $this->idsOf($idx->search("flags:false"));
+        $this->assertSame(["doc1"], $this->idsOf($idx->search("flags:true")->getResults()));
+        $falses = $this->idsOf($idx->search("flags:false")->getResults());
         sort($falses);
         $this->assertSame(["doc1", "doc2"], $falses);
     }
@@ -718,8 +718,8 @@ class LaurusTest extends TestCase
         $idx->commit();
         $this->assertSame(["hello world", "foo bar"], $idx->getDocuments("doc1")[0]["notes"]);
         // Any element matches a term query.
-        $this->assertSame(["doc1"], $this->idsOf($idx->search("notes:hello")));
-        $bar = $this->idsOf($idx->search("notes:bar"));
+        $this->assertSame(["doc1"], $this->idsOf($idx->search("notes:hello")->getResults()));
+        $bar = $this->idsOf($idx->search("notes:bar")->getResults());
         sort($bar);
         $this->assertSame(["doc1", "doc2"], $bar);
     }
@@ -765,13 +765,13 @@ class LaurusTest extends TestCase
         $idx = $this->indexWithMultiValuedTextField(true);
         $idx->putDocument("doc1", ["title" => "t", "notes" => ["hello world", "foo bar"]]);
         $idx->commit();
-        $this->assertSame(["doc1"], $this->idsOf($idx->search('notes:"hello world"')));
-        $this->assertSame([], $this->idsOf($idx->search('notes:"world foo"')));
+        $this->assertSame(["doc1"], $this->idsOf($idx->search('notes:"hello world"')->getResults()));
+        $this->assertSame([], $this->idsOf($idx->search('notes:"world foo"')->getResults()));
 
         $contiguous = $this->indexWithMultiValuedTextField(true, 0);
         $contiguous->putDocument("doc1", ["title" => "t", "notes" => ["hello world", "foo bar"]]);
         $contiguous->commit();
-        $this->assertSame(["doc1"], $this->idsOf($contiguous->search('notes:"world foo"')));
+        $this->assertSame(["doc1"], $this->idsOf($contiguous->search('notes:"world foo"')->getResults()));
     }
 
     // ── Multi-valued bytes arrays (Issue #1176) ──────────────────────────
@@ -859,7 +859,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->indexWithDateField();
         $q = new Laurus\DateTimeRangeQuery("created_at", "2024-01-01", "2024-12-31");
-        $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)));
+        $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)->getResults()));
         $this->assertStringContainsString("DateTimeRangeQuery", (string) $q);
     }
 
@@ -868,9 +868,9 @@ class LaurusTest extends TestCase
         $idx = $this->indexWithDateField();
         // +09:00 is normalized to UTC: 2024-06-15T21:00:00+09:00 == 12:00Z.
         $q = new Laurus\DateTimeRangeQuery("created_at", "2024-06-15T21:00:00+09:00", null);
-        $this->assertSame(["d2", "d3"], $this->idsOf($idx->search($q)));
+        $this->assertSame(["d2", "d3"], $this->idsOf($idx->search($q)->getResults()));
         $q = new Laurus\DateTimeRangeQuery("created_at", null, "2024-06-15T12:00:00");
-        $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)));
+        $this->assertSame(["d1", "d2"], $this->idsOf($idx->search($q)->getResults()));
     }
 
     /**
@@ -880,7 +880,7 @@ class LaurusTest extends TestCase
     public function testDateTimeRangeQueryBoundsCanBeLeftOut(): void
     {
         $idx = $this->indexWithDateField();
-        $search = fn (Laurus\DateTimeRangeQuery $q) => $this->idsOf($idx->search($q));
+        $search = fn (Laurus\DateTimeRangeQuery $q) => $this->idsOf($idx->search($q)->getResults());
         $this->assertSame(
             $search(new Laurus\DateTimeRangeQuery("created_at", null, null)),
             $search(new Laurus\DateTimeRangeQuery("created_at"))
@@ -899,7 +899,7 @@ class LaurusTest extends TestCase
     public function testDateTimeRangeQueryDslFormReachesTheIndex(): void
     {
         $idx = $this->indexWithDateField();
-        $results = $idx->search("created_at:{2024-01-01 TO 2024-12-31}");
+        $results = $idx->search("created_at:{2024-01-01 TO 2024-12-31}")->getResults();
         $this->assertSame(["d2"], $this->idsOf($results));
     }
 
@@ -921,7 +921,7 @@ class LaurusTest extends TestCase
         $idx->putDocument("d2", ["title" => "new", "year" => 2024]);
         $idx->commit();
         $q = new Laurus\NumericRangeQuery("year", 2020, 2030);
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
         $this->assertEquals("d2", $results[0]->getId());
     }
@@ -978,16 +978,16 @@ class LaurusTest extends TestCase
         // An int in a float range: the bound 5, not an open side.
         $this->assertSame(
             ["neg", "small"],
-            self::ids($idx->search(new Laurus\NumericRangeQuery("price", null, 5, "float")))
+            self::ids($idx->search(new Laurus\NumericRangeQuery("price", null, 5, "float"))->getResults())
         );
         // A float in an integer range is truncated: [-1.9, 4.9] is [-1, 4].
         $this->assertSame(
             ["small"],
-            self::ids($idx->search(new Laurus\NumericRangeQuery("price", -1.9, 4.9)))
+            self::ids($idx->search(new Laurus\NumericRangeQuery("price", -1.9, 4.9))->getResults())
         );
         $this->assertSame(
             ["big", "small"],
-            self::ids($idx->search(new Laurus\NumericRangeQuery("price", 0.0, INF, "float")))
+            self::ids($idx->search(new Laurus\NumericRangeQuery("price", 0.0, INF, "float"))->getResults())
         );
     }
 
@@ -1032,7 +1032,7 @@ class LaurusTest extends TestCase
         $idx->putDocument("d2", ["body" => "the slow red fox"]);
         $idx->commit();
         $q = Laurus\SpanQuery::near("body", ["quick", "fox"], 2, true);
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
         $this->assertEquals("d1", $results[0]->getId());
     }
@@ -1055,7 +1055,7 @@ class LaurusTest extends TestCase
             Laurus\SpanQuery::term("body", "fox"),
         ];
         $q = Laurus\SpanQuery::nearSpans("body", $clauses, 2, true);
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertCount(1, $results);
         $this->assertEquals("d1", $results[0]->getId());
     }
@@ -1080,7 +1080,7 @@ class LaurusTest extends TestCase
         $q = Laurus\Geo3dDistanceQuery::withinSphere(
             "position", -3955182.0, 3350553.0, 3700276.0, 50000.0
         );
-        $results = $idx->search($q, 10);
+        $results = $idx->search($q, 10)->getResults();
         $ids = array_map(fn($r) => $r->getId(), $results);
         sort($ids);
         $this->assertEquals(["tokyo_skytree", "tokyo_tower"], $ids);
@@ -1096,7 +1096,7 @@ class LaurusTest extends TestCase
             -3962000.0, 3340000.0, 3690000.0,
             -3954000.0, 3360000.0, 3710000.0
         );
-        $results = $idx->search($q, 10);
+        $results = $idx->search($q, 10)->getResults();
         $ids = array_map(fn($r) => $r->getId(), $results);
         sort($ids);
         $this->assertEquals(["tokyo_skytree", "tokyo_tower"], $ids);
@@ -1109,7 +1109,7 @@ class LaurusTest extends TestCase
         $q = Laurus\Geo3dNearestQuery::kNearest(
             "position", -3916073.0, 3437037.0, 3672751.0, 3
         );
-        $results = $idx->search($q, 3);
+        $results = $idx->search($q, 3)->getResults();
         $this->assertCount(3, $results);
         $this->assertEquals("mt_fuji", $results[0]->getId());
         $ids = array_map(fn($r) => $r->getId(), $results);
@@ -1126,7 +1126,7 @@ class LaurusTest extends TestCase
             10000.0,        // initialRadiusM
             10000000.0,     // maxRadiusM
         );
-        $results = $idx->search($q, 2);
+        $results = $idx->search($q, 2)->getResults();
         $ids = array_map(fn($r) => $r->getId(), $results);
         sort($ids);
         $this->assertEquals(["tokyo_skytree", "tokyo_tower"], $ids);
@@ -1138,7 +1138,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createVectorIndex();
         $q = new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]);
-        $results = $idx->search($q);
+        $results = $idx->search($q)->getResults();
         $this->assertGreaterThanOrEqual(1, count($results));
         $this->assertEquals("doc1", $results[0]->getId());
     }
@@ -1155,7 +1155,7 @@ class LaurusTest extends TestCase
             null, // filterQuery
             null, // fusion
         );
-        $results = $idx->search($req);
+        $results = $idx->search($req)->getResults();
         $this->assertCount(1, $results);
     }
 
@@ -1163,7 +1163,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createIndex();
         $query = "body:programming OR body:python";
-        $this->assertSame(["doc1", "doc2"], $this->idsOf($idx->search($query)));
+        $this->assertSame(["doc1", "doc2"], $this->idsOf($idx->search($query)->getResults()));
 
         $req = new Laurus\SearchRequest(
             $query, // query
@@ -1172,7 +1172,7 @@ class LaurusTest extends TestCase
             new Laurus\TermQuery("title", "rust"), // filterQuery
             null, // fusion
         );
-        $this->assertSame(["doc1"], $this->idsOf($idx->search($req)));
+        $this->assertSame(["doc1"], $this->idsOf($idx->search($req)->getResults()));
     }
 
     /**
@@ -1197,7 +1197,7 @@ class LaurusTest extends TestCase
             null, // fusion
             5, // limit
         );
-        $this->assertSame(["lexical", "vector"], $this->idsOf($idx->search($req)));
+        $this->assertSame(["lexical", "vector"], $this->idsOf($idx->search($req)->getResults()));
     }
 
     /**
@@ -1259,7 +1259,7 @@ class LaurusTest extends TestCase
             limit: 10,
             offset: 0,
         );
-        $results = $idx->search($req);
+        $results = $idx->search($req)->getResults();
         $this->assertSame("doc1", $results[0]->getId());
     }
 
@@ -1272,7 +1272,7 @@ class LaurusTest extends TestCase
     public function testSearchRequestArgumentsCanBeLeftOut(): void
     {
         $idx = $this->createVectorIndex();
-        $ids = fn (Laurus\SearchRequest $req) => $this->idsOf($idx->search($req));
+        $ids = fn (Laurus\SearchRequest $req) => $this->idsOf($idx->search($req)->getResults());
         $term = new Laurus\TermQuery("title", "rust");
         $vector = new Laurus\VectorQuery("embedding", [0.1, 0.2, 0.3, 0.4]);
 
@@ -1348,7 +1348,7 @@ class LaurusTest extends TestCase
         $idx->commit();
         $scores = function (mixed $fusion) use ($idx): array {
             $out = [];
-            foreach ($idx->search($this->hybridFusionRequest($fusion)) as $hit) {
+            foreach ($idx->search($this->hybridFusionRequest($fusion))->getResults() as $hit) {
                 $out[$hit->getId()] = round($hit->getScore(), 6);
             }
             return $out;
@@ -1507,8 +1507,8 @@ class LaurusTest extends TestCase
         $idx->commit();
 
         // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
-        $this->assertCount(1, $idx->search("title:ell", 5));
-        $this->assertCount(0, $idx->search("plain:ell", 5));
+        $this->assertCount(1, $idx->search("title:ell", 5)->getResults());
+        $this->assertCount(0, $idx->search("plain:ell", 5)->getResults());
     }
 
     public function testAddAnalyzerTokenFiltersApplyLowercase(): void
@@ -1522,8 +1522,8 @@ class LaurusTest extends TestCase
         $idx->putDocument("doc1", ["raw" => "HELLO World", "lower" => "HELLO World"]);
         $idx->commit();
 
-        $this->assertCount(0, $idx->search("raw:hello", 5));
-        $this->assertCount(1, $idx->search("lower:hello", 5));
+        $this->assertCount(0, $idx->search("raw:hello", 5)->getResults());
+        $this->assertCount(1, $idx->search("lower:hello", 5)->getResults());
     }
 
     public function testAddAnalyzerCharFiltersApplyPatternReplace(): void
@@ -1541,8 +1541,8 @@ class LaurusTest extends TestCase
         $idx->putDocument("doc1", ["raw" => "state-of-the-art", "split" => "state-of-the-art"]);
         $idx->commit();
 
-        $this->assertCount(0, $idx->search("raw:art", 5));
-        $this->assertCount(1, $idx->search("split:art", 5));
+        $this->assertCount(0, $idx->search("raw:art", 5)->getResults());
+        $this->assertCount(1, $idx->search("split:art", 5)->getResults());
     }
 
     public function testAnalyzerNamesReturnsRegisteredNames(): void
@@ -1638,7 +1638,7 @@ class LaurusTest extends TestCase
         $idx = new Laurus\Index(null, $schema);
         $idx->putDocument("doc1", ["title" => "hello"]);
         $idx->commit();
-        $this->assertCount(1, $idx->search("title:ell", 5));
+        $this->assertCount(1, $idx->search("title:ell", 5)->getResults());
     }
 
     public function testSchemaFromTomlFileLoadsSchema(): void
@@ -1691,7 +1691,7 @@ class LaurusTest extends TestCase
         $idx->commit();
         // Reachable only if both the ngram tokenizer and the lowercase
         // token filter survived the round trip.
-        $this->assertCount(1, $idx->search("title:ell", 5));
+        $this->assertCount(1, $idx->search("title:ell", 5)->getResults());
     }
 
     public function testSchemaTomlFileRoundTrip(): void
@@ -1716,7 +1716,7 @@ class LaurusTest extends TestCase
     public function testSearchResultDocument(): void
     {
         $idx = $this->createIndex();
-        $results = $idx->search("title:rust");
+        $results = $idx->search("title:rust")->getResults();
         $this->assertCount(1, $results);
         $doc = $results[0]->getDocument();
         $this->assertIsArray($doc);
@@ -1734,7 +1734,7 @@ class LaurusTest extends TestCase
     public function testSearchResultToString(): void
     {
         $idx = $this->createIndex();
-        $results = $idx->search("title:rust");
+        $results = $idx->search("title:rust")->getResults();
         $str = (string)$results[0];
         $this->assertStringContainsString("SearchResult(", $str);
         $this->assertStringContainsString("doc1", $str);
@@ -1770,13 +1770,13 @@ class LaurusTest extends TestCase
     public function testSearchBatchSingleQueryMatchesSearch(): void
     {
         $idx = $this->createBatchIndex();
-        $serial = $idx->search("title:rust", 5);
+        $serial = $idx->search("title:rust", 5)->getResults();
         $batch = $idx->searchBatch(["title:rust"], 5);
 
         $this->assertCount(1, $batch);
-        $this->assertCount(count($serial), $batch[0]);
+        $this->assertCount(count($serial), $batch[0]->getResults());
         foreach ($serial as $i => $s) {
-            $this->assertEquals($s->getId(), $batch[0][$i]->getId());
+            $this->assertEquals($s->getId(), $batch[0]->getResults()[$i]->getId());
         }
     }
 
@@ -1790,8 +1790,8 @@ class LaurusTest extends TestCase
         $this->assertCount(count($queries), $batch);
 
         foreach ($queries as $i => $q) {
-            $this->assertGreaterThanOrEqual(1, count($batch[$i]), "expected at least 1 hit for $q");
-            $this->assertEquals($expectedTopIds[$i], $batch[$i][0]->getId());
+            $this->assertGreaterThanOrEqual(1, count($batch[$i]->getResults()), "expected at least 1 hit for $q");
+            $this->assertEquals($expectedTopIds[$i], $batch[$i]->getResults()[0]->getId());
         }
     }
 
@@ -1865,8 +1865,8 @@ class LaurusTest extends TestCase
         $batch = $idx->searchBatch($queries, 5);
 
         $this->assertCount(2, $batch);
-        $this->assertEquals("doc1", $batch[0][0]->getId());
-        $this->assertEquals("doc2", $batch[1][0]->getId());
+        $this->assertEquals("doc1", $batch[0]->getResults()[0]->getId());
+        $this->assertEquals("doc2", $batch[1]->getResults()[0]->getId());
     }
 
     public function testSearchBatchNoMatchReturnsEmptyInnerArray(): void
@@ -1876,8 +1876,8 @@ class LaurusTest extends TestCase
         $batch = $idx->searchBatch($queries, 5);
 
         $this->assertCount(2, $batch);
-        $this->assertGreaterThanOrEqual(1, count($batch[0]));
-        $this->assertSame([], $batch[1]);
+        $this->assertGreaterThanOrEqual(1, count($batch[0]->getResults()));
+        $this->assertSame([], $batch[1]->getResults());
     }
 
     public function testSearchBatchLimitPerQuery(): void
@@ -1887,8 +1887,8 @@ class LaurusTest extends TestCase
         $batch = $idx->searchBatch($queries, 1);
 
         $this->assertCount(2, $batch);
-        foreach ($batch as $results) {
-            $this->assertLessThanOrEqual(1, count($results));
+        foreach ($batch as $response) {
+            $this->assertLessThanOrEqual(1, count($response->getResults()));
         }
     }
 
@@ -1915,7 +1915,7 @@ class LaurusTest extends TestCase
     public function testHighlightListReturnsFragments(): void
     {
         $idx = $this->createHighlightIndex();
-        $results = $idx->search("body:rust", 10, 0, ["body"]);
+        $results = $idx->search("body:rust", 10, 0, ["body"])->getResults();
 
         $this->assertCount(1, $results);
         $fragments = $results[0]->getHighlights()["body"];
@@ -1926,7 +1926,7 @@ class LaurusTest extends TestCase
     public function testHighlightOmittedLeavesHighlightsEmpty(): void
     {
         $idx = $this->createHighlightIndex();
-        $results = $idx->search("body:rust");
+        $results = $idx->search("body:rust")->getResults();
 
         $this->assertCount(1, $results);
         $this->assertSame([], $results[0]->getHighlights());
@@ -1935,7 +1935,7 @@ class LaurusTest extends TestCase
     public function testHighlightUnrequestedFieldIsAbsent(): void
     {
         $idx = $this->createHighlightIndex();
-        $results = $idx->search("body:rust", 10, 0, ["body"]);
+        $results = $idx->search("body:rust", 10, 0, ["body"])->getResults();
 
         $this->assertArrayNotHasKey("title", $results[0]->getHighlights());
     }
@@ -1943,7 +1943,7 @@ class LaurusTest extends TestCase
     public function testHighlightAssociativeArrayAppliesConfig(): void
     {
         $idx = $this->createHighlightIndex();
-        $results = $idx->search("body:rust", 10, 0, ["fields" => ["body"], "tag" => "em", "max_fragments" => 2]);
+        $results = $idx->search("body:rust", 10, 0, ["fields" => ["body"], "tag" => "em", "max_fragments" => 2])->getResults();
 
         $fragment = $results[0]->getHighlights()["body"][0];
         $this->assertStringContainsString("<em>Rust</em>", $fragment);
@@ -1965,7 +1965,8 @@ class LaurusTest extends TestCase
         $batch = $idx->searchBatch(["body:rust", "body:programming"], 10, 0, ["body"]);
 
         $this->assertCount(2, $batch);
-        foreach ($batch as $results) {
+        foreach ($batch as $response) {
+            $results = $response->getResults();
             $this->assertCount(1, $results);
             $this->assertStringContainsString("<mark>", $results[0]->getHighlights()["body"][0]);
         }
@@ -1974,12 +1975,12 @@ class LaurusTest extends TestCase
     public function testSearchRequestHighlightMatchesSearchArgument(): void
     {
         $idx = $this->createHighlightIndex();
-        $viaArgument = $idx->search("body:rust", 10, 0, ["body"]);
+        $viaArgument = $idx->search("body:rust", 10, 0, ["body"])->getResults();
         // SearchRequest's constructor args before `highlight` have no PHP
         // default (only `limit`/`offset` do), so they must all be passed
         // positionally here, same as the existing SearchRequest tests above.
         $request = new Laurus\SearchRequest("body:rust", null, null, null, null, 10, 0, ["body"]);
-        $viaRequest = $idx->search($request);
+        $viaRequest = $idx->search($request)->getResults();
 
         $this->assertEquals($viaArgument[0]->getHighlights(), $viaRequest[0]->getHighlights());
     }
@@ -2169,7 +2170,7 @@ class LaurusTest extends TestCase
         $idx->commit();
 
         $q = new Laurus\VectorQuery("embedding", $nearBase);
-        $results = $idx->search($q, 3);
+        $results = $idx->search($q, 3)->getResults();
         $this->assertCount(3, $results);
         foreach ($results as $r) {
             $this->assertStringStartsWith("near", $r->getId());
@@ -2244,7 +2245,7 @@ class LaurusTest extends TestCase
         $idx->putDocument("b", ["embedding" => [0.25, 0.0]]);
         $idx->commit();
 
-        $results = $idx->search(new Laurus\VectorQuery("embedding", [0.25, 0.0]), 2);
+        $results = $idx->search(new Laurus\VectorQuery("embedding", [0.25, 0.0]), 2)->getResults();
         $this->assertSame(["b", "a"], array_map(fn ($r) => $r->getId(), $results));
     }
 
@@ -2418,7 +2419,7 @@ class LaurusTest extends TestCase
         $idx->close();
 
         $reopened = new Laurus\Index($dir);
-        $results = $reopened->search("title:hello", 5);
+        $results = $reopened->search("title:hello", 5)->getResults();
         $this->assertCount(1, $results);
     }
 
@@ -2569,7 +2570,7 @@ class LaurusTest extends TestCase
         $idx = new Laurus\Index($dir, $fixedSchema);
         $idx->putDocument("doc1", ["body" => "hello world"]);
         $idx->commit();
-        $this->assertCount(1, $idx->search("body:hello", 5));
+        $this->assertCount(1, $idx->search("body:hello", 5)->getResults());
     }
 
     public function testFailedBuildInAPreExistingDirectoryKeepsUnrelatedFiles(): void
@@ -2764,7 +2765,7 @@ class LaurusTest extends TestCase
         $idx = new Laurus\Index($dir);
         $idx->putDocument("doc1", ["body" => "Hello World"]);
         $idx->commit();
-        $this->assertCount(1, $idx->search("body:hello", 5));
+        $this->assertCount(1, $idx->search("body:hello", 5)->getResults());
         $idx->close();
     }
 
@@ -2811,7 +2812,7 @@ class LaurusTest extends TestCase
         $idx = new Laurus\Index($dir);
         $idx->putDocument("doc1", ["body" => "Hello World"]);
         $idx->commit();
-        $this->assertCount(1, $idx->search("body:hello", 5));
+        $this->assertCount(1, $idx->search("body:hello", 5)->getResults());
         $idx->close();
     }
 
@@ -2905,9 +2906,9 @@ class LaurusTest extends TestCase
     public function testDslSearchIsReorderedByLateInteraction(): void
     {
         $idx = $this->createRescoreIndex();
-        $this->assertNotSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search("title:rust")));
+        $this->assertNotSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search("title:rust")->getResults()));
 
-        $results = $idx->search("title:rust", 10, 0, null, $this->rescore());
+        $results = $idx->search("title:rust", 10, 0, null, $this->rescore())->getResults();
 
         $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($results));
         foreach ($results as $r) {
@@ -2920,7 +2921,7 @@ class LaurusTest extends TestCase
     {
         $idx = $this->createRescoreIndex();
         $request = new Laurus\SearchRequest("title:rust", null, null, null, null, 10, 0, null, $this->rescore());
-        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search($request)));
+        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search($request)->getResults()));
 
         $hybrid = new Laurus\SearchRequest(
             null, // query
@@ -2933,17 +2934,17 @@ class LaurusTest extends TestCase
             null, // highlight
             $this->rescore(), // rescore
         );
-        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search($hybrid)));
+        $this->assertSame(self::RESCORE_EXPECTED, self::rankedIds($idx->search($hybrid)->getResults()));
     }
 
     public function testOnlyTheRescoreWindowIsReordered(): void
     {
         $idx = $this->createRescoreIndex();
-        $baseline = $idx->search("title:rust");
+        $baseline = $idx->search("title:rust")->getResults();
         $window = $this->rescore(1);
         $this->assertSame(1, $window->getWindowSize());
 
-        $results = $idx->search("title:rust", 10, 0, null, $window);
+        $results = $idx->search("title:rust", 10, 0, null, $window)->getResults();
 
         $this->assertSame(self::rankedIds($baseline), self::rankedIds($results));
         $top = self::maxSim(self::RESCORE_QUERY, self::RESCORE_CORPUS[$results[0]->getId()][2]);
@@ -3045,7 +3046,7 @@ class LaurusTest extends TestCase
         $idx = $this->createRescoreIndex();
         $idx->putDocument("x", ["title" => "rust", "tokens" => [[2, 0]]]);
         $idx->commit();
-        $results = $idx->search("title:rust", 10, 0, null, $this->rescore());
+        $results = $idx->search("title:rust", 10, 0, null, $this->rescore())->getResults();
         $this->assertSame("x", $results[0]->getId());
         $this->assertEqualsWithDelta(2.0, $results[0]->getScore(), 1e-5);
     }
@@ -3231,10 +3232,10 @@ class LaurusTest extends TestCase
     public function testSearchGroupsChunksById(): void
     {
         $idx = $this->createGroupIndex();
-        $results = $idx->search(self::groupVectorQuery(), groupBy: new Laurus\GroupBy("_id", groupSize: 2));
+        $results = $idx->search(self::groupVectorQuery(), groupBy: new Laurus\GroupBy("_id", groupSize: 2))->getResults();
         $this->assertSame(self::GROUP_EXPECTED, $this->groupsOf($results));
 
-        $oneEach = $idx->search(self::groupVectorQuery(), groupBy: new Laurus\GroupBy("_id"));
+        $oneEach = $idx->search(self::groupVectorQuery(), groupBy: new Laurus\GroupBy("_id"))->getResults();
         $this->assertSame(["a", "b", "c"], self::rankedIds($oneEach));
         foreach ($oneEach as $r) {
             $this->assertSame([], $r->getInnerHits());
@@ -3243,7 +3244,7 @@ class LaurusTest extends TestCase
 
     public function testUngroupedResultsHaveNoGroup(): void
     {
-        $results = $this->createGroupIndex()->search(self::groupVectorQuery());
+        $results = $this->createGroupIndex()->search(self::groupVectorQuery())->getResults();
         $this->assertCount(count(self::GROUP_CHUNKS), $results);
         foreach ($results as $r) {
             $this->assertNull($r->getGroupKey());
@@ -3265,7 +3266,7 @@ class LaurusTest extends TestCase
             null, // rescore
             new Laurus\GroupBy("_id", groupSize: 2), // groupBy
         );
-        $this->assertSame(self::GROUP_EXPECTED, $this->groupsOf($this->createGroupIndex()->search($request)));
+        $this->assertSame(self::GROUP_EXPECTED, $this->groupsOf($this->createGroupIndex()->search($request)->getResults()));
     }
 
     public function testSearchBatchGroupsEveryQuery(): void
@@ -3276,7 +3277,7 @@ class LaurusTest extends TestCase
         );
         $this->assertSame(
             [self::GROUP_EXPECTED, self::GROUP_EXPECTED],
-            array_map(fn ($results) => $this->groupsOf($results), $batch)
+            array_map(fn ($response) => $this->groupsOf($response->getResults()), $batch)
         );
     }
 
@@ -3389,6 +3390,185 @@ class LaurusTest extends TestCase
         }
         $this->assertInstanceOf(\Error::class, $caught);
         $this->assertSame('Unknown named parameter $ef_construction', $caught->getMessage());
+    }
+
+    // ── Total hits (Issue #1472) ─────────────────────────────────────────
+    //
+    // `search`, `searchBatch` and `new SearchRequest(...)` take
+    // `$trackTotalHits`, read as the HTTP gateway reads
+    // `"track_total_hits"`: an int counts exactly up to it, `true` counts
+    // every match, and `false` or `null` counts nothing. Each search returns
+    // a `Laurus\SearchResponse` whose `getTotalHits()` holds the count and
+    // whether it is exact (`"eq"`) or a lower bound (`"gte"`).
+
+    /**
+     * Return an index where five documents match `body:rust` and one
+     * matches `body:python`.
+     */
+    private function createTotalHitsIndex(): Laurus\Index
+    {
+        $schema = new Laurus\Schema();
+        $schema->addTextField("body");
+        $idx = new Laurus\Index(null, $schema);
+        for ($i = 0; $i < 5; $i++) {
+            $idx->putDocument("rust$i", ["body" => "rust $i"]);
+        }
+        $idx->putDocument("python", ["body" => "python"]);
+        $idx->commit();
+        return $idx;
+    }
+
+    /**
+     * The total of a response as `[value, relation]`, or null.
+     */
+    private function totalOf(Laurus\SearchResponse $response): ?array
+    {
+        $total = $response->getTotalHits();
+        return $total === null ? null : [$total->getValue(), $total->getRelation()];
+    }
+
+    /**
+     * The exception `$call` throws, or null.
+     */
+    private function thrownBy(callable $call): ?\Throwable
+    {
+        try {
+            $call();
+        } catch (\Throwable $e) {
+            return $e;
+        }
+        return null;
+    }
+
+    public function testSearchCountsTheMatchesAsAsked(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $cases = [
+            "above" => [1000, [5, "eq"]],
+            "below" => [3, [3, "gte"]],
+            "true" => [true, [5, "eq"]],
+            "false" => [false, null],
+            "null" => [null, null],
+        ];
+        foreach ($cases as $label => [$track, $expected]) {
+            $response = $idx->search("body:rust", 2, trackTotalHits: $track);
+            $this->assertInstanceOf(Laurus\SearchResponse::class, $response, $label);
+            $this->assertCount(2, $response->getResults(), $label);
+            $this->assertSame($expected, $this->totalOf($response), $label);
+        }
+    }
+
+    public function testSearchCountsNothingByDefault(): void
+    {
+        $response = $this->createTotalHitsIndex()->search("body:rust", 2);
+        $this->assertCount(2, $response->getResults());
+        $this->assertNull($response->getTotalHits());
+    }
+
+    public function testSearchTakesTrackTotalHitsAsTheLastPositionalArgument(): void
+    {
+        $response = $this->createTotalHitsIndex()->search("body:rust", 2, 0, null, null, null, 3);
+        $this->assertSame([3, "gte"], $this->totalOf($response));
+    }
+
+    public function testSearchRejectsZeroThroughTheEngine(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $caught = $this->thrownBy(fn () => $idx->search("body:rust", trackTotalHits: 0));
+        $this->assertInstanceOf(\ValueError::class, $caught);
+        $this->assertStringContainsString("track_total_hits must count at least 1 match", $caught->getMessage());
+    }
+
+    public function testSearchRejectsANegativeTrackTotalHits(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $caught = $this->thrownBy(fn () => $idx->search("body:rust", trackTotalHits: -1));
+        $this->assertInstanceOf(\ValueError::class, $caught);
+        $this->assertSame("Index::search: trackTotalHits must be at least 0, got -1", $caught->getMessage());
+    }
+
+    public function testSearchRejectsATrackTotalHitsOfAnotherType(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        // PHP's type juggling would read "1000" and 1.5 as numbers; they are
+        // not ints here.
+        foreach (["string" => "1000", "float" => 1.5, "array" => ["upTo" => 3]] as $label => $value) {
+            $caught = $this->thrownBy(fn () => $idx->search("body:rust", trackTotalHits: $value));
+            $this->assertInstanceOf(\TypeError::class, $caught, $label);
+            $this->assertStringStartsWith(
+                "Index::search: trackTotalHits must be true, false, null or an int from 0 up, got a value of type ",
+                $caught->getMessage(),
+                $label
+            );
+        }
+    }
+
+    public function testSearchRequestCarriesItsOwnTrackTotalHits(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $request = new Laurus\SearchRequest(query: "body:rust", limit: 2, trackTotalHits: 3);
+        $this->assertSame([3, "gte"], $this->totalOf($idx->search($request)));
+
+        // A SearchRequest uses its own value, as it does its own limit.
+        $plain = new Laurus\SearchRequest(query: "body:rust", limit: 2);
+        $this->assertNull($this->totalOf($idx->search($plain, trackTotalHits: true)));
+    }
+
+    public function testSearchRequestRejectsATrackTotalHitsOfAnotherType(): void
+    {
+        $caught = $this->thrownBy(
+            fn () => new Laurus\SearchRequest(query: "body:rust", trackTotalHits: "1000")
+        );
+        $this->assertInstanceOf(\TypeError::class, $caught);
+        $this->assertStringStartsWith("SearchRequest: trackTotalHits must be true, false, null", $caught->getMessage());
+    }
+
+    public function testSearchBatchReturnsEachQuerysTotal(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $responses = $idx->searchBatch(["body:rust", "body:python", "body:missing"], 2, trackTotalHits: 1000);
+        $this->assertSame(
+            [[5, "eq"], [1, "eq"], [0, "eq"]],
+            array_map(fn ($r) => $this->totalOf($r), $responses)
+        );
+        $this->assertSame([2, 1, 0], array_map(fn ($r) => count($r->getResults()), $responses));
+    }
+
+    public function testSearchBatchLetsASearchRequestUseItsOwnValue(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $request = new Laurus\SearchRequest(query: "body:rust", limit: 2, trackTotalHits: 3);
+        $responses = $idx->searchBatch(["body:rust", $request], 2, trackTotalHits: true);
+        $this->assertSame(
+            [[5, "eq"], [3, "gte"]],
+            array_map(fn ($r) => $this->totalOf($r), $responses)
+        );
+    }
+
+    public function testSearchBatchCountsNothingByDefault(): void
+    {
+        $responses = $this->createTotalHitsIndex()->searchBatch(["body:rust"], 2);
+        $this->assertNull($this->totalOf($responses[0]));
+    }
+
+    public function testSearchBatchRejectsATrackTotalHitsOfAnotherTypeEvenForAnEmptyBatch(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $caught = $this->thrownBy(fn () => $idx->searchBatch([], trackTotalHits: "1000"));
+        $this->assertInstanceOf(\TypeError::class, $caught);
+        $this->assertStringStartsWith("Index::searchBatch: trackTotalHits must be true", $caught->getMessage());
+    }
+
+    public function testSearchResponseAndTotalHitsToString(): void
+    {
+        $idx = $this->createTotalHitsIndex();
+        $response = $idx->search("body:rust", 2, trackTotalHits: 3);
+        $this->assertSame(
+            "SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))",
+            (string) $response
+        );
+        $this->assertSame("TotalHits(value=3, relation='gte')", (string) $response->getTotalHits());
+        $this->assertSame("SearchResponse(results=2, total_hits=null)", (string) $idx->search("body:rust", 2));
     }
 
     // ── API reference (Issue #1613) ──────────────────────────────────────

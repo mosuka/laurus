@@ -35,7 +35,7 @@ class TestDocValues < Minitest::Test
     idx.put_document("doc1", { "title" => "Rust programming" })
     idx.commit
 
-    results = idx.search(Laurus::TermQuery.new("title", "rust"), limit: 5)
+    results = idx.search(Laurus::TermQuery.new("title", "rust"), limit: 5).results
     assert results.any? { |r| r.id == "doc1" }
   end
 

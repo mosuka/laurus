@@ -18,14 +18,14 @@ class TestVectorBaseWeight < Minitest::Test
     idx = Laurus::Index.new(schema: schema)
     idx.put_document("doc1", { "embedding" => SAME_VECTOR })
     idx.commit
-    score = idx.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).first.score
+    score = idx.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).results.first.score
 
     schema2 = Laurus::Schema.new
     schema2.add_hnsw_field("embedding", 4, base_weight: 1.0)
     idx2 = Laurus::Index.new(schema: schema2)
     idx2.put_document("doc1", { "embedding" => SAME_VECTOR })
     idx2.commit
-    score2 = idx2.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).first.score
+    score2 = idx2.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).results.first.score
 
     assert_in_delta score, score2, 1e-6,
                      "an unset base_weight must score identically to an explicit 1.0"
@@ -37,14 +37,14 @@ class TestVectorBaseWeight < Minitest::Test
     idx_a = Laurus::Index.new(schema: schema_a)
     idx_a.put_document("doc1", { "vec_a" => SAME_VECTOR })
     idx_a.commit
-    score_a = idx_a.search(Laurus::VectorQuery.new("vec_a", SAME_VECTOR), limit: 1).first.score
+    score_a = idx_a.search(Laurus::VectorQuery.new("vec_a", SAME_VECTOR), limit: 1).results.first.score
 
     schema_b = Laurus::Schema.new
     schema_b.add_hnsw_field("vec_b", 4, base_weight: 3.0)
     idx_b = Laurus::Index.new(schema: schema_b)
     idx_b.put_document("doc1", { "vec_b" => SAME_VECTOR })
     idx_b.commit
-    score_b = idx_b.search(Laurus::VectorQuery.new("vec_b", SAME_VECTOR), limit: 1).first.score
+    score_b = idx_b.search(Laurus::VectorQuery.new("vec_b", SAME_VECTOR), limit: 1).results.first.score
 
     assert score_b > score_a,
            "base_weight=3.0 must score higher than base_weight=1.0: a=#{score_a}, b=#{score_b}"
@@ -59,14 +59,14 @@ class TestVectorBaseWeight < Minitest::Test
     idx_zero = Laurus::Index.new(schema: schema_zero)
     idx_zero.put_document("doc1", { "embedding" => SAME_VECTOR })
     idx_zero.commit
-    score_zero = idx_zero.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).first.score
+    score_zero = idx_zero.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).results.first.score
 
     schema_one = Laurus::Schema.new
     schema_one.add_hnsw_field("embedding", 4, base_weight: 1.0)
     idx_one = Laurus::Index.new(schema: schema_one)
     idx_one.put_document("doc1", { "embedding" => SAME_VECTOR })
     idx_one.commit
-    score_one = idx_one.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).first.score
+    score_one = idx_one.search(Laurus::VectorQuery.new("embedding", SAME_VECTOR), limit: 1).results.first.score
 
     assert_in_delta score_zero, score_one, 1e-6,
                      "base_weight=0.0 must clamp to 1.0 rather than zeroing the score"

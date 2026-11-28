@@ -34,8 +34,8 @@ describe("Schema#addAnalyzer behaviour", () => {
     await index.commit();
 
     // "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
-    expect((await index.search("title:ell", 5)).length).toBe(1);
-    expect((await index.search("plain:ell", 5)).length).toBe(0);
+    expect((await index.search("title:ell", 5)).results.length).toBe(1);
+    expect((await index.search("plain:ell", 5)).results.length).toBe(0);
   });
 
   it("token filters apply lowercase", async () => {
@@ -49,8 +49,8 @@ describe("Schema#addAnalyzer behaviour", () => {
     await index.putDocument("doc1", { raw: "HELLO World", lower: "HELLO World" });
     await index.commit();
 
-    expect((await index.search("raw:hello", 5)).length).toBe(0);
-    expect((await index.search("lower:hello", 5)).length).toBe(1);
+    expect((await index.search("raw:hello", 5)).results.length).toBe(0);
+    expect((await index.search("lower:hello", 5)).results.length).toBe(1);
   });
 
   it("char filters apply pattern replace", async () => {
@@ -68,8 +68,8 @@ describe("Schema#addAnalyzer behaviour", () => {
     await index.putDocument("doc1", { raw: "state-of-the-art", split: "state-of-the-art" });
     await index.commit();
 
-    expect((await index.search("raw:art", 5)).length).toBe(0);
-    expect((await index.search("split:art", 5)).length).toBe(1);
+    expect((await index.search("raw:art", 5)).results.length).toBe(0);
+    expect((await index.search("split:art", 5)).results.length).toBe(1);
   });
 
   it("defaults to no filters", () => {
@@ -179,7 +179,7 @@ describe("names reserved for built-in analyzers", () => {
       const index = await Index.create(dir);
       await index.putDocument("doc1", { body: "Hello World" });
       await index.commit();
-      expect((await index.search("body:hello", 5)).length).toBe(1);
+      expect((await index.search("body:hello", 5)).results.length).toBe(1);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -255,7 +255,7 @@ describe("field names reserved for the engine", () => {
       const index = await Index.create(dir);
       await index.putDocument("doc1", { body: "Hello World" });
       await index.commit();
-      expect((await index.search("body:hello", 5)).length).toBe(1);
+      expect((await index.search("body:hello", 5)).results.length).toBe(1);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -288,7 +288,7 @@ describe("Schema.fromToml / fromTomlFile", () => {
     const index = await Index.create(null, schema);
     await index.putDocument("doc1", { title: "hello" });
     await index.commit();
-    expect((await index.search("title:ell", 5)).length).toBe(1);
+    expect((await index.search("title:ell", 5)).results.length).toBe(1);
   });
 
   it("loads a schema from a TOML file", () => {
@@ -343,7 +343,7 @@ describe("Schema#toToml / toTomlFile round trip", () => {
     const index = await Index.create(null, restored);
     await index.putDocument("doc1", { title: "hello" });
     await index.commit();
-    expect((await index.search("title:ell", 5)).length).toBe(1);
+    expect((await index.search("title:ell", 5)).results.length).toBe(1);
   });
 
   it("round-trips through a TOML file", () => {

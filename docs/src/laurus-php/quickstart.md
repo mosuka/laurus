@@ -43,10 +43,10 @@ $index->commit();
 
 ```php
 // DSL string
-$results = $index->search("title:rust", 5);
+$results = $index->search("title:rust", 5)->getResults();
 
 // Query object
-$results = $index->search(new \Laurus\TermQuery("body", "php"), 5);
+$results = $index->search(new \Laurus\TermQuery("body", "php"), 5)->getResults();
 
 // Print results
 foreach ($results as $r) {
@@ -75,7 +75,7 @@ $index->putDocument("doc2", ["title" => "PHP", "embedding" => [0.9, 0.8, 0.7, 0.
 $index->commit();
 
 $queryVec = [0.1, 0.2, 0.3, 0.4];
-$results = $index->search(new VectorQuery("embedding", $queryVec), 3);
+$results = $index->search(new VectorQuery("embedding", $queryVec), 3)->getResults();
 ```
 
 ## 5. Hybrid search
@@ -94,7 +94,7 @@ $request = new SearchRequest(
     fusion: new RRF(60.0),
     limit: 5,
 );
-$results = $index->search($request);
+$results = $index->search($request)->getResults();
 ```
 
 ## 6. Late-interaction rescore
@@ -117,7 +117,7 @@ $index->putDocument("doc2", ["title" => "Rust language", "tokens" => [[0.9, 0.2]
 $index->commit();
 
 // Reorder the top 100 (default) results of "title:rust" by MaxSim
-$results = $index->search("title:rust", 10, 0, null, new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]));
+$results = $index->search("title:rust", 10, 0, null, new Laurus\LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]]))->getResults();
 ```
 
 A rescored result's score is its MaxSim. To pass the query as text instead of token vectors, register a `candle_colbert` embedder (Cargo feature `embeddings-candle`) with `addEmbedder` and name it in `addMultiVectorField`'s `$embedder`; see [LateInteractionRescore](api_reference.md#lateinteractionrescore).

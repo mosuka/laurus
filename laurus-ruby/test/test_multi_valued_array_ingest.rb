@@ -151,7 +151,7 @@ class TestMultiValuedArrayIngest < Minitest::Test
 
     assert_equal ["2024-01-01T00:00:00+00:00", "2024-06-15T12:00:00+00:00"],
                  idx.get_documents("doc1").first["seen_at"]
-    assert_equal ["doc1"], idx.search("seen_at:[2024-06-01 TO 2024-12-31]", limit: 5).map(&:id)
+    assert_equal ["doc1"], idx.search("seen_at:[2024-06-01 TO 2024-12-31]", limit: 5).results.map(&:id)
   end
 
   def test_single_datetime_is_wrapped_on_multi_valued_datetime_field
@@ -208,8 +208,8 @@ class TestMultiValuedArrayIngest < Minitest::Test
     idx.commit
 
     assert_equal [true, false], idx.get_documents("doc1").first["flags"]
-    assert_equal ["doc1"], idx.search("flags:true", limit: 5).map(&:id)
-    assert_equal %w[doc1 doc2], idx.search("flags:false", limit: 5).map(&:id).sort
+    assert_equal ["doc1"], idx.search("flags:true", limit: 5).results.map(&:id)
+    assert_equal %w[doc1 doc2], idx.search("flags:false", limit: 5).results.map(&:id).sort
   end
 
   def test_single_bool_is_wrapped_on_multi_valued_boolean_field
@@ -267,8 +267,8 @@ class TestMultiValuedArrayIngest < Minitest::Test
     idx.commit
 
     assert_equal ["hello world", "foo bar"], idx.get_documents("doc1").first["notes"]
-    assert_equal ["doc1"], idx.search("notes:hello", limit: 5).map(&:id)
-    assert_equal %w[doc1 doc2], idx.search("notes:bar", limit: 5).map(&:id).sort
+    assert_equal ["doc1"], idx.search("notes:hello", limit: 5).results.map(&:id)
+    assert_equal %w[doc1 doc2], idx.search("notes:bar", limit: 5).results.map(&:id).sort
   end
 
   def test_single_string_is_wrapped_on_multi_valued_text_field
@@ -311,13 +311,13 @@ class TestMultiValuedArrayIngest < Minitest::Test
     idx = index_with_text_field(multi_valued: true)
     idx.put_document("doc1", { "title" => "t", "notes" => ["hello world", "foo bar"] })
     idx.commit
-    assert_equal ["doc1"], idx.search('notes:"hello world"', limit: 5).map(&:id)
-    assert_empty idx.search('notes:"world foo"', limit: 5)
+    assert_equal ["doc1"], idx.search('notes:"hello world"', limit: 5).results.map(&:id)
+    assert_empty idx.search('notes:"world foo"', limit: 5).results
 
     contiguous = index_with_text_field(multi_valued: true, position_increment_gap: 0)
     contiguous.put_document("doc1", { "title" => "t", "notes" => ["hello world", "foo bar"] })
     contiguous.commit
-    assert_equal ["doc1"], contiguous.search('notes:"world foo"', limit: 5).map(&:id)
+    assert_equal ["doc1"], contiguous.search('notes:"world foo"', limit: 5).results.map(&:id)
   end
 
   def test_mixed_geo_dimension_array_is_rejected

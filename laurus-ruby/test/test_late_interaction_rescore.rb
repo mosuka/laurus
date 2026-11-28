@@ -42,9 +42,9 @@ class TestLateInteractionRescore < Minitest::Test
   end
 
   def test_dsl_search_is_reordered_by_late_interaction
-    refute_equal EXPECTED, @index.search("title:rust").map(&:id)
+    refute_equal EXPECTED, @index.search("title:rust").results.map(&:id)
 
-    results = @index.search("title:rust", rescore: rescore)
+    results = @index.search("title:rust", rescore: rescore).results
 
     assert_equal EXPECTED, results.map(&:id)
     results.each do |r|
@@ -54,7 +54,7 @@ class TestLateInteractionRescore < Minitest::Test
 
   def test_search_request_is_reordered_by_late_interaction
     request = Laurus::SearchRequest.new(query: "title:rust", rescore: rescore)
-    assert_equal EXPECTED, @index.search(request).map(&:id)
+    assert_equal EXPECTED, @index.search(request).results.map(&:id)
 
     hybrid = Laurus::SearchRequest.new(
       lexical_query: Laurus::TermQuery.new("title", "rust"),
@@ -62,15 +62,15 @@ class TestLateInteractionRescore < Minitest::Test
       fusion: Laurus::RRF.new,
       rescore: rescore
     )
-    assert_equal EXPECTED, @index.search(hybrid).map(&:id)
+    assert_equal EXPECTED, @index.search(hybrid).results.map(&:id)
   end
 
   def test_only_the_window_is_reordered
-    baseline = @index.search("title:rust")
+    baseline = @index.search("title:rust").results
     window = rescore(window_size: 1)
     assert_equal 1, window.window_size
 
-    results = @index.search("title:rust", rescore: window)
+    results = @index.search("title:rust", rescore: window).results
 
     assert_equal baseline.map(&:id), results.map(&:id)
     assert_in_delta max_sim(QUERY, TOKENS[results[0].id]), results[0].score, 1e-5
@@ -133,7 +133,7 @@ class TestLateInteractionRescore < Minitest::Test
   def test_integer_token_vectors_are_accepted
     @index.put_document("x", { "title" => "rust", "tokens" => [[2, 0]] })
     @index.commit
-    results = @index.search("title:rust", rescore: rescore)
+    results = @index.search("title:rust", rescore: rescore).results
     assert_equal "x", results[0].id
     assert_in_delta 2.0, results[0].score, 1e-5
   end

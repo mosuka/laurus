@@ -43,12 +43,12 @@ index.put_document("doc2", {"title": "Python for Data Science", "body": "Data an
 index.commit()
 
 # Search with a DSL string
-results = index.search("title:rust", limit=5)
+results = index.search("title:rust", limit=5).results
 for r in results:
     print(f"[{r.id}] score={r.score:.4f}  {r.document['title']}")
 
 # Search with a query object
-results = index.search(laurus.TermQuery("body", "python"), limit=5)
+results = index.search(laurus.TermQuery("body", "python"), limit=5).results
 ```
 
 ## Index Types
@@ -183,7 +183,7 @@ request = laurus.SearchRequest(
     fusion=laurus.RRF(k=60.0),
     limit=10,
 )
-results = index.search(request)
+results = index.search(request).results
 ```
 
 ### Fusion algorithms
@@ -203,7 +203,7 @@ schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
 index.put_document("doc1", {"title": "Rust", "tokens": [[0.9, 0.2], [0.0, 0.3]]})
 # ...
 rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]])
-results = index.search("title:rust", rescore=rescore)
+results = index.search("title:rust", rescore=rescore).results
 ```
 
 With a `"candle_colbert"` embedder on the field, documents and the rescore query can be text instead.

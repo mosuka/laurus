@@ -34,8 +34,8 @@ def test_ngram_tokenizer_enables_substring_match():
     idx.commit()
 
     # "ell" is a substring of "hello", only reachable via 3-grams (hel/ell/llo).
-    assert len(idx.search("title:ell", limit=5)) == 1
-    assert len(idx.search("plain:ell", limit=5)) == 0
+    assert len(idx.search("title:ell", limit=5).results) == 1
+    assert len(idx.search("plain:ell", limit=5).results) == 0
 
 
 def test_token_filters_apply_lowercase():
@@ -51,9 +51,9 @@ def test_token_filters_apply_lowercase():
 
     # Without a lowercase filter, neither the indexed token nor the query
     # term is folded, so an all-lowercase query term can't match "HELLO".
-    assert len(idx.search("raw:hello", limit=5)) == 0
+    assert len(idx.search("raw:hello", limit=5).results) == 0
     # With the filter applied on both sides (index + query time), it matches.
-    assert len(idx.search("lower:hello", limit=5)) == 1
+    assert len(idx.search("lower:hello", limit=5).results) == 1
 
 
 def test_char_filters_apply_pattern_replace():
@@ -72,9 +72,9 @@ def test_char_filters_apply_pattern_replace():
     idx.commit()
 
     # Whitespace alone doesn't split on hyphens, so "art" is never its own token.
-    assert len(idx.search("raw:art", limit=5)) == 0
+    assert len(idx.search("raw:art", limit=5).results) == 0
     # The char filter turns hyphens into spaces before tokenization.
-    assert len(idx.search("split:art", limit=5)) == 1
+    assert len(idx.search("split:art", limit=5).results) == 1
 
 
 def test_add_analyzer_defaults_to_no_filters():
@@ -200,7 +200,7 @@ def test_existing_index_with_reserved_analyzer_name_still_opens(tmp_path):
     idx = laurus.Index(str(tmp_path))
     idx.put_document("doc1", {"body": "Hello World"})
     idx.commit()
-    assert len(idx.search("body:hello", limit=5)) == 1
+    assert len(idx.search("body:hello", limit=5).results) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +266,7 @@ def test_existing_index_with_reserved_field_name_still_opens(tmp_path):
     idx = laurus.Index(str(tmp_path))
     idx.put_document("doc1", {"body": "Hello World"})
     idx.commit()
-    assert len(idx.search("body:hello", limit=5)) == 1
+    assert len(idx.search("body:hello", limit=5).results) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ def test_from_toml_then_search():
     idx = laurus.Index(schema=schema)
     idx.put_document("doc1", {"title": "hello"})
     idx.commit()
-    assert len(idx.search("title:ell", limit=5)) == 1
+    assert len(idx.search("title:ell", limit=5).results) == 1
 
 
 def test_from_toml_file_accepts_path_and_str(tmp_path):
@@ -354,7 +354,7 @@ def test_to_toml_then_from_toml_round_trip():
     idx = laurus.Index(schema=restored)
     idx.put_document("doc1", {"title": "hello"})
     idx.commit()
-    assert len(idx.search("title:ell", limit=5)) == 1
+    assert len(idx.search("title:ell", limit=5).results) == 1
 
 
 def test_to_toml_file_then_from_toml_file_round_trip(tmp_path):

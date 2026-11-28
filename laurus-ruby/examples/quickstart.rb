@@ -25,14 +25,14 @@ index.commit
 
 # Search with a DSL string.
 puts "=== DSL search ==="
-results = index.search("ruby OR development", limit: 5)
+results = index.search("ruby OR development", limit: 5).results
 results.each do |r|
   puts "  #{r.id} (score: #{r.score}): #{r.document['title']}"
 end
 
 # Search with a TermQuery object.
 puts "\n=== TermQuery search ==="
-results = index.search(Laurus::TermQuery.new("body", "convention"), limit: 5)
+results = index.search(Laurus::TermQuery.new("body", "convention"), limit: 5).results
 results.each do |r|
   puts "  #{r.id} (score: #{r.score}): #{r.document['title']}"
 end

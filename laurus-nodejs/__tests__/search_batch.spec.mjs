@@ -4,7 +4,7 @@
  * Covers:
  * - Empty input returns an empty list without invoking the engine.
  * - Single-query batch matches the single-query `search()` result.
- * - Multi-query batch preserves input order and returns one result list
+ * - Multi-query batch preserves input order and returns one response
  *   per input query.
  * - `limit` and `offset` apply per query in the batch.
  */
@@ -43,13 +43,13 @@ describe("searchBatch", () => {
 
   it("single-query batch matches search()", async () => {
     const index = await createTextIndex();
-    const serial = await index.search("title:rust", 5);
+    const serial = (await index.search("title:rust", 5)).results;
     const batch = await index.searchBatch(["title:rust"], 5);
 
     expect(batch.length).toBe(1);
-    expect(batch[0].length).toBe(serial.length);
+    expect(batch[0].results.length).toBe(serial.length);
     for (let i = 0; i < serial.length; i++) {
-      expect(batch[0][i].id).toBe(serial[i].id);
+      expect(batch[0].results[i].id).toBe(serial[i].id);
     }
   });
 
@@ -62,8 +62,8 @@ describe("searchBatch", () => {
     expect(batch.length).toBe(queries.length);
 
     for (let i = 0; i < queries.length; i++) {
-      expect(batch[i].length).toBeGreaterThanOrEqual(1);
-      expect(batch[i][0].id).toBe(expectedTopIds[i]);
+      expect(batch[i].results.length).toBeGreaterThanOrEqual(1);
+      expect(batch[i].results[0].id).toBe(expectedTopIds[i]);
     }
   });
 
@@ -73,8 +73,8 @@ describe("searchBatch", () => {
     const batch = await index.searchBatch(queries, 5);
 
     expect(batch.length).toBe(2);
-    expect(batch[0].length).toBeGreaterThanOrEqual(1);
-    expect(batch[1]).toEqual([]);
+    expect(batch[0].results.length).toBeGreaterThanOrEqual(1);
+    expect(batch[1].results).toEqual([]);
   });
 
   it("applies limit per query", async () => {
@@ -86,7 +86,7 @@ describe("searchBatch", () => {
     const batch = await index.searchBatch(queries, 1);
 
     expect(batch.length).toBe(2);
-    for (const results of batch) {
+    for (const { results } of batch) {
       expect(results.length).toBeLessThanOrEqual(1);
     }
   });

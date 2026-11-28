@@ -38,8 +38,8 @@ class Index:
 | `delete_documents(id)` | Delete all versions for the given ID. |
 | `commit()` | Flush buffered writes and make all pending changes searchable. |
 | `flush_wal()` | Force a durable WAL barrier. See [WAL sync policy / durability](#wal-sync-policy--durability). |
-| `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None) -> list[SearchResult]` | Execute a search query. `rescore` takes a [`LateInteractionRescore`](#lateinteractionrescore) that reorders the top results by late interaction over a multi-vector field (Issue #1351). `group_by` takes a [`GroupBy`](#groupby) that groups the results by a field's value (Issue #1297); `limit` and `offset` then count groups. When `query` is a `SearchRequest`, the request's own `rescore` and `group_by` are used and these keywords are ignored. |
-| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None) -> list[list[SearchResult]]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `results[i]` corresponds to `queries[i]`. Empty input returns `[]`. `highlight` and `group_by` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. A query that cannot be converted or that the engine rejects raises the exception `search` raises for it, with the query's position in front of the message: `queries[1]: ...` (Issue #1627). |
+| `search(query, *, limit=10, offset=0, highlight=None, rescore=None, group_by=None, track_total_hits=None) -> SearchResponse` | Execute a search query and return a [`SearchResponse`](#searchresponse) with the page of results in `results`. `track_total_hits` asks for the total hit count (Issue #1472); see [Total hits](#total-hits). `rescore` takes a [`LateInteractionRescore`](#lateinteractionrescore) that reorders the top results by late interaction over a multi-vector field (Issue #1351). `group_by` takes a [`GroupBy`](#groupby) that groups the results by a field's value (Issue #1297); `limit` and `offset` then count groups. When `query` is a `SearchRequest`, the request's own `rescore`, `group_by` and `track_total_hits` are used and these keywords are ignored. |
+| `search_batch(queries, *, limit=10, offset=0, highlight=None, group_by=None, track_total_hits=None) -> list[SearchResponse]` | Execute multiple independent searches in one call. Each query is dispatched in parallel on the underlying tokio runtime. `responses[i]` is the [`SearchResponse`](#searchresponse) of `queries[i]`, with its own `total_hits`. Empty input returns `[]`. `highlight`, `group_by` and `track_total_hits` apply identically to every query in the batch, except that a `SearchRequest` element uses its own. There is no `rescore` keyword; pass a `SearchRequest` with `rescore=` for each query that needs one. A query that cannot be converted or that the engine rejects raises the exception `search` raises for it, with the query's position in front of the message: `queries[1]: ...` (Issue #1627). |
 | `stats() -> dict` | Return index statistics (`document_count`, `vector_fields`). |
 
 ### `search` query argument
@@ -53,6 +53,31 @@ The `query` parameter accepts any of the following:
 
 The same value kinds are accepted as the elements of `search_batch`'s `queries` list — DSL strings, query objects, and `SearchRequest` instances may be mixed within a single batch.
 
+### Total hits
+
+`search`, `search_batch` and `SearchRequest` take `track_total_hits` (Issue #1472), which asks for the number of matching documents in the response's `total_hits`, as the HTTP gateway's `"track_total_hits"` does:
+
+| Value | Counts |
+| :--- | :--- |
+| `None` or `False` (the default) | Nothing: `total_hits` is `None`. |
+| An `int` from 1 up | Exactly while fewer match. Once the count reaches it, `total_hits` is that number with the relation `"gte"`. |
+| `True` | Every match. |
+
+Counting has a cost: until the count reaches the threshold, a search cannot skip the documents block-max pruning would skip. What a total counts for vector, hybrid and grouped searches is the engine's; see [Total hits](../laurus/engine.md#total-hits). `0` raises `ValueError` from the engine (`track_total_hits must count at least 1 match, got UpTo(0)`), a negative `int` or one above `u64::MAX` raises `ValueError`, and a value of another type (`"1000"`, `1.5`) raises `TypeError` (`track_total_hits must be True, False or an integer from 0 to 18446744073709551615, got '1000'`). `True` is read as every match, not as the `int` 1.
+
+Over five documents that match `body:rust`:
+
+```python
+response = index.search("body:rust", limit=2, track_total_hits=3)
+print(len(response.results))  # 2
+print(response.total_hits)    # TotalHits(value=3, relation='gte')
+
+response = index.search("body:rust", limit=2, track_total_hits=True)
+print(response.total_hits)    # TotalHits(value=5, relation='eq')
+
+print(index.search("body:rust", limit=2).total_hits)  # None
+```
+
 ### Highlighting
 
 `search`/`search_batch`'s `highlight` parameter (Issue #1134) requests highlighted fragments per field on each hit's `SearchResult.highlights`. It accepts:
@@ -61,7 +86,7 @@ The same value kinds are accepted as the elements of `search_batch`'s `queries` 
 - A **dict** with a required `"fields"` key plus any of the optional `HighlightConfig` knobs: `max_fragments`, `fragment_size`, `tag`, `css_class`, `require_field_match`, `max_analyzed_chars`, `return_entire_field_if_no_highlight` — e.g. `highlight={"fields": ["body"], "tag": "em", "max_fragments": 2}`
 
 ```python
-results = index.search("body:rust", highlight=["body"])
+results = index.search("body:rust", highlight=["body"]).results
 print(results[0].highlights)  # {"body": ["<mark>Rust</mark> is a systems programming language."]}
 ```
 
@@ -563,6 +588,7 @@ class SearchRequest:
         highlight=None,
         rescore: LateInteractionRescore | None = None,
         group_by: GroupBy | None = None,
+        track_total_hits: int | bool | None = None,
     ) -> None: ...
 ```
 
@@ -578,6 +604,7 @@ class SearchRequest:
 | `highlight` | Same list-or-dict shape as `Index.search`'s `highlight` parameter (Issue #1134). See [Highlighting](#highlighting). |
 | `rescore` | A [`LateInteractionRescore`](#lateinteractionrescore) applied to the top results of this request, whichever query shape is set (Issue #1351). It takes the place of `Index.search`'s `rescore` keyword, which is ignored when a `SearchRequest` is passed. |
 | `group_by` | A [`GroupBy`](#groupby) grouping the results of this request (Issue #1297). It takes the place of the `group_by` keyword of `Index.search` and `Index.search_batch`, which is ignored when a `SearchRequest` is passed. |
+| `track_total_hits` | How many matches to count for the response's `total_hits` (Issue #1472), read as `Index.search`'s; see [Total hits](#total-hits). It takes the place of the `track_total_hits` keyword of `Index.search` and `Index.search_batch`, which is ignored when a `SearchRequest` is passed. A value of another type raises `TypeError` or `ValueError` when the request is constructed. |
 
 ---
 
@@ -627,11 +654,11 @@ index.put_document("b", {"title": "rust language", "tokens": [[0.9, 0.2]]})
 index.commit()
 
 rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]], window_size=50)
-results = index.search("title:rust", rescore=rescore)  # "b" (MaxSim 1.1) before "a" (0.1)
+results = index.search("title:rust", rescore=rescore).results  # "b" (MaxSim 1.1) before "a" (0.1)
 
 # The same rescore inside a SearchRequest (also usable in search_batch)
 request = laurus.SearchRequest(query="title:rust", rescore=rescore, limit=5)
-results = index.search(request)
+results = index.search(request).results
 ```
 
 With a `"candle_colbert"` embedder on the field, documents can give the field text and the query can be text too: `laurus.LateInteractionRescore("body_colbert", "how do lifetimes work")`.
@@ -676,7 +703,7 @@ index.add_document("manual", {"body": "Elided lifetimes follow three rules."})
 index.add_document("faq", {"body": "Why do lifetimes appear in signatures?"})
 index.commit()
 
-for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", group_size=2)):
+for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", group_size=2)).results:
     print(result.group_key, [hit.document["body"] for hit in result.inner_hits])
 # faq []
 # manual ['Elided lifetimes follow three rules.']
@@ -684,9 +711,33 @@ for result in index.search("body:lifetimes", group_by=laurus.GroupBy("_id", grou
 
 ---
 
+## SearchResponse
+
+Returned by `Index.search()`, and for each query by `Index.search_batch()` (Issue #1472).
+
+```python
+class SearchResponse:
+    results: list[SearchResult]    # The page of results
+    total_hits: TotalHits | None   # With track_total_hits, the total hit count
+```
+
+`repr` gives `SearchResponse(results=2, total_hits=TotalHits(value=3, relation='gte'))`.
+
+### TotalHits
+
+```python
+class TotalHits:
+    value: int     # The number of matching documents counted
+    relation: str  # "eq" when value is exact, "gte" when it is a lower bound
+```
+
+The relation is written as the HTTP gateway, MCP and the CLI write it. See [Total hits](#total-hits).
+
+---
+
 ## SearchResult
 
-Returned by `Index.search()`.
+One result of a search, an element of `SearchResponse.results`.
 
 ```python
 class SearchResult:

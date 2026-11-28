@@ -9,7 +9,8 @@ use crate::query::{
 use laurus::vector::Vector;
 use laurus::{
     DataValue, Document, FusionAlgorithm, GroupBy, HighlightConfig, HighlightOptions,
-    LexicalSearchQuery, RescoreOptions, SearchRequestBuilder, SearchResult, VectorSearchQuery,
+    LexicalSearchQuery, RescoreOptions, SearchRequestBuilder, SearchResult, TotalHits,
+    TotalHitsRelation, TrackTotalHits, VectorSearchQuery,
 };
 use magnus::prelude::*;
 use magnus::scan_args::{get_kwargs, scan_args};
@@ -319,7 +320,7 @@ fn rb_to_fusion(value: Value) -> Result<FusionAlgorithm, Error> {
 /// ## Example
 ///
 /// ```ruby
-/// results = index.search("body:rust", group_by: Laurus::GroupBy.new("_id", group_size: 3))
+/// results = index.search("body:rust", group_by: Laurus::GroupBy.new("_id", group_size: 3)).results
 /// ```
 #[magnus::wrap(class = "Laurus::GroupBy")]
 #[derive(Clone)]
@@ -390,7 +391,8 @@ pub fn rb_to_group_by(value: Value) -> Result<GroupBy, Error> {
 // SearchResult
 // ---------------------------------------------------------------------------
 
-/// A single search result returned by `Index#search` (`Laurus::SearchResult`).
+/// A single search result (`Laurus::SearchResult`), an element of a
+/// `SearchResponse`'s `results` (Issue #1472).
 ///
 /// Attributes:
 ///   - `id` (String): External document identifier.
@@ -494,6 +496,154 @@ pub fn to_rb_search_result(r: SearchResult) -> RbSearchResult {
 }
 
 // ---------------------------------------------------------------------------
+// SearchResponse and TotalHits (Issue #1472)
+// ---------------------------------------------------------------------------
+
+/// The total hit count of a search (`Laurus::TotalHits`), returned when
+/// `track_total_hits:` asks for one (Issue #1472).
+///
+/// Attributes:
+///   - `value` (Integer): The number of matching documents counted.
+///   - `relation` (String): `"eq"` when `value` is the number of matching
+///     documents, `"gte"` when counting stopped at the threshold and `value`
+///     is a lower bound. What a total counts for vector, hybrid and grouped
+///     searches is the engine's (`laurus/engine.md`, "Total hits").
+#[magnus::wrap(class = "Laurus::TotalHits")]
+pub struct RbTotalHits {
+    value: u64,
+    relation: &'static str,
+}
+
+impl RbTotalHits {
+    /// Return the number of matching documents counted.
+    fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Return `"eq"` or `"gte"`.
+    fn relation(&self) -> String {
+        self.relation.to_string()
+    }
+
+    fn inspect(&self) -> String {
+        format!(
+            "TotalHits(value={}, relation='{}')",
+            self.value, self.relation
+        )
+    }
+}
+
+impl From<TotalHits> for RbTotalHits {
+    /// Write the relation as the HTTP gateway, MCP and the CLI write it:
+    /// `"eq"` for an exact total, `"gte"` for a lower bound.
+    fn from(total: TotalHits) -> Self {
+        Self {
+            value: total.value,
+            relation: match total.relation {
+                TotalHitsRelation::Exact => "eq",
+                TotalHitsRelation::AtLeast => "gte",
+            },
+        }
+    }
+}
+
+/// The response of `Index#search`, and of each query of
+/// `Index#search_batch` (`Laurus::SearchResponse`, Issue #1472).
+///
+/// Attributes:
+///   - `results` (Array of SearchResult): The page of results.
+///   - `total_hits` (TotalHits | nil): The total hit count, when
+///     `track_total_hits:` asked for one; `nil` otherwise.
+#[magnus::wrap(class = "Laurus::SearchResponse")]
+pub struct RbSearchResponse {
+    /// The engine's results, converted when `results` is called, as
+    /// `SearchResult#inner_hits` converts its hits.
+    results: Vec<SearchResult>,
+    total_hits: Option<TotalHits>,
+}
+
+impl RbSearchResponse {
+    /// Return the page of results as an Array of `SearchResult`.
+    fn results(&self) -> Result<RArray, Error> {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        let arr = ruby.ary_new_capa(self.results.len());
+        for r in &self.results {
+            arr.push(ruby.into_value(to_rb_search_result(r.clone())))?;
+        }
+        Ok(arr)
+    }
+
+    /// Return the total hit count as a `TotalHits`, or nil.
+    fn total_hits(&self) -> Value {
+        let ruby = Ruby::get().expect("called from Ruby thread");
+        match self.total_hits {
+            Some(total) => ruby.into_value(RbTotalHits::from(total)),
+            None => ruby.qnil().as_value(),
+        }
+    }
+
+    fn inspect(&self) -> String {
+        let total_hits = self.total_hits.map_or_else(
+            || "nil".to_string(),
+            |total| RbTotalHits::from(total).inspect(),
+        );
+        format!(
+            "SearchResponse(results={}, total_hits={total_hits})",
+            self.results.len()
+        )
+    }
+}
+
+/// Convert the engine's [`laurus::SearchResponse`] into a
+/// [`RbSearchResponse`].
+pub fn to_rb_search_response(response: laurus::SearchResponse) -> RbSearchResponse {
+    RbSearchResponse {
+        results: response.results,
+        total_hits: response.total_hits,
+    }
+}
+
+/// Read a `track_total_hits:` argument as the HTTP gateway reads
+/// `"track_total_hits"` (Issue #1472): an Integer from 0 up counts exactly
+/// up to it, `true` counts every match, and `false` or `nil` (`None` when
+/// left out) counts nothing.
+///
+/// `true` and `false` are told apart from other values, whose truthiness
+/// is not a count. A 0 is passed on: the engine rejects it, which raises
+/// `ArgumentError`.
+///
+/// # Errors
+///
+/// Raises `TypeError` for a value of another class, and `ArgumentError` for
+/// a negative Integer or one above `u64::MAX`.
+pub fn rb_to_track_total_hits(value: Option<Value>) -> Result<TrackTotalHits, Error> {
+    let ruby = Ruby::get().expect("called from Ruby thread");
+    let Some(value) = value.filter(|v| !v.is_nil()) else {
+        return Ok(TrackTotalHits::Disabled);
+    };
+    if magnus::value::Qtrue::from_value(value).is_some() {
+        return Ok(TrackTotalHits::Exact);
+    }
+    if magnus::value::Qfalse::from_value(value).is_some() {
+        return Ok(TrackTotalHits::Disabled);
+    }
+    let message = || {
+        let got = value.inspect();
+        format!(
+            "track_total_hits must be true, false or an Integer from 0 to {}, got {got}",
+            u64::MAX
+        )
+    };
+    match magnus::Integer::from_value(value) {
+        Some(integer) => integer
+            .to_u64()
+            .map(TrackTotalHits::UpTo)
+            .map_err(|_| Error::new(ruby.exception_arg_error(), message())),
+        None => Err(Error::new(ruby.exception_type_error(), message())),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchRequest - stores Rust types only (no Ruby Values)
 // ---------------------------------------------------------------------------
 
@@ -531,6 +681,9 @@ pub struct RbSearchRequest {
     rescore: Option<RescoreOptions>,
     /// Grouping of the results by a field's value (Issue #1297).
     group_by: Option<GroupBy>,
+    /// How many matches to count for the response's `total_hits` (Issue
+    /// #1472).
+    track_total_hits: TrackTotalHits,
 }
 
 impl RbSearchRequest {
@@ -558,17 +711,25 @@ impl RbSearchRequest {
     ///     (Issue #1351).
     ///   - `group_by:` - `GroupBy` grouping the results by a field's value
     ///     (Issue #1297).
+    ///   - `track_total_hits:` - How many matches to count for the
+    ///     response's `total_hits` (Issue #1472): an Integer from 0 up, `true`
+    ///     or `false`/`nil`, read as `Index#search`'s.
     fn new(args: &[Value]) -> Result<Self, Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
         // `ScanArgsOpt` stops at 9 elements, which the list below fills, so
-        // `group_by:` (Issue #1297) is taken out of the keyword hash first.
+        // `group_by:` (Issue #1297) and `track_total_hits:` (Issue #1472)
+        // are taken out of the keyword hash first.
         let group_by = args
             .keywords
             .delete::<_, Option<Value>>(ruby.to_symbol("group_by"))?
             .filter(|value| !value.is_nil())
             .map(rb_to_group_by)
             .transpose()?;
+        let track_total_hits = rb_to_track_total_hits(
+            args.keywords
+                .delete::<_, Option<Value>>(ruby.to_symbol("track_total_hits"))?,
+        )?;
         // `Option<Option<Value>>` for the keywords whose default is `nil`:
         // an explicit `nil` is the same as leaving them out (Issue #1616).
         let kwargs = get_kwargs::<
@@ -669,6 +830,7 @@ impl RbSearchRequest {
             highlight,
             rescore,
             group_by,
+            track_total_hits,
         })
     }
 
@@ -685,7 +847,8 @@ impl RbSearchRequest {
     pub fn build(&self) -> Result<laurus::SearchRequest, Error> {
         let mut builder = SearchRequestBuilder::new()
             .limit(self.limit)
-            .offset(self.offset);
+            .offset(self.offset)
+            .track_total_hits(self.track_total_hits);
 
         // Fusion algorithm
         if let Some(ref fusion) = self.fusion {
@@ -798,9 +961,9 @@ impl RbSearchRequest {
 /// - `VectorQuery` or `VectorTextQuery`
 ///
 /// When `query` is a `SearchRequest`, `limit`/`offset`/`highlight`/`rescore`/
-/// `group_by` are used as-is from the request without overriding — same
-/// precedent as `limit`/`offset` already had here before highlighting
-/// existed.
+/// `group_by`/`track_total_hits` are used as-is from the request without
+/// overriding — same precedent as `limit`/`offset` already had here before
+/// highlighting existed.
 ///
 /// # Arguments
 ///
@@ -810,6 +973,7 @@ impl RbSearchRequest {
 /// * `highlight` - Already-parsed highlight options, if `highlight:` was given.
 /// * `rescore` - Already-parsed rescore, if `rescore:` was given.
 /// * `group_by` - Already-parsed grouping, if `group_by:` was given.
+/// * `track_total_hits` - Already-parsed `track_total_hits:` (Issue #1472).
 ///
 /// # Returns
 ///
@@ -821,13 +985,17 @@ pub fn build_request_from_rb(
     highlight: Option<&HighlightOptions>,
     rescore: Option<&RescoreOptions>,
     group_by: Option<&GroupBy>,
+    track_total_hits: TrackTotalHits,
 ) -> Result<laurus::SearchRequest, Error> {
     // Full SearchRequest object
     if let Ok(req) = <&RbSearchRequest>::try_convert(query) {
         return req.build();
     }
 
-    let mut builder = SearchRequestBuilder::new().limit(limit).offset(offset);
+    let mut builder = SearchRequestBuilder::new()
+        .limit(limit)
+        .offset(offset)
+        .track_total_hits(track_total_hits);
 
     if let Some(options) = highlight {
         builder = builder
@@ -915,6 +1083,21 @@ pub fn define(ruby: &Ruby, module: &RModule) -> Result<(), Error> {
     sr.define_method("inner_hits", magnus::method!(RbSearchResult::inner_hits, 0))?;
     sr.define_method("inspect", magnus::method!(RbSearchResult::inspect, 0))?;
     sr.define_method("to_s", magnus::method!(RbSearchResult::inspect, 0))?;
+
+    // SearchResponse and TotalHits (Issue #1472)
+    let resp = module.define_class("SearchResponse", ruby.class_object())?;
+    resp.define_method("results", magnus::method!(RbSearchResponse::results, 0))?;
+    resp.define_method(
+        "total_hits",
+        magnus::method!(RbSearchResponse::total_hits, 0),
+    )?;
+    resp.define_method("inspect", magnus::method!(RbSearchResponse::inspect, 0))?;
+    resp.define_method("to_s", magnus::method!(RbSearchResponse::inspect, 0))?;
+    let total = module.define_class("TotalHits", ruby.class_object())?;
+    total.define_method("value", magnus::method!(RbTotalHits::value, 0))?;
+    total.define_method("relation", magnus::method!(RbTotalHits::relation, 0))?;
+    total.define_method("inspect", magnus::method!(RbTotalHits::inspect, 0))?;
+    total.define_method("to_s", magnus::method!(RbTotalHits::inspect, 0))?;
 
     // SearchRequest
     let sreq = module.define_class("SearchRequest", ruby.class_object())?;

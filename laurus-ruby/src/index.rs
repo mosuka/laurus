@@ -9,8 +9,8 @@ use crate::errors::{closed_err, index_dir_err, laurus_err, with_context};
 use crate::gvl::without_gvl;
 use crate::schema::RbSchema;
 use crate::search::{
-    build_request_from_rb, rb_to_group_by, rb_to_highlight_options, rb_to_rescore_options,
-    to_rb_search_result,
+    RbSearchResponse, build_request_from_rb, rb_to_group_by, rb_to_highlight_options,
+    rb_to_rescore_options, rb_to_track_total_hits, to_rb_search_response,
 };
 use crate::wal::RbWalSyncPolicy;
 use laurus::index_dir::IndexDirClaim;
@@ -43,8 +43,8 @@ use magnus::{Error, RArray, RHash, RModule, Ruby, TryConvert, Value};
 /// # Searching
 ///
 /// ```ruby
-/// results = index.search("title:hello", limit: 10)
-/// results = index.search(Laurus::TermQuery.new("body", "rust"), limit: 5)
+/// results = index.search("title:hello", limit: 10).results
+/// results = index.search(Laurus::TermQuery.new("body", "rust"), limit: 5).results
 /// ```
 #[magnus::wrap(class = "Laurus::Index")]
 pub struct RbIndex {
@@ -363,7 +363,8 @@ impl RbIndex {
 
     // ── Search ────────────────────────────────────────────────────────────
 
-    /// Search the index and return an Array of `SearchResult` objects.
+    /// Search the index and return a `SearchResponse` with the page of
+    /// `SearchResult` objects and, when asked for, the total hit count.
     ///
     /// `query` may be:
     ///   - A **DSL string** (e.g. `"title:hello"`)
@@ -385,20 +386,34 @@ impl RbIndex {
     ///     by MaxSim against a multi-vector field (Issue #1351).
     ///   - `group_by:` - `GroupBy` grouping the results by a field's value
     ///     (Issue #1297); `limit:` and `offset:` then count groups.
+    ///   - `track_total_hits:` - How many matches to count for the
+    ///     response's `total_hits` (Issue #1472): an Integer from 0 up counts
+    ///     exactly up to it, `true` counts every match, and `false` or `nil`
+    ///     (the default) counts nothing. Counting has a cost, and what a
+    ///     total means for vector, hybrid and grouped searches is the
+    ///     engine's (`laurus/engine.md`, "Total hits").
     ///
     /// When `query` is a `SearchRequest`, the keyword arguments are ignored
     /// in favor of the request's own values.
     ///
     /// # Returns
     ///
-    /// An Array of `SearchResult` objects.
-    fn search(&self, args: &[Value]) -> Result<RArray, Error> {
+    /// A `SearchResponse`: `results` is an Array of `SearchResult` objects,
+    /// and `total_hits` is a `TotalHits` when `track_total_hits:` asked for
+    /// one, `nil` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Raises `TypeError` or `ArgumentError` if `track_total_hits:` is not
+    /// `true`, `false`, `nil` or an Integer from 0 to `u64::MAX`, and
+    /// `ArgumentError` from the engine for `track_total_hits: 0`.
+    fn search(&self, args: &[Value]) -> Result<RbSearchResponse, Error> {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (query,) = args.required;
         // `Option<Option<Value>>`: an explicit `nil` for `highlight:`,
-        // `rescore:` or `group_by:` is the same as leaving it out (Issue
-        // #1616).
+        // `rescore:`, `group_by:` or `track_total_hits:` is the same as
+        // leaving it out (Issue #1616).
         let kwargs = get_kwargs::<
             _,
             (),
@@ -408,14 +423,22 @@ impl RbIndex {
                 Option<Option<Value>>,
                 Option<Option<Value>>,
                 Option<Option<Value>>,
+                Option<Option<Value>>,
             ),
             (),
         >(
             args.keywords,
             &[],
-            &["limit", "offset", "highlight", "rescore", "group_by"],
+            &[
+                "limit",
+                "offset",
+                "highlight",
+                "rescore",
+                "group_by",
+                "track_total_hits",
+            ],
         )?;
-        let (limit, offset, highlight, rescore, group_by) = kwargs.optional;
+        let (limit, offset, highlight, rescore, group_by, track_total_hits) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
         let highlight = highlight
@@ -424,6 +447,7 @@ impl RbIndex {
             .transpose()?;
         let rescore = rescore.flatten().map(rb_to_rescore_options).transpose()?;
         let group_by = group_by.flatten().map(rb_to_group_by).transpose()?;
+        let track_total_hits = rb_to_track_total_hits(track_total_hits.flatten())?;
 
         let request = build_request_from_rb(
             query,
@@ -432,19 +456,14 @@ impl RbIndex {
             highlight.as_ref(),
             rescore.as_ref(),
             group_by.as_ref(),
+            track_total_hits,
         )?;
 
         let engine = self.engine()?;
-        let results = without_gvl(|| self.rt.block_on(engine.search(request)))
-            .map_err(laurus_err)?
-            .results;
+        let response =
+            without_gvl(|| self.rt.block_on(engine.search(request))).map_err(laurus_err)?;
 
-        let arr = ruby.ary_new_capa(results.len());
-        for r in results {
-            let rb_result = to_rb_search_result(r);
-            arr.push(ruby.into_value(rb_result))?;
-        }
-        Ok(arr)
+        Ok(to_rb_search_response(response))
     }
 
     /// Execute multiple independent searches in one call.
@@ -467,18 +486,23 @@ impl RbIndex {
     ///     `search`'s `highlight:` (Issue #1134).
     ///   - `group_by:` - `GroupBy` applied identically to every query in the
     ///     batch (Issue #1297). A `SearchRequest` entry uses its own.
+    ///   - `track_total_hits:` - How many matches to count for each query's
+    ///     `total_hits`, applied identically to every query in the batch and
+    ///     read as `search`'s (Issue #1472). A `SearchRequest` entry uses its
+    ///     own.
     ///
     /// # Returns
     ///
-    /// An Array of Arrays: `results[i]` is the result Array for
-    /// `queries[i]`. Empty input returns an empty Array without
-    /// invoking the engine.
+    /// An Array of `SearchResponse` objects: `responses[i]` is the response
+    /// for `queries[i]`, with its own `total_hits`. Empty input returns an
+    /// empty Array without invoking the engine.
     ///
     /// # Errors
     ///
     /// Raises the exception `search` raises for a query that cannot be
     /// converted or that the engine rejects, its message starting with
-    /// `queries[i]: ` for the query's position `i` (Issue #1627).
+    /// `queries[i]: ` for the query's position `i` (Issue #1627), and the
+    /// exception `search` raises for `track_total_hits:`.
     ///
     /// Issue [#719](https://github.com/mosuka/laurus/issues/719)
     /// Phase 3d of [#648](https://github.com/mosuka/laurus/issues/648).
@@ -486,8 +510,9 @@ impl RbIndex {
         let ruby = Ruby::get().expect("called from Ruby thread");
         let args = scan_args::<(Value,), (), (), (), RHash, ()>(args)?;
         let (queries,) = args.required;
-        // `Option<Option<Value>>`: an explicit `nil` for `highlight:` or
-        // `group_by:` is the same as leaving it out (Issue #1616).
+        // `Option<Option<Value>>`: an explicit `nil` for `highlight:`,
+        // `group_by:` or `track_total_hits:` is the same as leaving it out
+        // (Issue #1616).
         let kwargs = get_kwargs::<
             _,
             (),
@@ -496,14 +521,21 @@ impl RbIndex {
                 Option<usize>,
                 Option<Option<Value>>,
                 Option<Option<Value>>,
+                Option<Option<Value>>,
             ),
             (),
         >(
             args.keywords,
             &[],
-            &["limit", "offset", "highlight", "group_by"],
+            &[
+                "limit",
+                "offset",
+                "highlight",
+                "group_by",
+                "track_total_hits",
+            ],
         )?;
-        let (limit, offset, highlight, group_by) = kwargs.optional;
+        let (limit, offset, highlight, group_by, track_total_hits) = kwargs.optional;
         let limit = limit.unwrap_or(10);
         let offset = offset.unwrap_or(0);
         let highlight = highlight
@@ -511,6 +543,7 @@ impl RbIndex {
             .map(|v| rb_to_highlight_options(&ruby, v))
             .transpose()?;
         let group_by = group_by.flatten().map(rb_to_group_by).transpose()?;
+        let track_total_hits = rb_to_track_total_hits(track_total_hits.flatten())?;
 
         let queries_array: RArray = TryConvert::try_convert(queries).map_err(|_| {
             Error::new(
@@ -534,6 +567,7 @@ impl RbIndex {
                 highlight.as_ref(),
                 None,
                 group_by.as_ref(),
+                track_total_hits,
             )
             .map_err(|e| with_context(e, &format!("queries[{index}]")))?;
             requests.push(request);
@@ -543,16 +577,11 @@ impl RbIndex {
         let batch_results =
             without_gvl(|| self.rt.block_on(engine.search_batch(requests))).map_err(laurus_err)?;
 
-        let outer = ruby.ary_new_capa(batch_results.len());
-        for per_query_results in batch_results {
-            let inner = ruby.ary_new_capa(per_query_results.results.len());
-            for r in per_query_results.results {
-                let rb_result = to_rb_search_result(r);
-                inner.push(ruby.into_value(rb_result))?;
-            }
-            outer.push(inner)?;
+        let responses = ruby.ary_new_capa(batch_results.len());
+        for response in batch_results {
+            responses.push(ruby.into_value(to_rb_search_response(response)))?;
         }
-        Ok(outer)
+        Ok(responses)
     }
 
     // ── Schema & stats ────────────────────────────────────────────────────

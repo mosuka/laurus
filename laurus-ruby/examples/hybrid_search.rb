@@ -83,7 +83,7 @@ def main
   puts "=" * 60
   puts "[A] Lexical-only: term 'migrations' in text"
   puts "=" * 60
-  print_results(index.search(Laurus::TermQuery.new("text", "migrations"), limit: 3))
+  print_results(index.search(Laurus::TermQuery.new("text", "migrations"), limit: 3).results)
 
   # =====================================================================
   # [B] Vector-only search (baseline)
@@ -91,7 +91,7 @@ def main
   puts "\n#{"=" * 60}"
   puts "[B] Vector-only: 'database query builder'"
   puts "=" * 60
-  print_results(index.search(Laurus::VectorTextQuery.new("text_vec", "database query builder"), limit: 3))
+  print_results(index.search(Laurus::VectorTextQuery.new("text_vec", "database query builder"), limit: 3).results)
 
   # =====================================================================
   # [C] Hybrid search — RRF Fusion
@@ -105,7 +105,7 @@ def main
     fusion: Laurus::RRF.new(k: 60.0),
     limit: 3
   )
-  print_results(index.search(request))
+  print_results(index.search(request).results)
 
   # =====================================================================
   # [D] Hybrid search — WeightedSum Fusion
@@ -119,7 +119,7 @@ def main
     fusion: Laurus::WeightedSum.new(lexical_weight: 0.3, vector_weight: 0.7),
     limit: 3
   )
-  print_results(index.search(request))
+  print_results(index.search(request).results)
 
   # =====================================================================
   # [E] Hybrid search with filter query
@@ -134,7 +134,7 @@ def main
     fusion: Laurus::RRF.new(k: 60.0),
     limit: 3
   )
-  print_results(index.search(request))
+  print_results(index.search(request).results)
 
   # =====================================================================
   # [F] DSL string query
@@ -142,7 +142,7 @@ def main
   puts "\n#{"=" * 60}"
   puts "[F] DSL query string: 'text:middleware'"
   puts "=" * 60
-  print_results(index.search("text:middleware", limit: 3))
+  print_results(index.search("text:middleware", limit: 3).results)
 
   puts "\nHybrid search example completed!"
 end

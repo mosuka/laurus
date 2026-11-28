@@ -43,12 +43,12 @@ index.put_document("doc2", {"title": "Python データサイエンス", "body": 
 index.commit()
 
 # DSL 文字列で検索
-results = index.search("title:rust", limit=5)
+results = index.search("title:rust", limit=5).results
 for r in results:
     print(f"[{r.id}] score={r.score:.4f}  {r.document['title']}")
 
 # クエリオブジェクトで検索
-results = index.search(laurus.TermQuery("body", "python"), limit=5)
+results = index.search(laurus.TermQuery("body", "python"), limit=5).results
 ```
 
 ## インデックスの種類
@@ -183,7 +183,7 @@ request = laurus.SearchRequest(
     fusion=laurus.RRF(k=60.0),
     limit=10,
 )
-results = index.search(request)
+results = index.search(request).results
 ```
 
 ### フュージョンアルゴリズム
@@ -203,7 +203,7 @@ schema.add_multi_vector_field("tokens", dimension=2, distance="dot_product")
 index.put_document("doc1", {"title": "Rust", "tokens": [[0.9, 0.2], [0.0, 0.3]]})
 # ...
 rescore = laurus.LateInteractionRescore("tokens", [[1.0, 0.0], [0.0, 1.0]])
-results = index.search("title:rust", rescore=rescore)
+results = index.search("title:rust", rescore=rescore).results
 ```
 
 フィールドに `"candle_colbert"` のエンベダーがあれば、文書と再採点のクエリをテキストで渡せます。

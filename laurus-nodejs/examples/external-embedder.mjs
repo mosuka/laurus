@@ -193,7 +193,7 @@ console.log("\nExternal embedder example completed!");
 // Helper
 // ---------------------------------------------------------------------------
 
-function printResults(results) {
+function printResults({ results }) {
   if (results.length === 0) {
     console.log("  (no results)");
     return;
